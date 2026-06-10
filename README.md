@@ -4,6 +4,8 @@ A Burp Repeater-style exploration and security testing tool for [Model Context P
 
 Built for red teamers and security operators evaluating MCP server attack surface.
 
+![MCPoke screenshot](assets/screenshot.png)
+
 ---
 
 ## Features
