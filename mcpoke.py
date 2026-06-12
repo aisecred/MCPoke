@@ -1062,26 +1062,39 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   white-space: nowrap;
 }
 .export-opt:hover { background: var(--border); }
-#hist-table { width: 100%; border-collapse: collapse; font-size: 11px; }
-#hist-table th {
+#hist-table, #hist-modal-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+#hist-table th, #hist-modal-table th {
   background: var(--bg); color: var(--muted); font-weight: 600;
   font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
   padding: 0.2rem 0.5rem; text-align: left; position: sticky; top: 0;
 }
-#hist-table td { padding: 0.2rem 0.5rem; }
-#hist-table tr:hover td { background: var(--surface); }
+#hist-table td, #hist-modal-table td { padding: 0.2rem 0.5rem; }
+#hist-table tr:hover td, #hist-modal-table tr:hover td { background: var(--surface); }
 /* Findings table */
-#findings-table { width: 100%; border-collapse: collapse; font-size: 11px; font-family: monospace; }
-#findings-table th {
+#findings-table, #findings-modal-table { width: 100%; border-collapse: collapse; font-size: 11px; font-family: monospace; }
+#findings-table th, #findings-modal-table th {
   background: var(--bg); color: var(--muted); font-weight: 600;
   font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
   padding: 0.2rem 0.5rem; text-align: left; position: sticky; top: 0;
 }
-#findings-table td { padding: 0.25rem 0.5rem; border-bottom: 1px solid var(--border); vertical-align: top; }
-#findings-table tr:hover td { background: var(--surface); }
+#findings-table td, #findings-modal-table td { padding: 0.25rem 0.5rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+#findings-table tr:hover td, #findings-modal-table tr:hover td { background: var(--surface); }
+#findings-overlay, #hist-overlay, #notif-overlay { position: fixed; inset: 0; z-index: 2000; }
+#panel-overlay { position: fixed; inset: 0; z-index: 2000; display: flex; background: var(--bg); }
+.panel-in-modal { flex: 1 !important; }
+#findings-modal, #hist-modal, #notif-modal {
+  background: var(--surface); border: none; border-radius: 0;
+  width: 100vw; height: 100vh;
+  display: flex; flex-direction: column;
+  position: fixed; top: 0; left: 0; overflow: hidden;
+}
+.panel-modal-hdr {
+  display: flex; align-items: center; gap: 0.5rem; flex-shrink: 0;
+  padding: 0.35rem 0.75rem; border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
 .findings-detail { color: var(--muted); font-size: 10px; word-break: break-all; }
-.findings-remediation { color: var(--muted); font-size: 10px; margin-top: .3rem; word-break: break-all; }
-.findings-remediation-lbl { color: #e3b341; font-size: 9px; text-transform: uppercase; letter-spacing: .05em; margin-right: .3rem; }
+.findings-remediation { color: #b3c2d1; font-size: 10px; word-break: break-all; }
 /* Add finding modal */
 #af-overlay { position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.65); }
 #af-modal {
@@ -1107,14 +1120,14 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   outline:none;border-color:var(--accent);
 }
 /* Notifications table */
-#notif-table { width: 100%; border-collapse: collapse; font-size: 11px; font-family: monospace; }
-#notif-table th {
+#notif-table, #notif-modal-table { width: 100%; border-collapse: collapse; font-size: 11px; font-family: monospace; }
+#notif-table th, #notif-modal-table th {
   background: var(--bg); color: var(--muted); font-weight: 600;
   font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
   padding: 0.2rem 0.5rem; text-align: left; position: sticky; top: 0;
 }
-#notif-table td { padding: 0.25rem 0.5rem; border-bottom: 1px solid var(--border); vertical-align: top; }
-#notif-table tr:hover td { background: var(--surface); }
+#notif-table td, #notif-modal-table td { padding: 0.25rem 0.5rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+#notif-table tr:hover td, #notif-modal-table tr:hover td { background: var(--surface); }
 .notif-method { color: var(--cyan); }
 .notif-params { color: var(--muted); font-size: 10px; word-break: break-all; }
 .mono { font-family: monospace; }
@@ -1388,8 +1401,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 <div id="main">
 
   <!-- Servers -->
-  <div class="panel">
-    <div class="phdr">
+  <div class="panel" id="servers-panel">
+    <div class="phdr" ondblclick="openPanelModal('servers-panel')" title="Double-click to expand" style="cursor:zoom-in">
       <span>Servers</span>
       <span id="srv-count" style="color:var(--accent)"></span>
     </div>
@@ -1410,8 +1423,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   <div class="resizer" id="rsz-0"></div>
 
   <!-- Tools / Resources / Prompts -->
-  <div class="panel">
-    <div class="phdr">
+  <div class="panel" id="enum-panel">
+    <div class="phdr" ondblclick="openPanelModal('enum-panel')" title="Double-click to expand" style="cursor:zoom-in">
       <span id="enum-panel-title">Tools</span>
       <span id="enum-count" style="color:var(--accent)"></span>
     </div>
@@ -1428,8 +1441,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   <div class="resizer" id="rsz-1"></div>
 
   <!-- Request -->
-  <div class="panel">
-    <div class="phdr">Request
+  <div class="panel" id="req-panel">
+    <div class="phdr" ondblclick="openPanelModal('req-panel')" title="Double-click to expand" style="cursor:zoom-in">Request
       <span id="req-server" style="color:var(--accent);font-size:10px;font-family:monospace"></span>
     </div>
     <div class="pbody">
@@ -1483,8 +1496,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   <div class="resizer" id="rsz-2"></div>
 
   <!-- Response -->
-  <div class="panel">
-    <div class="phdr">Response</div>
+  <div class="panel" id="resp-panel">
+    <div class="phdr" ondblclick="openPanelModal('resp-panel')" title="Double-click to expand" style="cursor:zoom-in">Response</div>
     <div class="pbody" id="resp-content">
       <div class="empty" style="padding:2rem 0;text-align:center">
         Send a tool call to see the response
@@ -1500,9 +1513,9 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 <div id="hist-panel">
   <div class="phdr">
     <div style="display:flex;gap:0.4rem;align-items:center">
-      <button class="hist-tab active" id="htab-history"       onclick="switchHistTab('history')">History</button>
-      <button class="hist-tab"        id="htab-findings"      onclick="switchHistTab('findings')">Findings</button>
-      <button class="hist-tab"        id="htab-notifications" onclick="switchHistTab('notifications')">Notifications</button>
+      <button class="hist-tab active" id="htab-history"       onclick="switchHistTab('history')" ondblclick="openHistoryModal()" title="Double-click to open full screen">History</button>
+      <button class="hist-tab"        id="htab-findings"      onclick="switchHistTab('findings')" ondblclick="openFindingsModal()" title="Double-click to open full screen">Findings</button>
+      <button class="hist-tab"        id="htab-notifications" onclick="switchHistTab('notifications')" ondblclick="openNotificationsModal()" title="Double-click to open full screen">Notifications</button>
     </div>
     <div style="display:flex;gap:0.4rem;align-items:center">
       <button class="btn-sm" id="hist-export-json" onclick="exportHistory()">Export JSON</button>
@@ -1539,10 +1552,10 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
     <div id="findings-view" style="display:none">
       <table id="findings-table">
         <thead>
-          <tr><th>Sev</th><th>Category</th><th>Server</th><th>Item</th><th>Detail / Remediation</th><th></th></tr>
+          <tr><th>Sev</th><th>Category</th><th>Server</th><th>Item</th><th>Detail</th><th>Remediation</th><th></th></tr>
         </thead>
         <tbody id="findings-body">
-          <tr><td colspan="6" class="empty" style="padding:.3rem .5rem">No findings — connect a server to scan</td></tr>
+          <tr><td colspan="7" class="empty" style="padding:.3rem .5rem">No findings — connect a server to scan</td></tr>
         </tbody>
       </table>
     </div>
@@ -1734,14 +1747,17 @@ async function fetchCertInfo(srv) {
     const certFindings = [];
     if (info.expired) {
       certFindings.push({severity:'high', category:'TLS', server:srvShort, item:'cert',
-        detail:`Certificate EXPIRED on ${info.expiry} — connections may be rejected by clients`});
+        detail:`Certificate EXPIRED on ${info.expiry} — connections may be rejected by clients`,
+        remediation:'Replace the certificate immediately. Configure automated renewal (e.g. certbot with a systemd timer or cron job) to prevent future expiry.'});
     } else if (info.expiring_soon) {
       certFindings.push({severity:'medium', category:'TLS', server:srvShort, item:'cert',
-        detail:`Certificate expires in ${info.days_remaining} day${info.days_remaining===1?'':'s'} (${info.expiry})`});
+        detail:`Certificate expires in ${info.days_remaining} day${info.days_remaining===1?'':'s'} (${info.expiry})`,
+        remediation:'Renew the certificate before expiry. Automate renewal using certbot or your CA\'s ACME client to avoid disruption.'});
     }
     if (info.self_signed) {
       certFindings.push({severity:'medium', category:'TLS', server:srvShort, item:'cert',
-        detail:`Self-signed certificate — not trusted by system store, susceptible to MITM if attacker has network positioning${info.verify_error ? ': ' + info.verify_error : ''}`});
+        detail:`Self-signed certificate — not trusted by system store, susceptible to MITM if attacker has network positioning${info.verify_error ? ': ' + info.verify_error : ''}`,
+        remediation:'Replace with a CA-signed certificate. For internal infrastructure, deploy a private CA and distribute the root certificate to clients. For public-facing servers, use Let\'s Encrypt (free, automated).'});
     }
     if (certFindings.length) {
       srv.findings = (srv.findings || []).filter(f => f.item !== 'cert');
@@ -2527,6 +2543,14 @@ const DANGER_RULES = [
            'private_key','env','environ']},
 ];
 
+const DANGEROUS_TOOL_REMEDIATION = {
+  filesystem: 'Validate all path inputs against an explicit allowlist of permitted directories. Canonicalize paths and reject traversal sequences (`../`). Run the server process with minimal filesystem permissions.',
+  'code exec': 'Sandbox execution in an isolated environment (container, VM, or seccomp profile). Validate and sanitize all inputs before execution. Require explicit authorization for any shell or script access.',
+  network:    'Validate destination URLs against an allowlist. Block RFC 1918, loopback, and link-local ranges to prevent SSRF. Log all outbound requests with destination and response metadata.',
+  database:   'Use parameterized queries exclusively — never interpolate user input into SQL. Apply least-privilege database credentials scoped to required tables only.',
+  secrets:    'Audit what credentials are exposed in tool responses. Ensure secrets are not returned in plaintext. Scope tokens to minimum required permissions and rotate any confirmed-exposed credentials.',
+};
+
 function flagTool(tool) {
   const name   = (tool.name        || '').toLowerCase();
   const desc   = (tool.description || '').toLowerCase();
@@ -2736,13 +2760,17 @@ function fingerprintServer(srv) {
 // ── Capability analysis ───────────────────────────────────────────────────
 
 const CAP_RISKS = {
-  sampling:     {level: 'critical', label: 'sampling',     tip: 'Server can invoke AI/LLM sampling on your client — billing risk and data exfiltration vector. Treat as critical.'},
-  experimental: {level: 'high',     label: 'experimental', tip: 'Server has undocumented experimental capabilities. Attack surface is unknown; audit all tools carefully.'},
-  roots:        {level: 'medium',   label: 'roots',        tip: 'Server declares filesystem root access. May be able to traverse or list host paths.'},
-  logging:      {level: 'medium',   label: 'logging',      tip: 'Server has logging capability — request data and tool arguments may be captured server-side.'},
-  resources:    {level: 'info',     label: 'resources',    tip: 'Server supports the resources/list endpoint.'},
-  prompts:      {level: 'info',     label: 'prompts',      tip: 'Server supports the prompts/list endpoint.'},
-  tools:        {level: 'info',     label: 'tools',        tip: 'Server supports the tools/list endpoint.'},
+  sampling:     {level: 'critical', label: 'sampling',     tip: 'Server can invoke AI/LLM sampling on your client — billing risk and data exfiltration vector. Treat as critical.',
+                 remediation: 'Remove the sampling capability declaration if not genuinely required. If needed, enforce strict rate limits and audit every model invocation for unexpected prompts or data exfiltration attempts.'},
+  experimental: {level: 'high',     label: 'experimental', tip: 'Server has undocumented experimental capabilities. Attack surface is unknown; audit all tools carefully.',
+                 remediation: 'Audit all tools and endpoints on this server. Experimental capabilities have no formal spec and may bypass standard protocol safety checks — restrict access until fully reviewed.'},
+  roots:        {level: 'medium',   label: 'roots',        tip: 'Server declares filesystem root access. May be able to traverse or list host paths.',
+                 remediation: 'Scope declared filesystem roots to the minimum required paths. Enforce strict path traversal prevention (canonicalize all inputs, reject `../`). Audit all tool parameters that accept file paths.'},
+  logging:      {level: 'medium',   label: 'logging',      tip: 'Server has logging capability — request data and tool arguments may be captured server-side.',
+                 remediation: 'Review what data the logging capability captures. Ensure sensitive tool arguments and bearer tokens are not written to logs in cleartext or transmitted to unintended third parties.'},
+  resources:    {level: 'info',     label: 'resources',    tip: 'Server supports the resources/list endpoint.', remediation: undefined},
+  prompts:      {level: 'info',     label: 'prompts',      tip: 'Server supports the prompts/list endpoint.', remediation: undefined},
+  tools:        {level: 'info',     label: 'tools',        tip: 'Server supports the tools/list endpoint.', remediation: undefined},
 };
 
 function capabilityBadges(srv) {
@@ -3125,6 +3153,9 @@ function scanServerFindings(srv) {
       detail: hasToken
         ? 'Connection is plain HTTP — bearer token is transmitted in cleartext'
         : 'Connection is plain HTTP — traffic is unencrypted and can be intercepted',
+      remediation: hasToken
+        ? 'Migrate to HTTPS immediately. Bearer tokens transmitted over HTTP are exposed to passive network interception. Obtain a TLS certificate and redirect all HTTP traffic to HTTPS.'
+        : 'Migrate to HTTPS to prevent passive eavesdropping and traffic manipulation. Obtain a TLS certificate and configure the server to accept encrypted connections only.',
     });
   }
 
@@ -3132,31 +3163,39 @@ function scanServerFindings(srv) {
   for (const v of matchVulns(srv)) {
     rows.push({severity: v.severity, category: 'Vulnerability',
       server: srvShort, item: 'server',
-      detail: `[${v.id}] ${v.title} — ${v.desc}`});
+      detail: `[${v.id}] ${v.title} — ${v.desc}`,
+      remediation: 'Apply the vendor patch or workaround for this vulnerability. Update the MCP server to the latest patched release and review the advisory for additional mitigations.'});
   }
 
   // Capability risks (skip plain info caps)
   const caps = srv.serverInfo?.capabilities || {};
   for (const k of Object.keys(caps)) {
-    const risk = CAP_RISKS[k] || {level: 'info', label: k, tip: `Undocumented capability: ${k}`};
+    const risk = CAP_RISKS[k] || {level: 'high', label: k, tip: `Undocumented capability: ${k}`,
+      remediation: 'Audit this undocumented capability. Unknown capabilities have no formal spec — restrict server access until the feature is understood and reviewed.'};
     if (risk.level === 'info') continue;
     rows.push({severity: risk.level, category: 'Capability Risk',
       server: srvShort, item: 'server',
-      detail: `${k}: ${risk.tip}`});
+      detail: `${k}: ${risk.tip}`,
+      remediation: risk.remediation});
   }
+
+  const INJECTION_REMEDIATION = 'Audit all tool names, descriptions, parameter names, resource URIs, and prompt content. Remove any embedded instructions that could redirect AI behaviour. Treat all server-provided metadata as untrusted input and validate it before including in model context.';
 
   // Tools — dangerous flags + injection findings
   for (const t of (srv.tools || [])) {
     const flags = flagTool(t);
     if (flags.length) {
+      const rem = flags.map(f => DANGEROUS_TOOL_REMEDIATION[f]).filter(Boolean).join(' ');
       rows.push({severity: 'medium', category: 'Dangerous Tool',
         server: srvShort, item: t.name,
-        detail: `High-impact categories: ${flags.join(', ')}`});
+        detail: `High-impact categories: ${flags.join(', ')}`,
+        remediation: rem});
     }
     for (const f of scanTool(t)) {
       rows.push({severity: 'high', category: 'Injection/Poisoning',
         server: srvShort, item: t.name,
-        detail: `${f.cat} in [${f.field}]: ${f.preview}`});
+        detail: `${f.cat} in [${f.field}]: ${f.preview}`,
+        remediation: INJECTION_REMEDIATION});
     }
   }
 
@@ -3165,7 +3204,8 @@ function scanServerFindings(srv) {
     for (const f of scanResource(r)) {
       rows.push({severity: 'high', category: 'Injection/Poisoning',
         server: srvShort, item: r.name || r.uri,
-        detail: `${f.cat} in [${f.field}]: ${f.preview}`});
+        detail: `${f.cat} in [${f.field}]: ${f.preview}`,
+        remediation: INJECTION_REMEDIATION});
     }
   }
 
@@ -3174,7 +3214,8 @@ function scanServerFindings(srv) {
     for (const f of scanPrompt(p)) {
       rows.push({severity: 'high', category: 'Injection/Poisoning',
         server: srvShort, item: p.name,
-        detail: `${f.cat} in [${f.field}]: ${f.preview}`});
+        detail: `${f.cat} in [${f.field}]: ${f.preview}`,
+        remediation: INJECTION_REMEDIATION});
     }
   }
 
@@ -3197,6 +3238,7 @@ function buildFindings() {
         server:   host,
         item:     e.tool,
         detail:   `${h.cat}: ${h.preview}`,
+        remediation: 'Audit the tool\'s response and remove or redact sensitive fields at the server layer before returning data to the client. Rotate any credentials confirmed as exposed.',
       });
     }
   }
@@ -3210,6 +3252,7 @@ function buildFindings() {
       server:   shortUrls.join(' / '),
       item:     name,
       detail:   `Tool name registered by ${urls.length} servers — a malicious server may intercept calls intended for another`,
+      remediation: 'Ensure your MCP client enforces server identity. Do not load untrusted servers alongside trusted ones without namespace isolation. Implement an allowlist of permitted tool names per trusted server.',
     });
   }
 
@@ -3217,19 +3260,13 @@ function buildFindings() {
   return rows;
 }
 
-function renderFindings() {
-  const findings = buildFindings();
-  const tbody = document.getElementById('findings-body');
-  const tab   = document.getElementById('htab-findings');
-  tab.textContent = findings.length ? `Findings (${findings.length})` : 'Findings';
-  if (!findings.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty" style="padding:.3rem .5rem">No findings — connect a server to scan</td></tr>';
-    return;
-  }
-  tbody.innerHTML = findings.map(f => {
-    const remHtml = f.remediation
-      ? `<div class="findings-remediation"><span class="findings-remediation-lbl">Remediation:</span>${esc(f.remediation)}</div>`
-      : '';
+function buildFindingRows(findings) {
+  if (!findings.length)
+    return '<tr><td colspan="7" class="empty" style="padding:.3rem .5rem">No findings — connect a server to scan</td></tr>';
+  return findings.map(f => {
+    const remCell = f.remediation
+      ? `<td class="findings-remediation">${esc(f.remediation)}</td>`
+      : `<td style="color:var(--border);font-size:10px">—</td>`;
     const delBtn = f.source === 'manual'
       ? `<button class="btn-sm" title="Delete finding" onclick="deleteManualFinding('${esc(f.id)}')">&#x2715;</button>`
       : '';
@@ -3238,10 +3275,76 @@ function renderFindings() {
       <td>${esc(f.category)}</td>
       <td style="color:var(--muted)">${esc(f.server)}</td>
       <td style="color:var(--accent)">${esc(f.item)}</td>
-      <td class="findings-detail">${esc(f.detail)}${remHtml}</td>
+      <td class="findings-detail">${esc(f.detail)}</td>
+      ${remCell}
       <td style="white-space:nowrap">${delBtn}</td>
     </tr>`;
   }).join('');
+}
+
+function renderFindings() {
+  const findings = buildFindings();
+  const tab = document.getElementById('htab-findings');
+  tab.textContent = findings.length ? `Findings (${findings.length})` : 'Findings';
+  document.getElementById('findings-body').innerHTML = buildFindingRows(findings);
+  // Keep modal in sync if open
+  const modalBody = document.getElementById('findings-modal-body');
+  if (modalBody) {
+    modalBody.innerHTML = buildFindingRows(findings);
+    const cnt = document.getElementById('findings-modal-count');
+    if (cnt) cnt.textContent = findings.length
+      ? `${findings.length} finding${findings.length === 1 ? '' : 's'}`
+      : 'No findings';
+  }
+}
+
+function openFindingsModal() {
+  const existing = document.getElementById('findings-overlay');
+  if (existing) { existing.style.display = ''; return; }
+  const exportMenu = `
+    <div style="position:relative">
+      <button class="btn-sm" onclick="document.getElementById('fm-exp-menu').style.display=document.getElementById('fm-exp-menu').style.display==='none'?'':'none'">Export &#9662;</button>
+      <div id="fm-exp-menu" style="display:none;position:absolute;right:0;top:100%;margin-top:2px;
+           background:var(--surface);border:1px solid var(--border);border-radius:4px;
+           z-index:100;min-width:110px;box-shadow:0 4px 12px rgba(0,0,0,.4)">
+        <div class="export-opt" onclick="exportFindings('csv')">CSV</div>
+        <div class="export-opt" onclick="exportFindings('json')">JSON</div>
+        <div class="export-opt" onclick="exportFindings('md')">Markdown</div>
+      </div>
+    </div>`;
+  const ov = document.createElement('div');
+  ov.id = 'findings-overlay';
+  ov.innerHTML = `
+    <div id="findings-modal">
+      <div class="panel-modal-hdr">
+        <span style="color:#e3b341;font-weight:700;font-family:monospace;font-size:13px">&#9873; Findings</span>
+        <span id="findings-modal-count" style="color:var(--muted);font-size:11px;flex:1"></span>
+        <button class="btn-sm" onclick="clearFindings()">Clear</button>
+        <button class="btn-sm" onclick="openAddFindingModal()">&#x2b; Add Finding</button>
+        ${exportMenu}
+        <button class="btn-sm" onclick="closeFindingsModal()">&#x2715; Close</button>
+      </div>
+      <div style="overflow-y:auto;flex:1">
+        <table id="findings-modal-table">
+          <thead>
+            <tr><th>Sev</th><th>Category</th><th>Server</th><th>Item</th><th>Detail</th><th>Remediation</th><th></th></tr>
+          </thead>
+          <tbody id="findings-modal-body"></tbody>
+        </table>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  renderFindings();
+  document.addEventListener('keydown', _findingsModalEsc);
+}
+
+function closeFindingsModal() {
+  document.removeEventListener('keydown', _findingsModalEsc);
+  document.getElementById('findings-overlay')?.remove();
+}
+
+function _findingsModalEsc(e) {
+  if (e.key === 'Escape') closeFindingsModal();
 }
 
 // ── Notifications ──────────────────────────────────────────────────────────
@@ -3256,15 +3359,10 @@ function addNotifications(serverUrl, notifs) {
   renderNotifications();
 }
 
-function renderNotifications() {
-  const tbody = document.getElementById('notif-body');
-  const tab   = document.getElementById('htab-notifications');
-  tab.textContent = S.notifications.length ? `Notifications (${S.notifications.length})` : 'Notifications';
-  if (!S.notifications.length) {
-    tbody.innerHTML = '<tr><td colspan="4" class="empty" style="padding:.3rem .5rem">No notifications — SSE servers push these during tool calls</td></tr>';
-    return;
-  }
-  tbody.innerHTML = S.notifications.slice().reverse().map(n =>
+function buildNotifRows() {
+  if (!S.notifications.length)
+    return '<tr><td colspan="4" class="empty" style="padding:.3rem .5rem">No notifications — SSE servers push these during tool calls</td></tr>';
+  return S.notifications.slice().reverse().map(n =>
     `<tr>
       <td style="color:var(--muted);white-space:nowrap">${esc(n.time)}</td>
       <td style="color:var(--muted);font-size:10px">${esc(n.server)}</td>
@@ -3272,6 +3370,95 @@ function renderNotifications() {
       <td class="notif-params">${esc(JSON.stringify(n.params))}</td>
     </tr>`
   ).join('');
+}
+
+function renderNotifications() {
+  const tab = document.getElementById('htab-notifications');
+  tab.textContent = S.notifications.length ? `Notifications (${S.notifications.length})` : 'Notifications';
+  document.getElementById('notif-body').innerHTML = buildNotifRows();
+  const modalBody = document.getElementById('notif-modal-body');
+  if (modalBody) {
+    modalBody.innerHTML = buildNotifRows();
+    const cnt = document.getElementById('notif-modal-count');
+    if (cnt) cnt.textContent = S.notifications.length
+      ? `${S.notifications.length} notification${S.notifications.length === 1 ? '' : 's'}`
+      : 'No notifications';
+  }
+}
+
+function openNotificationsModal() {
+  const existing = document.getElementById('notif-overlay');
+  if (existing) { existing.style.display = ''; return; }
+  const ov = document.createElement('div');
+  ov.id = 'notif-overlay';
+  ov.innerHTML = `
+    <div id="notif-modal">
+      <div class="panel-modal-hdr">
+        <span style="color:var(--cyan);font-weight:700;font-family:monospace;font-size:13px">&#9656; Notifications</span>
+        <span id="notif-modal-count" style="color:var(--muted);font-size:11px;flex:1"></span>
+        <button class="btn-sm" onclick="S.notifications=[];renderNotifications()">Clear</button>
+        <button class="btn-sm" onclick="closeNotificationsModal()">&#x2715; Close</button>
+      </div>
+      <div style="overflow-y:auto;flex:1">
+        <table id="notif-modal-table">
+          <thead>
+            <tr><th>Time</th><th>Server</th><th>Method</th><th>Params</th></tr>
+          </thead>
+          <tbody id="notif-modal-body"></tbody>
+        </table>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  renderNotifications();
+  document.addEventListener('keydown', _notifModalEsc);
+}
+
+function closeNotificationsModal() {
+  document.removeEventListener('keydown', _notifModalEsc);
+  document.getElementById('notif-overlay')?.remove();
+}
+
+function _notifModalEsc(e) { if (e.key === 'Escape') closeNotificationsModal(); }
+
+// ── Panel expand (DOM-relocation full-screen) ─────────────────────────────
+let _panelModalMeta = null;
+
+function openPanelModal(panelId) {
+  if (document.getElementById('panel-overlay')) return; // only one at a time
+  const panelEl = document.getElementById(panelId);
+  if (!panelEl) return;
+
+  const origParent      = panelEl.parentNode;
+  const origNextSibling = panelEl.nextSibling;
+
+  // Inject close button into the panel's existing phdr
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'btn-sm';
+  closeBtn.id        = 'panel-modal-close-btn';
+  closeBtn.innerHTML = '&#x2715; Close';
+  closeBtn.onclick   = closePanelModal;
+  panelEl.querySelector('.phdr').appendChild(closeBtn);
+
+  const ov = document.createElement('div');
+  ov.id = 'panel-overlay';
+  ov.appendChild(panelEl);
+  document.body.appendChild(ov);
+  panelEl.classList.add('panel-in-modal');
+
+  const escHandler = e => { if (e.key === 'Escape') closePanelModal(); };
+  document.addEventListener('keydown', escHandler);
+  _panelModalMeta = { origParent, origNextSibling, panelEl, escHandler };
+}
+
+function closePanelModal() {
+  if (!_panelModalMeta) return;
+  const { origParent, origNextSibling, panelEl, escHandler } = _panelModalMeta;
+  document.removeEventListener('keydown', escHandler);
+  document.getElementById('panel-modal-close-btn')?.remove();
+  panelEl.classList.remove('panel-in-modal');
+  origParent.insertBefore(panelEl, origNextSibling);
+  document.getElementById('panel-overlay')?.remove();
+  _panelModalMeta = null;
 }
 
 // ── Enum panel (Tools / Resources / Prompts) ──────────────────────────────
@@ -3891,13 +4078,10 @@ function statusBadges(data, isErr) {
   return html || `<span class="badge ${isErr ? 'badge-error' : 'badge-ok'}">${isErr ? 'err' : 'ok'}</span>`;
 }
 
-function renderHistory() {
-  const tbody = document.getElementById('hist-body');
-  if (!S.history.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty" style="padding:.3rem .5rem">No history</td></tr>';
-    return;
-  }
-  tbody.innerHTML = S.history.slice().reverse().map(e => {
+function buildHistoryRows() {
+  if (!S.history.length)
+    return '<tr><td colspan="6" class="empty" style="padding:.3rem .5rem">No history</td></tr>';
+  return S.history.slice().reverse().map(e => {
     let host = e.url;
     try { host = new URL(e.url).host; } catch {}
     const argStr = JSON.stringify(e.args);
@@ -3915,10 +4099,62 @@ function renderHistory() {
   }).join('');
 }
 
+function renderHistory() {
+  document.getElementById('hist-body').innerHTML = buildHistoryRows();
+  const modalBody = document.getElementById('hist-modal-body');
+  if (modalBody) {
+    modalBody.innerHTML = buildHistoryRows();
+    const cnt = document.getElementById('hist-modal-count');
+    if (cnt) cnt.textContent = S.history.length
+      ? `${S.history.length} entr${S.history.length === 1 ? 'y' : 'ies'}`
+      : 'No history';
+  }
+}
+
 document.getElementById('hist-body').addEventListener('click', e => {
   const btn = e.target.closest('[data-replay]');
   if (btn) replayEntry(parseInt(btn.dataset.replay));
 });
+
+function openHistoryModal() {
+  const existing = document.getElementById('hist-overlay');
+  if (existing) { existing.style.display = ''; return; }
+  const ov = document.createElement('div');
+  ov.id = 'hist-overlay';
+  ov.innerHTML = `
+    <div id="hist-modal">
+      <div class="panel-modal-hdr">
+        <span style="color:var(--accent);font-weight:700;font-family:monospace;font-size:13px">&#9654; History</span>
+        <span id="hist-modal-count" style="color:var(--muted);font-size:11px;flex:1"></span>
+        <button class="btn-sm" onclick="exportHistory()">Export JSON</button>
+        <button class="btn-sm" onclick="exportMarkdown()">Export MD</button>
+        <button class="btn-sm" onclick="clearHistory()">Clear</button>
+        <button class="btn-sm" onclick="closeHistoryModal()">&#x2715; Close</button>
+      </div>
+      <div style="overflow-y:auto;flex:1">
+        <table id="hist-modal-table">
+          <thead>
+            <tr><th>Time</th><th>Server</th><th>Tool</th><th>Args</th><th>Status</th><th></th></tr>
+          </thead>
+          <tbody id="hist-modal-body"></tbody>
+        </table>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener('click', e => {
+    const btn = e.target.closest('[data-replay]');
+    if (btn) { closeHistoryModal(); replayEntry(parseInt(btn.dataset.replay)); }
+  });
+  renderHistory();
+  document.addEventListener('keydown', _histModalEsc);
+}
+
+function closeHistoryModal() {
+  document.removeEventListener('keydown', _histModalEsc);
+  document.getElementById('hist-overlay')?.remove();
+}
+
+function _histModalEsc(e) { if (e.key === 'Escape') closeHistoryModal(); }
 
 function replayEntry(id) {
   const e = S.history[id];
@@ -4703,6 +4939,7 @@ function analyzeAuthFindings(srv, vars, results) {
       server:   srvShort,
       item:     'auth-test',
       detail:   `${confidence}. Succeeded with ${what}`,
+      remediation: 'Enforce authentication at the middleware layer on every request — not only during the initialize handshake. Validate the Authorization header before any handler executes and reject missing, empty, null, or unsigned tokens with HTTP 401.',
     });
   }
 
@@ -4713,6 +4950,7 @@ function analyzeAuthFindings(srv, vars, results) {
       server:   srvShort,
       item:     'auth-test',
       detail:   'Request succeeded with alternate auth when baseline (current token) failed — inconsistent auth enforcement',
+      remediation: 'Audit the authentication logic for consistency across all endpoints. Ensure auth validation is centralised in middleware rather than duplicated per-handler, and that all failure paths return HTTP 401.',
     });
   }
 
