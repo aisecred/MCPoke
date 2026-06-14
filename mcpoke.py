@@ -696,6 +696,55 @@ def _fetch_cert_sync(host: str, port: int) -> dict:
     return result
 
 
+class RaceRequest(BaseModel):
+    url:       str
+    token:     Optional[str] = None
+    transport: Literal["http", "sse"] = "http"
+    proxy:     Optional[str] = None
+    payload:   dict
+    count:     int = 10
+
+    @field_validator("url")
+    @classmethod
+    def url_scheme(cls, v: str) -> str:
+        return _validate_url(v)
+
+    @field_validator("count")
+    @classmethod
+    def clamp_count(cls, v: int) -> int:
+        return max(2, min(50, v))
+
+
+@app.post("/race")
+async def race_call(req: RaceRequest):
+    """Fire N concurrent requests and return all results for race condition testing."""
+    extra_headers: dict = {}
+    if req.token:
+        extra_headers["Authorization"] = f"Bearer {req.token}"
+
+    async def _one(idx: int) -> dict:
+        t0 = asyncio.get_event_loop().time()
+        try:
+            session_ctx = _make_session(req.proxy)
+        except RuntimeError as e:
+            return {"idx": idx, "error": str(e), "elapsed": 0}
+        try:
+            async with session_ctx as session:
+                body, status = await _post_json(session, req.url, req.payload,
+                                                extra_headers=extra_headers,
+                                                proxy=req.proxy)
+            elapsed = round((asyncio.get_event_loop().time() - t0) * 1000)
+            if body is None:
+                return {"idx": idx, "status": status, "error": f"HTTP {status}", "elapsed": elapsed}
+            return {"idx": idx, "status": status, "result": body, "elapsed": elapsed}
+        except Exception as exc:
+            elapsed = round((asyncio.get_event_loop().time() - t0) * 1000)
+            return {"idx": idx, "error": str(exc), "elapsed": elapsed}
+
+    results = await asyncio.gather(*[_one(i) for i in range(req.count)])
+    return {"results": list(results)}
+
+
 @app.get("/cert")
 async def cert_info(url: str):
     parsed = urllib.parse.urlparse(url)
@@ -1095,6 +1144,20 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 }
 .findings-detail { color: var(--muted); font-size: 10px; word-break: break-all; }
 .findings-remediation { color: #b3c2d1; font-size: 10px; word-break: break-all; }
+/* Overview dashboard */
+.ov-grid { display:grid; grid-template-columns:1fr 1fr; gap:.5rem; padding:.4rem; }
+.ov-card { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:.5rem .65rem; }
+.ov-card-title { font-size:10px; font-weight:700; color:var(--muted); text-transform:uppercase;
+  letter-spacing:.05em; margin-bottom:.4rem; }
+.ov-stat-row { display:flex; align-items:center; gap:.4rem; margin:.15rem 0; }
+.ov-stat-num { font-size:16px; font-weight:700; color:var(--fg); min-width:2rem; text-align:right; }
+.ov-stat-lbl { font-size:11px; color:var(--muted); }
+.ov-cat-row { display:flex; justify-content:space-between; font-size:10px;
+  color:var(--muted); padding:.1rem 0; border-top:1px solid var(--border); margin-top:.15rem; }
+.ov-cat-name { flex:1; }
+.ov-cat-count { font-weight:700; color:var(--fg); }
+.ov-cap-row { display:flex; align-items:flex-start; gap:.4rem; font-size:10px; margin:.2rem 0; }
+.ov-cap-tip { flex:1; color:var(--muted); font-size:10px; line-height:1.3; }
 /* Add finding modal */
 #af-overlay { position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.65); }
 #af-modal {
@@ -1348,6 +1411,92 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 .fuzz-pl  { font-family: monospace; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fuzz-pre { color: var(--muted); font-family: monospace; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 600px; }
 
+/* ── Race modal ── */
+#race-overlay { position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.65); }
+#race-modal {
+  background:var(--surface);border:none;border-radius:0;
+  width:100vw;height:100vh;
+  display:flex;flex-direction:column;
+  position:fixed;top:0;left:0;overflow:hidden;
+}
+.race-hdr {
+  display:flex;align-items:center;gap:.6rem;flex-shrink:0;
+  padding:.35rem .75rem;border-bottom:1px solid var(--border);background:var(--bg);
+}
+.race-hdr-title { color:var(--accent);font-weight:700;font-family:monospace;font-size:13px; }
+#race-tbl { width:100%;border-collapse:collapse;font-size:11px; }
+#race-tbl th {
+  background:var(--bg);color:var(--muted);font-size:10px;
+  text-transform:uppercase;letter-spacing:.06em;
+  padding:.2rem .5rem;text-align:left;position:sticky;top:0;z-index:1;
+}
+#race-tbl td { padding:.3rem .5rem;border-bottom:1px solid #21262d;vertical-align:middle;font-family:monospace; }
+#race-tbl tr.race-outlier td { background:#2d1a00; }
+#race-tbl tr.clickable:hover td { background:#0d2040;cursor:pointer; }
+#race-tbl tr.race-selected td { background:#0d2040; }
+#race-response-pane {
+  flex-shrink:0;overflow-y:auto;background:var(--bg);
+  border-top:1px solid var(--border);font-family:monospace;font-size:11px;
+  padding:.5rem .75rem;color:var(--text);white-space:pre-wrap;word-break:break-all;
+}
+.race-h-resizer {
+  height:5px;flex-shrink:0;background:var(--border);cursor:row-resize;transition:background .15s;
+}
+.race-h-resizer:hover,.race-h-resizer.dragging { background:var(--accent); }
+
+/* ── Intruder modal ── */
+#intruder-overlay { position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.65); }
+#intruder-modal {
+  background:var(--surface);border:none;border-radius:0;
+  width:100vw;height:100vh;
+  display:flex;flex-direction:column;
+  position:fixed;top:0;left:0;overflow:hidden;
+}
+.intruder-hdr {
+  display:flex;align-items:center;gap:.6rem;flex-shrink:0;
+  padding:.35rem .75rem;border-bottom:1px solid var(--border);background:var(--bg);
+}
+.intruder-hdr-title { color:var(--accent);font-weight:700;font-family:monospace;font-size:13px; }
+.intruder-body { display:flex;flex:1;overflow:hidden;gap:0; }
+.intruder-left { width:280px;flex-shrink:0;border-right:1px solid var(--border);
+  display:flex;flex-direction:column;overflow:hidden; }
+.intruder-right { flex:1;display:flex;flex-direction:column;overflow:hidden; }
+.intruder-section-hdr { font-size:10px;font-weight:700;color:var(--muted);
+  text-transform:uppercase;letter-spacing:.05em;
+  padding:.3rem .5rem;background:var(--bg);border-bottom:1px solid var(--border);flex-shrink:0; }
+.intruder-param-list { flex:1;overflow-y:auto;padding:.3rem; }
+.intruder-param-item { font-size:11px;font-family:monospace;padding:.25rem .4rem;
+  border-radius:3px;cursor:pointer;word-break:break-all; }
+.intruder-param-item:hover { background:var(--surface); }
+.intruder-param-item.selected { background:#2a1a00;border:1px solid #e3b341; }
+.intruder-param-item .ipkey { color:var(--muted); }
+.intruder-param-item .ipval { color:var(--accent); }
+.intruder-src-tabs { display:flex;gap:2px;padding:.25rem .4rem;
+  background:var(--bg);border-bottom:1px solid var(--border);flex-shrink:0; }
+.intruder-src-tab { font-size:11px;padding:.15rem .4rem;border-radius:3px;
+  border:1px solid transparent;background:none;color:var(--muted);cursor:pointer; }
+.intruder-src-tab.active { background:#0d2040;border-color:var(--accent);color:var(--accent);font-weight:600; }
+.intruder-source-pane { flex:1;overflow-y:auto;padding:.4rem; }
+#intruder-tbl { width:100%;border-collapse:collapse;font-size:11px; }
+#intruder-tbl th {
+  background:var(--bg);color:var(--muted);font-size:10px;
+  text-transform:uppercase;letter-spacing:.06em;
+  padding:.2rem .5rem;text-align:left;position:sticky;top:0;z-index:1;
+}
+#intruder-tbl td { padding:.3rem .5rem;border-bottom:1px solid #21262d;vertical-align:middle; }
+#intruder-tbl tr.intr-anomaly td { background:#2d1a00; }
+#intruder-tbl tr.clickable:hover td { background:#0d2040;cursor:pointer; }
+#intruder-tbl tr.intr-selected td { background:#0d2040; }
+#intruder-response-pane {
+  flex-shrink:0;overflow-y:auto;background:var(--bg);
+  border-top:1px solid var(--border);font-family:monospace;font-size:11px;
+  padding:.5rem .75rem;color:var(--text);white-space:pre-wrap;word-break:break-all;
+}
+.intr-h-resizer {
+  height:5px;flex-shrink:0;background:var(--border);cursor:row-resize;transition:background .15s;
+}
+.intr-h-resizer:hover,.intr-h-resizer.dragging { background:var(--accent); }
+
 /* ── Enum panel tabs ── */
 .tab-bar { display: flex; gap: 2px; padding: 0.25rem 0.4rem;
            background: var(--surface); border-bottom: 1px solid var(--border);
@@ -1429,6 +1578,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
       <span id="enum-count" style="color:var(--accent)"></span>
     </div>
     <div class="tab-bar">
+      <button class="tab-btn"        id="tab-overview"  onclick="switchTab('overview')">Overview</button>
       <button class="tab-btn active" id="tab-tools"     onclick="switchTab('tools')">Tools</button>
       <button class="tab-btn"        id="tab-resources" onclick="switchTab('resources')">Resources</button>
       <button class="tab-btn"        id="tab-prompts"   onclick="switchTab('prompts')">Prompts</button>
@@ -1478,6 +1628,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
             <button class="btn-sm" onclick="markSection()" title="Wrap selection with §§ injection markers">&#167; Mark</button>
             <button class="btn-sm" id="fuzz-btn" style="display:none" onclick="toggleFuzzer()" title="Show / hide Fuzzer">&#9889; Fuzz</button>
             <button class="btn-sm" onclick="openAuthTestModal()" title="Test auth bypass variations">&#9919; Auth</button>
+            <button class="btn-sm" onclick="openRaceModal()" title="Fire concurrent requests to test for race conditions">&#9651; Race</button>
             <button class="btn-sm" onclick="substituteOobInEditor()" title="Replace placeholder domains with your OOB URL">Sub OOB</button>
             <div style="position:relative">
               <button class="btn-sm" onclick="toggleProtocolMenu()" title="Inject MCP protocol edge-case payload">Protocol &#9662;</button>
@@ -1518,6 +1669,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
       <button class="hist-tab"        id="htab-notifications" onclick="switchHistTab('notifications')" ondblclick="openNotificationsModal()" title="Double-click to open full screen">Notifications</button>
     </div>
     <div style="display:flex;gap:0.4rem;align-items:center">
+      <button class="btn-sm" id="hist-diff-btn" style="display:none;color:#58a6ff;border-color:#1a3a5c" onclick="openDiffModal()">&#8942; Diff (2)</button>
       <button class="btn-sm" id="hist-export-json" onclick="exportHistory()">Export JSON</button>
       <button class="btn-sm" id="hist-export-md"   onclick="exportMarkdown()">Export MD</button>
       <button class="btn-sm" id="hist-clear"        onclick="clearHistory()">Clear</button>
@@ -1540,22 +1692,22 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
       <table id="hist-table">
         <thead>
           <tr>
-            <th>Time</th><th>Server</th><th>Tool</th><th>Args</th>
+            <th></th><th>Time</th><th>Server</th><th>Tool</th><th>Args</th>
             <th>Status</th><th></th>
           </tr>
         </thead>
         <tbody id="hist-body">
-          <tr><td colspan="6" class="empty" style="padding:.3rem .5rem">No history</td></tr>
+          <tr><td colspan="7" class="empty" style="padding:.3rem .5rem">No history</td></tr>
         </tbody>
       </table>
     </div>
     <div id="findings-view" style="display:none">
       <table id="findings-table">
         <thead>
-          <tr><th>Sev</th><th>Category</th><th>Server</th><th>Item</th><th>Detail</th><th>Remediation</th><th></th></tr>
+          <tr><th>Sev</th><th>Status</th><th>Category</th><th>Server</th><th>Item</th><th>Detail</th><th>Remediation</th><th></th></tr>
         </thead>
         <tbody id="findings-body">
-          <tr><td colspan="7" class="empty" style="padding:.3rem .5rem">No findings — connect a server to scan</td></tr>
+          <tr><td colspan="8" class="empty" style="padding:.3rem .5rem">No findings — connect a server to scan</td></tr>
         </tbody>
       </table>
     </div>
@@ -1579,10 +1731,12 @@ const S = {
   servers: {},      // url -> ServerState
   activeUrl: null,
   selectedIdx: -1,
-  activeTab: 'tools',  // 'tools' | 'resources' | 'prompts'
+  activeTab: 'tools',  // 'tools' | 'resources' | 'prompts' | 'overview'
   history: [],
   notifications: [],
   rawMode: false,
+  findingStatus: JSON.parse(localStorage.getItem('mcpoke-finding-status') || '{}'),
+  histChecked: [],  // up to 2 history entry IDs selected for diff
 };
 
 function mkServer(url, token, proxy) {
@@ -3096,9 +3250,9 @@ function exportFindings(fmt) {
 
   if (fmt === 'csv') {
     const escape = v => '"' + String(v || '').replace(/"/g, '""') + '"';
-    const rows = [['Severity','Category','Server','Item','Detail','Remediation','Source'].map(escape).join(',')];
+    const rows = [['Severity','Status','Category','Server','Item','Detail','Remediation','Source'].map(escape).join(',')];
     for (const f of findings)
-      rows.push([f.severity, f.category, f.server, f.item, f.detail,
+      rows.push([f.severity, S.findingStatus[findingFp(f)] || 'open', f.category, f.server, f.item, f.detail,
                  f.remediation || '', f.source || 'auto'].map(escape).join(','));
     content = rows.join('\r\n');
     mime = 'text/csv'; ext = 'csv';
@@ -3260,18 +3414,39 @@ function buildFindings() {
   return rows;
 }
 
+const FINDING_STATUS_CYCLE = ['open', 'confirmed', 'false_positive', 'accepted_risk'];
+const FINDING_STATUS_LABEL = {open:'open', confirmed:'confirmed', false_positive:'false pos.', accepted_risk:'accepted'};
+const FINDING_STATUS_COLOR = {open:'var(--muted)', confirmed:'#e85c5c', false_positive:'var(--border)', accepted_risk:'#e3b341'};
+
+function findingFp(f) {
+  return `${f.category}|${f.server}|${f.item}|${(f.detail||'').slice(0,60)}`;
+}
+
+function cycleFindingStatus(fp) {
+  const cur = S.findingStatus[fp] || 'open';
+  const next = FINDING_STATUS_CYCLE[(FINDING_STATUS_CYCLE.indexOf(cur) + 1) % FINDING_STATUS_CYCLE.length];
+  if (next === 'open') delete S.findingStatus[fp]; else S.findingStatus[fp] = next;
+  localStorage.setItem('mcpoke-finding-status', JSON.stringify(S.findingStatus));
+  renderFindings();
+}
+
 function buildFindingRows(findings) {
   if (!findings.length)
-    return '<tr><td colspan="7" class="empty" style="padding:.3rem .5rem">No findings — connect a server to scan</td></tr>';
+    return '<tr><td colspan="8" class="empty" style="padding:.3rem .5rem">No findings — connect a server to scan</td></tr>';
   return findings.map(f => {
+    const fp     = findingFp(f);
+    const status = S.findingStatus[fp] || 'open';
     const remCell = f.remediation
       ? `<td class="findings-remediation">${esc(f.remediation)}</td>`
       : `<td style="color:var(--border);font-size:10px">—</td>`;
     const delBtn = f.source === 'manual'
       ? `<button class="btn-sm" title="Delete finding" onclick="deleteManualFinding('${esc(f.id)}')">&#x2715;</button>`
       : '';
-    return `<tr>
+    const rowStyle = status === 'false_positive' ? ' style="opacity:.45;text-decoration:line-through"' : '';
+    return `<tr${rowStyle}>
       <td><span class="cap-${esc(f.severity)}">${esc(f.severity)}</span></td>
+      <td><button class="btn-sm" style="font-size:9px;color:${FINDING_STATUS_COLOR[status]};white-space:nowrap"
+          title="Click to cycle status" onclick="cycleFindingStatus('${esc(fp)}')">${FINDING_STATUS_LABEL[status]}</button></td>
       <td>${esc(f.category)}</td>
       <td style="color:var(--muted)">${esc(f.server)}</td>
       <td style="color:var(--accent)">${esc(f.item)}</td>
@@ -3327,7 +3502,7 @@ function openFindingsModal() {
       <div style="overflow-y:auto;flex:1">
         <table id="findings-modal-table">
           <thead>
-            <tr><th>Sev</th><th>Category</th><th>Server</th><th>Item</th><th>Detail</th><th>Remediation</th><th></th></tr>
+            <tr><th>Sev</th><th>Status</th><th>Category</th><th>Server</th><th>Item</th><th>Detail</th><th>Remediation</th><th></th></tr>
           </thead>
           <tbody id="findings-modal-body"></tbody>
         </table>
@@ -3465,18 +3640,19 @@ function closePanelModal() {
 
 function renderTabContent(srv) {
   const tab = S.activeTab;
-  ['tools','resources','prompts'].forEach(t =>
+  ['overview','tools','resources','prompts'].forEach(t =>
     document.getElementById('tab-' + t).classList.toggle('active', t === tab));
   if (!srv) {
     document.getElementById('enum-panel-title').textContent =
-      tab.charAt(0).toUpperCase() + tab.slice(1);
+      tab === 'overview' ? 'Overview' : tab.charAt(0).toUpperCase() + tab.slice(1);
     document.getElementById('enum-count').textContent = '';
     document.getElementById('enum-list').innerHTML =
       '<div class="empty" style="padding:.5rem">Select a server</div>';
     return;
   }
   updateTabCounts(srv);
-  if (tab === 'tools')         renderToolsList(srv.tools     || []);
+  if (tab === 'overview')       renderOverview(srv);
+  else if (tab === 'tools')     renderToolsList(srv.tools     || []);
   else if (tab === 'resources') renderResourcesList(srv.resources || []);
   else                          renderPromptsList(srv.prompts   || []);
 }
@@ -3485,9 +3661,114 @@ function updateTabCounts(srv) {
   const tc = (srv?.tools     || []).length;
   const rc = (srv?.resources || []).length;
   const pc = (srv?.prompts   || []).length;
+  document.getElementById('tab-overview').textContent  = 'Overview';
   document.getElementById('tab-tools').textContent     = tc ? `Tools (${tc})`     : 'Tools';
   document.getElementById('tab-resources').textContent = rc ? `Resources (${rc})` : 'Resources';
   document.getElementById('tab-prompts').textContent   = pc ? `Prompts (${pc})`   : 'Prompts';
+}
+
+function renderOverview(srv) {
+  document.getElementById('enum-panel-title').textContent = 'Overview';
+  document.getElementById('enum-count').textContent = '';
+  const list = document.getElementById('enum-list');
+
+  // Findings breakdown
+  const findings = buildFindings().filter(f => {
+    let host = srv.url; try { host = new URL(srv.url).host; } catch {}
+    return f.server === host || f.server === srv.url ||
+      (srv.serverInfo?.name && f.server === srv.serverInfo.name);
+  });
+  // Also include findings with this server's host anywhere in server field
+  const allFindings = buildFindings();
+  let srvHost = srv.url; try { srvHost = new URL(srv.url).host; } catch {}
+  const srvFindings = allFindings.filter(f =>
+    f.server && (f.server.includes(srvHost) || (srv.serverInfo?.name && f.server.includes(srv.serverInfo.name)))
+  );
+
+  const sevCount = {critical:0, high:0, medium:0, info:0};
+  const catCount = {};
+  for (const f of srvFindings) {
+    sevCount[f.severity] = (sevCount[f.severity] || 0) + 1;
+    catCount[f.category] = (catCount[f.category] || 0) + 1;
+  }
+
+  // Dangerous tools breakdown
+  const tools = srv.tools || [];
+  const dangerCatCount = {};
+  let dangerTotal = 0;
+  for (const t of tools) {
+    const flags = flagTool(t);
+    if (flags.length) { dangerTotal++; flags.forEach(f => { dangerCatCount[f] = (dangerCatCount[f]||0)+1; }); }
+  }
+
+  // Capabilities
+  const caps = srv.serverInfo?.capabilities || {};
+  const capKeys = Object.keys(caps);
+
+  // Transport
+  const isHttps = srv.url.startsWith('https://');
+  const certInfo = srv.certInfo;
+  let transportHtml;
+  if (isHttps) {
+    if (certInfo?.self_signed)
+      transportHtml = `<span class="cap-high">&#128274; HTTPS (self-signed)</span>`;
+    else if (certInfo?.verified === false)
+      transportHtml = `<span class="cap-high">&#128274; HTTPS (cert error)</span>`;
+    else
+      transportHtml = `<span class="cap-info">&#128274; HTTPS</span>`;
+  } else {
+    transportHtml = `<span class="cap-critical">&#128275; Plaintext HTTP — credentials and data in cleartext</span>`;
+  }
+
+  // Injection findings count
+  const injN = totalInjectionFindings(srv);
+
+  const card = (title, body) =>
+    `<div class="ov-card"><div class="ov-card-title">${title}</div>${body}</div>`;
+
+  // Enumeration counts card
+  const enumBody = `
+    <div class="ov-stat-row"><span class="ov-stat-num">${tools.length}</span><span class="ov-stat-lbl">Tools</span></div>
+    <div class="ov-stat-row"><span class="ov-stat-num">${(srv.resources||[]).length}</span><span class="ov-stat-lbl">Resources</span></div>
+    <div class="ov-stat-row"><span class="ov-stat-num">${(srv.prompts||[]).length}</span><span class="ov-stat-lbl">Prompts</span></div>
+    ${injN ? `<div class="ov-stat-row"><span class="ov-stat-num" style="color:#e85c5c">&#9873; ${injN}</span><span class="ov-stat-lbl">Injection findings</span></div>` : ''}
+  `;
+
+  // Findings severity card
+  const total = Object.values(sevCount).reduce((a,b)=>a+b,0);
+  const sevBody = total ? `
+    ${['critical','high','medium','info'].map(s => sevCount[s]
+      ? `<div class="ov-stat-row"><span class="cap-${s}" style="min-width:60px;text-align:center">${sevCount[s]}</span><span class="ov-stat-lbl">${s}</span></div>`
+      : '').join('')}
+    ${Object.entries(catCount).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([c,n]) =>
+      `<div class="ov-cat-row"><span class="ov-cat-name">${esc(c)}</span><span class="ov-cat-count">${n}</span></div>`
+    ).join('')}
+  ` : '<div style="color:var(--muted);font-size:11px;padding:.25rem 0">No findings for this server</div>';
+
+  // Tool risk card
+  const toolBody = dangerTotal ? `
+    <div class="ov-stat-row"><span class="ov-stat-num" style="color:#e3b341">${dangerTotal}</span><span class="ov-stat-lbl">of ${tools.length} tools flagged dangerous</span></div>
+    ${Object.entries(dangerCatCount).sort((a,b)=>b[1]-a[1]).map(([c,n]) =>
+      `<div class="ov-cat-row"><span class="ov-cat-name">${esc(c)}</span><span class="ov-cat-count">${n}</span></div>`
+    ).join('')}
+  ` : `<div style="color:var(--muted);font-size:11px;padding:.25rem 0">No dangerous tools detected${tools.length ? '' : ' (no tools)'}</div>`;
+
+  // Capabilities card
+  const capBody = capKeys.length ? capKeys.map(k => {
+    const risk = CAP_RISKS[k] || {level:'info', label:k, tip:`Undocumented: ${k}`};
+    return `<div class="ov-cap-row"><span class="cap-${risk.level}">${esc(risk.label)}</span><span class="ov-cap-tip">${esc(risk.tip)}</span></div>`;
+  }).join('') : '<div style="color:var(--muted);font-size:11px;padding:.25rem 0">No capabilities declared</div>';
+
+  list.innerHTML = `<div class="ov-grid">
+    ${card('Enumeration', enumBody)}
+    ${card('Findings by Severity', sevBody)}
+    ${card('Dangerous Tools', toolBody)}
+    ${card('Capabilities', capBody)}
+    ${card('Transport', `<div style="padding:.2rem 0">${transportHtml}</div>
+      ${certInfo?.subject_cn ? `<div class="ov-cap-tip" style="margin-top:.3rem">CN: ${esc(certInfo.subject_cn)}</div>` : ''}
+      ${certInfo?.not_after  ? `<div class="ov-cap-tip">Expires: ${esc(certInfo.not_after)}</div>` : ''}
+    `)}
+  </div>`;
 }
 
 function renderToolsList(tools) {
@@ -3844,6 +4125,27 @@ const PROTOCOL_PRESETS = [
     hint:  'add an unrecognised top-level field — servers should ignore it',
     payload: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{},"mcpokeTest":true},
   },
+  // ── MCP spec coverage ────────────────────────────────────────────────────
+  {
+    label: 'MCP: ping',
+    hint:  'health-check endpoint — often unauthenticated; check if auth is enforced',
+    payload: {"jsonrpc":"2.0","id":1,"method":"ping","params":{}},
+  },
+  {
+    label: 'MCP: completion/complete',
+    hint:  'autocomplete endpoint — injection vector; check for reflected input and auth enforcement',
+    payload: {"jsonrpc":"2.0","id":1,"method":"completion/complete","params":{"ref":{"type":"ref/prompt","name":"example"},"argument":{"name":"query","value":"test"}}},
+  },
+  {
+    label: 'MCP: resources/subscribe',
+    hint:  'subscribe to resource updates — check if unauthorised subscriptions are accepted',
+    payload: {"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"resource://EDIT_ME"}},
+  },
+  {
+    label: 'MCP: logging/setLevel',
+    hint:  'control server log verbosity — check if unprivileged callers can set DEBUG and extract sensitive log data',
+    payload: {"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"debug"}},
+  },
 ];
 
 function toggleProtocolMenu() {
@@ -3873,6 +4175,15 @@ function injectProtocolPreset(idx) {
 
 // ── Form generation ────────────────────────────────────────────────────────
 
+const TYPE_CONFUSION_PAYLOADS = {
+  integer: ['"1"', 'null', '[]', '{}', '-1', '2147483648', '1.5', 'true', '"abc"', '""'],
+  number:  ['"1.5"', 'null', '[]', '{}', '-1', 'Infinity', 'NaN', 'true', '"abc"'],
+  string:  ['0', 'true', 'false', 'null', '[]', '{}', '-1', '""'],
+  boolean: ['"true"', '"false"', '1', '0', 'null', '"yes"', '"no"', '[]'],
+  array:   ['null', '""', '0', '{}', 'false', '"[]"'],
+  object:  ['null', '[]', '""', '0', 'false', '"{}\"'],
+};
+
 function generateForm(schema) {
   if (!schema || !schema.properties || !Object.keys(schema.properties).length) {
     return `<div class="param-group">
@@ -3898,18 +4209,26 @@ function generateForm(schema) {
         <input type="checkbox" id="p-${esc(name)}" data-name="${esc(name)}" data-type="boolean">
         <label for="p-${esc(name)}" style="color:var(--text)">true</label></div>`;
     } else if (type === 'number' || type === 'integer') {
-      input = `<input type="number" id="p-${esc(name)}"
-        data-name="${esc(name)}" data-type="${type}"
-        placeholder="${type}" step="${type==='integer'?'1':'any'}">`;
+      input = `<div class="param-input-row">
+        <input type="number" id="p-${esc(name)}"
+          data-name="${esc(name)}" data-type="${type}"
+          placeholder="${type}" step="${type==='integer'?'1':'any'}">
+        <button class="inject-btn btn-sm" data-inject-for="p-${esc(name)}" data-field-type="${type}"
+          title="Inject type confusion / payload">&#9889;</button>
+      </div>`;
     } else if (type === 'array' || type === 'object') {
-      input = `<textarea id="p-${esc(name)}" data-name="${esc(name)}"
-        data-type="${type}" rows="3" placeholder="${type==='array'?'[]':'{}'}"></textarea>`;
+      input = `<div class="param-input-row">
+        <textarea id="p-${esc(name)}" data-name="${esc(name)}"
+          data-type="${type}" rows="3" placeholder="${type==='array'?'[]':'{}'}"></textarea>
+        <button class="inject-btn btn-sm" data-inject-for="p-${esc(name)}" data-field-type="${type}"
+          title="Inject type confusion / payload" style="align-self:flex-start">&#9889;</button>
+      </div>`;
     } else {
       const ph = prop.default !== undefined ? String(prop.default) : (prop.format || '');
       input = `<div class="param-input-row">
         <input type="text" id="p-${esc(name)}"
           data-name="${esc(name)}" data-type="string" placeholder="${esc(ph)}">
-        <button class="inject-btn btn-sm" data-inject-for="p-${esc(name)}"
+        <button class="inject-btn btn-sm" data-inject-for="p-${esc(name)}" data-field-type="string"
           title="Inject payload">&#9889;</button>
       </div>`;
     }
@@ -4006,7 +4325,7 @@ async function doSend() {
     const elapsed = Date.now() - t0;
     const isErr        = !!(body?.error || body?.result?.error || body?.result?.isError);
     const sensitiveHits = showResponse(body, elapsed, args);
-    addHistory(srv.url, toolName, args, body, isErr, elapsed, sensitiveHits);
+    addHistory(srv.url, toolName, args, body, isErr, elapsed, sensitiveHits, S.rawMode ? fetchBody.payload : null);
     addNotifications(srv.url, body?.notifications);
   } catch (e) {
     showError(`Send failed: ${e.message}`);
@@ -4046,12 +4365,13 @@ function showResponse(data, elapsed, requestArgs) {
 
 // ── History ────────────────────────────────────────────────────────────────
 
-function addHistory(url, tool, args, result, isErr, elapsed, sensitiveHits) {
+function addHistory(url, tool, args, result, isErr, elapsed, sensitiveHits, rawPayload) {
   S.history.push({
     id: S.history.length, time: new Date().toLocaleTimeString(),
     url, tool, args: JSON.parse(JSON.stringify(args)), result, isErr,
     elapsed: elapsed || 0,
     sensitiveHits: sensitiveHits || [],
+    rawPayload: rawPayload ? JSON.parse(JSON.stringify(rawPayload)) : null,
   });
   renderHistory();
   if (sensitiveHits?.length) renderFindings();
@@ -4080,13 +4400,15 @@ function statusBadges(data, isErr) {
 
 function buildHistoryRows() {
   if (!S.history.length)
-    return '<tr><td colspan="6" class="empty" style="padding:.3rem .5rem">No history</td></tr>';
+    return '<tr><td colspan="7" class="empty" style="padding:.3rem .5rem">No history</td></tr>';
   return S.history.slice().reverse().map(e => {
     let host = e.url;
     try { host = new URL(e.url).host; } catch {}
     const argStr = JSON.stringify(e.args);
     const argPrev = argStr.length > 44 ? argStr.slice(0,41)+'…' : argStr;
+    const checked = S.histChecked.includes(e.id);
     return `<tr>
+      <td style="width:18px;padding:.2rem .3rem"><input type="checkbox" class="hist-chk" data-hid="${e.id}" ${checked?'checked':''}></td>
       <td class="mono" style="color:var(--muted)">${e.time}</td>
       <td class="mono" style="color:var(--muted);font-size:10px">${esc(host)}</td>
       <td class="mono" style="color:var(--accent)">${esc(e.tool)}</td>
@@ -4094,7 +4416,10 @@ function buildHistoryRows() {
       <td style="white-space:nowrap">${statusBadges(e.result, e.isErr)}
           <span style="color:var(--muted);font-size:9px;margin-left:3px">${e.elapsed}ms</span>
           ${e.sensitiveHits?.length ? `<span class="shadow-badge" style="color:#ffa657;background:#2d1800;border-color:#5c3000" title="${e.sensitiveHits.map(h=>h.cat).join(', ')}">&#9888; data</span>` : ''}</td>
-      <td><button class="btn-sm" data-replay="${e.id}">Replay</button></td>
+      <td style="white-space:nowrap">
+        <button class="btn-sm" data-replay="${e.id}">Replay</button>
+        <button class="btn-sm" data-intruder="${e.id}" title="Intruder-lite: fuzz a parameter from this entry" style="color:#e3b341;border-color:#4a3a10">&#9889; Intruder</button>
+      </td>
     </tr>`;
   }).join('');
 }
@@ -4111,10 +4436,80 @@ function renderHistory() {
   }
 }
 
+document.addEventListener('change', e => {
+  const chk = e.target.closest('.hist-chk');
+  if (!chk) return;
+  const id = parseInt(chk.dataset.hid);
+  if (chk.checked) {
+    if (!S.histChecked.includes(id)) {
+      S.histChecked.push(id);
+      if (S.histChecked.length > 2) { S.histChecked.shift(); renderHistory(); }
+    }
+  } else {
+    S.histChecked = S.histChecked.filter(x => x !== id);
+  }
+  const diffBtn = document.getElementById('hist-diff-btn');
+  if (diffBtn) diffBtn.style.display = S.histChecked.length === 2 ? '' : 'none';
+});
+
 document.getElementById('hist-body').addEventListener('click', e => {
   const btn = e.target.closest('[data-replay]');
   if (btn) replayEntry(parseInt(btn.dataset.replay));
+  const ib = e.target.closest('[data-intruder]');
+  if (ib) openIntruderModal(parseInt(ib.dataset.intruder));
 });
+
+// ── Response Diff Viewer ───────────────────────────────────────────────────
+
+function computeDiff(aLines, bLines) {
+  const m = aLines.length, n = bLines.length;
+  const dp = Array.from({length: m+1}, () => new Uint32Array(n+1));
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      dp[i][j] = aLines[i-1] === bLines[j-1] ? dp[i-1][j-1]+1 : Math.max(dp[i-1][j], dp[i][j-1]);
+  const out = [];
+  let i = m, j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && aLines[i-1] === bLines[j-1]) { out.push({t:'eq', l:aLines[i-1]}); i--; j--; }
+    else if (j > 0 && (i === 0 || dp[i][j-1] >= dp[i-1][j])) { out.push({t:'add', l:bLines[j-1]}); j--; }
+    else { out.push({t:'del', l:aLines[i-1]}); i--; }
+  }
+  return out.reverse();
+}
+
+function renderDiff(oldText, newText) {
+  const aL = (oldText||'').split('\n'), bL = (newText||'').split('\n');
+  const diff = computeDiff(aL, bL);
+  return diff.map(d => {
+    const cls = d.t === 'add' ? 'background:#0d2a1a;color:#56d364' :
+                d.t === 'del' ? 'background:#2d0f0f;color:#e85c5c' : 'color:var(--muted)';
+    const pfx = d.t === 'add' ? '+' : d.t === 'del' ? '-' : ' ';
+    return `<div style="${cls};white-space:pre;font-family:monospace;font-size:11px;padding:0 6px">${pfx} ${esc(d.l)}</div>`;
+  }).join('');
+}
+
+function openDiffModal() {
+  if (S.histChecked.length !== 2) return;
+  const [id1, id2] = [...S.histChecked].sort((a,b) => a-b);
+  const e1 = S.history[id1], e2 = S.history[id2];
+  if (!e1 || !e2) return;
+  const t1 = JSON.stringify(e1.result, null, 2) || '';
+  const t2 = JSON.stringify(e2.result, null, 2) || '';
+  document.getElementById('diff-overlay')?.remove();
+  const ov = document.createElement('div');
+  ov.id = 'diff-overlay';
+  ov.style.cssText = 'position:fixed;inset:0;z-index:2000;display:flex;flex-direction:column;background:var(--bg)';
+  ov.innerHTML = `
+    <div class="panel-modal-hdr">
+      <span style="color:#58a6ff;font-weight:700;font-family:monospace;font-size:13px">&#8942; Response Diff</span>
+      <span style="color:var(--muted);font-size:11px;flex:1;margin-left:.5rem">#${id1} → #${id2} &nbsp;·&nbsp; ${e1.tool} vs ${e2.tool}</span>
+      <button class="btn-sm" onclick="document.getElementById('diff-overlay').remove()">&#x2715; Close</button>
+    </div>
+    <div style="overflow-y:auto;flex:1;padding:.5rem">${renderDiff(t1, t2)}</div>`;
+  document.body.appendChild(ov);
+  const esc2 = ev => { if (ev.key === 'Escape') { ov.remove(); document.removeEventListener('keydown', esc2); } };
+  document.addEventListener('keydown', esc2);
+}
 
 function openHistoryModal() {
   const existing = document.getElementById('hist-overlay');
@@ -4134,7 +4529,7 @@ function openHistoryModal() {
       <div style="overflow-y:auto;flex:1">
         <table id="hist-modal-table">
           <thead>
-            <tr><th>Time</th><th>Server</th><th>Tool</th><th>Args</th><th>Status</th><th></th></tr>
+            <tr><th></th><th>Time</th><th>Server</th><th>Tool</th><th>Args</th><th>Status</th><th></th></tr>
           </thead>
           <tbody id="hist-modal-body"></tbody>
         </table>
@@ -4143,7 +4538,9 @@ function openHistoryModal() {
   document.body.appendChild(ov);
   ov.addEventListener('click', e => {
     const btn = e.target.closest('[data-replay]');
-    if (btn) { closeHistoryModal(); replayEntry(parseInt(btn.dataset.replay)); }
+    if (btn) { closeHistoryModal(); replayEntry(parseInt(btn.dataset.replay)); return; }
+    const ib  = e.target.closest('[data-intruder]');
+    if (ib)  { closeHistoryModal(); openIntruderModal(parseInt(ib.dataset.intruder)); }
   });
   renderHistory();
   document.addEventListener('keydown', _histModalEsc);
@@ -4436,12 +4833,19 @@ function showPayloadPicker(btn) {
   _pickerTarget = document.getElementById(btn.dataset.injectFor);
   if (!_pickerTarget) return;
 
+  const fieldType = btn.dataset.fieldType || '';
+  const hasTypeConfusion = !!(fieldType && TYPE_CONFUSION_PAYLOADS[fieldType]);
   const cats = Object.keys(PAYLOAD_PRESETS);
+  const confusionBtn = hasTypeConfusion
+    ? `<button class="pp-cat-btn" data-cat="__type_confusion__" style="color:#e3b341;border-color:#4a3a10">Type confusion</button>`
+    : '';
   const div  = document.createElement('div');
   div.id = 'payload-picker';
+  div.dataset.fieldType = fieldType;
   div.innerHTML = `
     <div id="pp-main">
       <div class="pp-cats">
+        ${confusionBtn}
         ${cats.map(c => `<button class="pp-cat-btn" data-cat="${esc(c)}">${esc(c)}</button>`).join('')}
         <button class="pp-cat-btn pp-file-btn" data-cat="__file__">Load file…</button>
       </div>
@@ -4472,21 +4876,34 @@ function showPayloadPicker(btn) {
     fuzzAllFromPicker();
   });
 
-  _pickerActiveCat = cats[0];
-  div.querySelector('.pp-cat-btn').classList.add('active');
-  showPickerCat(cats[0]);
+  // Default to Type confusion if available, else first regular category
+  if (hasTypeConfusion) {
+    _pickerActiveCat = '__type_confusion__';
+    div.querySelector('[data-cat="__type_confusion__"]').classList.add('active');
+    showPickerCat('__type_confusion__');
+  } else {
+    _pickerActiveCat = cats[0];
+    div.querySelector('.pp-cat-btn').classList.add('active');
+    showPickerCat(cats[0]);
+  }
 }
 
 function showPickerCat(cat) {
   const pane = document.getElementById('pp-items');
   if (!pane) return;
-  const pls = PAYLOAD_PRESETS[cat] || [];
+  let pls;
+  if (cat === '__type_confusion__') {
+    const ft = document.getElementById('payload-picker')?.dataset.fieldType || 'string';
+    pls = TYPE_CONFUSION_PAYLOADS[ft] || [];
+  } else {
+    pls = PAYLOAD_PRESETS[cat] || [];
+  }
   pane.innerHTML = pls.map(p =>
     `<button class="pp-item" title="${esc(p)}">${esc(p)}</button>`).join('');
   pane.querySelectorAll('.pp-item').forEach((b, i) => {
     b.addEventListener('click', e => {
       e.stopPropagation();
-      if (_pickerTarget) _pickerTarget.value = applyOobUrl(pls[i]);
+      if (_pickerTarget) _pickerTarget.value = cat === '__type_confusion__' ? pls[i] : applyOobUrl(pls[i]);
       closePayloadPicker();
     });
   });
@@ -4767,10 +5184,27 @@ function initFuzzPaneResizer() {
 
 // ── Auth variation tester ──────────────────────────────────────────────────
 
+const _b64u = s => btoa(unescape(encodeURIComponent(s))).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+const _b64uDec = s => { try { return JSON.parse(decodeURIComponent(escape(atob(s.replace(/-/g,'+').replace(/_/g,'/'))))); } catch { return null; } };
+
 function makeAlgNoneJwt() {
-  const b64u = s => btoa(s).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
-  const hdr  = b64u(JSON.stringify({alg:'none',typ:'JWT'}));
-  const pay  = b64u(JSON.stringify({sub:'test',iat:Math.floor(Date.now()/1000),exp:Math.floor(Date.now()/1000)+3600}));
+  const hdr = _b64u(JSON.stringify({alg:'none',typ:'JWT'}));
+  const pay = _b64u(JSON.stringify({sub:'test',iat:Math.floor(Date.now()/1000),exp:Math.floor(Date.now()/1000)+3600}));
+  return `${hdr}.${pay}.`;
+}
+
+function makeClaimMutationJwt(origToken, mutations) {
+  let origClaims = {sub:'test', iat:Math.floor(Date.now()/1000), exp:Math.floor(Date.now()/1000)+3600};
+  if (origToken) {
+    const parts = origToken.split('.');
+    if (parts.length === 3) {
+      const decoded = _b64uDec(parts[1]);
+      if (decoded) origClaims = decoded;
+    }
+  }
+  const claims = Object.assign({}, origClaims, mutations);
+  const hdr = _b64u(JSON.stringify({alg:'none',typ:'JWT'}));
+  const pay = _b64u(JSON.stringify(claims));
   return `${hdr}.${pay}.`;
 }
 
@@ -4784,7 +5218,18 @@ function authVariations(currentToken) {
     { name: 'Null header',     header: 'null' },
     { name: 'alg:none JWT',    header: `Bearer ${noneJwt}` },
   ];
-  if (!currentToken) vars.shift();  // no "current token" row if server has no token
+  if (!currentToken) vars.shift();
+  // JWT claim mutations — only when current token looks like a JWT
+  if (currentToken && currentToken.split('.').length === 3) {
+    vars.push(
+      { name: 'JWT: role=admin',      header: `Bearer ${makeClaimMutationJwt(currentToken, {role:'admin'})}` },
+      { name: 'JWT: role=superuser',  header: `Bearer ${makeClaimMutationJwt(currentToken, {role:'superuser',groups:['admin']})}` },
+      { name: 'JWT: sub=admin',       header: `Bearer ${makeClaimMutationJwt(currentToken, {sub:'admin'})}` },
+      { name: 'JWT: sub=0 (IDOR)',    header: `Bearer ${makeClaimMutationJwt(currentToken, {sub:'0'})}` },
+      { name: 'JWT: expired (exp=1)', header: `Bearer ${makeClaimMutationJwt(currentToken, {exp:1})}` },
+      { name: 'JWT: far future exp',  header: `Bearer ${makeClaimMutationJwt(currentToken, {exp:9999999999})}` },
+    );
+  }
   return vars;
 }
 
@@ -5132,6 +5577,453 @@ document.addEventListener('keydown', e => {
     inp.focus(); inp.select();
   }
 });
+
+// ── Race Condition Tester ─────────────────────────────────────────────────
+
+function openRaceModal() {
+  const raw = document.getElementById('raw-editor').value.trim();
+  if (!raw) { showError('Raw editor is empty — load a request first'); return; }
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { showError('Raw editor contains invalid JSON'); return; }
+  const srv = S.servers[S.activeUrl];
+  if (!srv || srv.status !== 'connected') { showError('No active connected server'); return; }
+
+  document.getElementById('race-overlay')?.remove();
+  const ov = document.createElement('div');
+  ov.id = 'race-overlay';
+  ov.innerHTML = `
+    <div id="race-modal">
+      <div class="race-hdr">
+        <span class="race-hdr-title">&#9651; Race Condition Tester</span>
+        <span id="race-prog" style="color:var(--muted);font-size:11px;flex:1">Configure and run</span>
+        <label style="font-size:11px;color:var(--muted);margin-right:.3rem">Count:</label>
+        <select id="race-count" class="btn-sm" style="width:5rem">
+          <option value="5">5</option>
+          <option value="10" selected>10</option>
+          <option value="20">20</option>
+          <option value="50">50</option>
+        </select>
+        <button class="btn-sm btn-cyan" id="race-run-btn" onclick="runRace()">&#9654; Run</button>
+        <button class="btn-sm" onclick="closeRaceModal()">&#x2715; Close</button>
+      </div>
+      <div style="flex:1;overflow-y:auto">
+        <table id="race-tbl">
+          <colgroup>
+            <col style="width:3rem"><col style="width:6rem"><col style="width:5rem">
+            <col style="width:5rem"><col style="width:auto">
+          </colgroup>
+          <thead><tr><th>#</th><th>HTTP Status</th><th>RPC Status</th><th>Time (ms)</th><th>Notes</th></tr></thead>
+          <tbody id="race-body"><tr><td colspan="5" class="empty" style="padding:.4rem .5rem">Click Run to fire concurrent requests</td></tr></tbody>
+        </table>
+      </div>
+      <div class="race-h-resizer" id="race-resizer"></div>
+      <div id="race-response-pane" style="height:180px;min-height:60px"></div>
+    </div>`;
+  document.body.appendChild(ov);
+
+  // Wire resizer
+  const resizer = document.getElementById('race-resizer');
+  const respPane = document.getElementById('race-response-pane');
+  resizer.addEventListener('mousedown', e => {
+    e.preventDefault();
+    const startY = e.clientY, startH = respPane.offsetHeight;
+    resizer.classList.add('dragging');
+    document.body.style.userSelect = 'none';
+    const onMove = e => respPane.style.height = Math.max(40, startH + (startY - e.clientY)) + 'px';
+    const onUp   = () => { resizer.classList.remove('dragging'); document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+
+  const escH = e => { if (e.key === 'Escape') closeRaceModal(); };
+  document.addEventListener('keydown', escH);
+  ov._escH = escH;
+}
+
+function closeRaceModal() {
+  const ov = document.getElementById('race-overlay');
+  if (ov) { if (ov._escH) document.removeEventListener('keydown', ov._escH); ov.remove(); }
+}
+
+async function runRace() {
+  const srv = S.servers[S.activeUrl];
+  if (!srv) return;
+  const raw = document.getElementById('raw-editor').value.trim();
+  let payload;
+  try { payload = JSON.parse(raw); } catch { showError('Invalid JSON in raw editor'); return; }
+  const count = parseInt(document.getElementById('race-count').value) || 10;
+  const prog  = document.getElementById('race-prog');
+  const btn   = document.getElementById('race-run-btn');
+  const body  = document.getElementById('race-body');
+  btn.disabled = true;
+  prog.textContent = `Firing ${count} concurrent requests…`;
+  body.innerHTML = `<tr><td colspan="5" class="empty" style="padding:.4rem .5rem">Running…</td></tr>`;
+
+  let data;
+  try {
+    const resp = await fetch('/race', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({url: srv.url, token: srv.token || null,
+        transport: srv.transport || 'http', proxy: srv.proxy || null, payload, count}),
+    });
+    data = await resp.json();
+  } catch (err) {
+    prog.textContent = 'Error: ' + err.message;
+    btn.disabled = false;
+    return;
+  }
+
+  const results = data.results || [];
+  prog.textContent = `${results.length} responses received`;
+  btn.disabled = false;
+
+  // Majority detection: most-common status+size combo
+  const sizes   = results.map(r => JSON.stringify(r.result || r.error || '').length);
+  const statuses = results.map(r => r.status || 0);
+  const freq    = {};
+  results.forEach((r, i) => {
+    const k = `${statuses[i]}|${sizes[i]}`;
+    freq[k] = (freq[k] || 0) + 1;
+  });
+  const majorKey = Object.entries(freq).sort((a,b)=>b[1]-a[1])[0]?.[0];
+
+  body.innerHTML = results.map(r => {
+    const rpcOk = r.result && !r.result.error;
+    const rpcBadge = r.error
+      ? `<span class="cap-high">err</span>`
+      : (rpcOk ? `<span class="cap-info">ok</span>` : `<span class="cap-high">rpc err</span>`);
+    const sz   = JSON.stringify(r.result || r.error || '').length;
+    const key  = `${r.status||0}|${sz}`;
+    const isOut= key !== majorKey;
+    return `<tr class="${isOut?'race-outlier ':'' }clickable" data-race-idx="${r.idx}">
+      <td>${r.idx}</td>
+      <td><span class="cap-${r.status>=200&&r.status<300?'info':'high'}">${r.status||'—'}</span></td>
+      <td>${rpcBadge}</td>
+      <td>${r.elapsed}ms</td>
+      <td style="color:${isOut?'#ffa657':'var(--muted)'}">
+        ${isOut ? '&#9651; outlier' : '—'}${sz ? ` · ${sz}b` : ''}
+      </td>
+    </tr>`;
+  }).join('');
+
+  const _raceResults = results;
+  document.getElementById('race-tbl').addEventListener('click', e => {
+    const row = e.target.closest('[data-race-idx]');
+    if (!row) return;
+    document.querySelectorAll('#race-tbl tr.race-selected').forEach(r => r.classList.remove('race-selected'));
+    row.classList.add('race-selected');
+    const idx = parseInt(row.dataset.raceIdx);
+    const r   = _raceResults[idx];
+    const pane = document.getElementById('race-response-pane');
+    pane.textContent = r ? JSON.stringify(r.result || r.error, null, 2) : '';
+  }, {once: true});
+  // Re-attach listener on each run
+  const tbl = document.getElementById('race-tbl');
+  tbl.onclick = e => {
+    const row = e.target.closest('[data-race-idx]');
+    if (!row) return;
+    tbl.querySelectorAll('tr.race-selected').forEach(r => r.classList.remove('race-selected'));
+    row.classList.add('race-selected');
+    const idx = parseInt(row.dataset.raceIdx);
+    const r   = results[idx];
+    document.getElementById('race-response-pane').textContent =
+      r ? JSON.stringify(r.result || r.error, null, 2) : '';
+  };
+}
+
+// ── Intruder-lite ─────────────────────────────────────────────────────────
+
+let _intruderState = {histId: null, params: [], selectedPath: null, results: [], srcTab: 'presets', selectedCat: null};
+
+function openIntruderModal(histId) {
+  const e = S.history[histId];
+  if (!e) return;
+  _intruderState = {histId, params: [], selectedPath: null, results: [], srcTab: 'presets', selectedCat: null};
+
+  // Flatten params from args or rawPayload
+  const source = e.rawPayload?.params?.arguments ?? e.rawPayload?.params ?? e.args ?? {};
+  _intruderState.params = flattenParams(source, '');
+
+  document.getElementById('intruder-overlay')?.remove();
+  const ov = document.createElement('div');
+  ov.id = 'intruder-overlay';
+  ov.innerHTML = `
+    <div id="intruder-modal">
+      <div class="intruder-hdr">
+        <span class="intruder-hdr-title">&#9889; Intruder</span>
+        <span style="color:var(--muted);font-size:11px;flex:1">&nbsp;#${histId} · ${esc(e.tool)}</span>
+        <button class="btn-sm btn-cyan" id="intr-run-btn" onclick="runIntruder()" disabled>&#9654; Run</button>
+        <button class="btn-sm" onclick="exportIntruderResults()">Export CSV</button>
+        <span id="intr-prog" style="color:var(--muted);font-size:11px;margin-left:.5rem"></span>
+        <button class="btn-sm" style="margin-left:.5rem" onclick="closeIntruderModal()">&#x2715; Close</button>
+      </div>
+      <div class="intruder-body">
+        <!-- Left: param selector -->
+        <div class="intruder-left">
+          <div class="intruder-section-hdr">Select fuzz target</div>
+          <div class="intruder-param-list" id="intr-param-list"></div>
+        </div>
+        <!-- Right: payload source + results -->
+        <div class="intruder-right">
+          <div class="intruder-src-tabs">
+            <button class="intruder-src-tab active" id="intr-tab-presets"
+              onclick="switchIntruderSrc('presets')">Presets</button>
+            <button class="intruder-src-tab" id="intr-tab-paste"
+              onclick="switchIntruderSrc('paste')">Paste list</button>
+          </div>
+          <div class="intruder-source-pane" id="intr-src-pane"></div>
+          <div style="border-top:1px solid var(--border);overflow-y:auto;flex:1">
+            <table id="intruder-tbl">
+              <colgroup>
+                <col style="width:auto"><col style="width:6rem"><col style="width:5rem">
+                <col style="width:5rem"><col style="width:auto">
+              </colgroup>
+              <thead><tr><th>Payload</th><th>HTTP Status</th><th>RPC Status</th><th>Time (ms)</th><th>Preview</th></tr></thead>
+              <tbody id="intr-body"><tr><td colspan="5" class="empty" style="padding:.4rem">Select a param, choose payloads, click Run</td></tr></tbody>
+            </table>
+          </div>
+          <div class="intr-h-resizer" id="intr-resizer"></div>
+          <div id="intruder-response-pane" style="height:160px;min-height:40px"></div>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+
+  renderIntruderParams();
+  renderIntruderSrc();
+
+  // Wire resizer
+  const resizer  = document.getElementById('intr-resizer');
+  const respPane = document.getElementById('intruder-response-pane');
+  resizer.addEventListener('mousedown', ev => {
+    ev.preventDefault();
+    const startY = ev.clientY, startH = respPane.offsetHeight;
+    resizer.classList.add('dragging');
+    document.body.style.userSelect = 'none';
+    const onMove = ev => respPane.style.height = Math.max(40, startH + (startY - ev.clientY)) + 'px';
+    const onUp   = () => { resizer.classList.remove('dragging'); document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+
+  // Results table click
+  document.getElementById('intruder-tbl').addEventListener('click', ev => {
+    const row = ev.target.closest('[data-intr-idx]');
+    if (!row) return;
+    document.querySelectorAll('#intruder-tbl tr.intr-selected').forEach(r=>r.classList.remove('intr-selected'));
+    row.classList.add('intr-selected');
+    const idx = parseInt(row.dataset.intrIdx);
+    const res = _intruderState.results[idx];
+    document.getElementById('intruder-response-pane').textContent =
+      res ? JSON.stringify(res.result || res.error, null, 2) : '';
+  });
+
+  const escH = ev => { if (ev.key === 'Escape') closeIntruderModal(); };
+  document.addEventListener('keydown', escH);
+  ov._escH = escH;
+}
+
+function flattenParams(obj, prefix) {
+  const out = [];
+  if (obj === null || obj === undefined) return out;
+  if (typeof obj !== 'object' || Array.isArray(obj)) {
+    out.push({path: prefix || '(root)', value: obj});
+  } else {
+    for (const [k, v] of Object.entries(obj)) {
+      const p = prefix ? `${prefix}.${k}` : k;
+      if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
+        out.push(...flattenParams(v, p));
+      } else {
+        out.push({path: p, value: v});
+      }
+    }
+  }
+  return out;
+}
+
+function renderIntruderParams() {
+  const list = document.getElementById('intr-param-list');
+  if (!list) return;
+  const {params, selectedPath} = _intruderState;
+  if (!params.length) {
+    list.innerHTML = '<div class="empty" style="padding:.4rem">No parameters found</div>';
+    return;
+  }
+  list.innerHTML = params.map(p =>
+    `<div class="intruder-param-item${p.path===selectedPath?' selected':''}" data-path="${esc(p.path)}">
+      <span class="ipkey">${esc(p.path)}: </span>
+      <span class="ipval">${esc(String(p.value).slice(0,60))}</span>
+    </div>`
+  ).join('');
+  list.onclick = e => {
+    const item = e.target.closest('[data-path]');
+    if (!item) return;
+    _intruderState.selectedPath = item.dataset.path;
+    renderIntruderParams();
+    document.getElementById('intr-run-btn').disabled = false;
+  };
+}
+
+function switchIntruderSrc(tab) {
+  _intruderState.srcTab = tab;
+  document.querySelectorAll('.intruder-src-tab').forEach(b =>
+    b.classList.toggle('active', b.id === 'intr-tab-' + tab));
+  renderIntruderSrc();
+}
+
+function renderIntruderSrc() {
+  const pane = document.getElementById('intr-src-pane');
+  if (!pane) return;
+  if (_intruderState.srcTab === 'paste') {
+    pane.innerHTML = `
+      <div style="font-size:11px;color:var(--muted);margin-bottom:.3rem">One payload per line</div>
+      <textarea id="intr-paste" style="width:100%;height:140px;box-sizing:border-box;
+        font-family:monospace;font-size:11px;background:var(--bg);color:var(--fg);
+        border:1px solid var(--border);border-radius:4px;padding:.3rem;resize:vertical"
+        placeholder="payload1&#10;payload2&#10;..."></textarea>`;
+    return;
+  }
+  // Presets tab
+  const cats = Object.keys(PAYLOAD_PRESETS);
+  pane.innerHTML = `
+    <div style="font-size:11px;color:var(--muted);margin-bottom:.4rem">Select a payload category:</div>
+    <div style="display:flex;flex-wrap:wrap;gap:.3rem" id="intr-preset-btns">
+      ${cats.map(c => `<button class="btn-sm${c===_intruderState.selectedCat?' active':''}"
+        data-cat="${esc(c)}" onclick="selectIntruderCat('${esc(c)}')">${esc(c)}</button>`).join('')}
+    </div>
+    <div id="intr-preset-preview" style="margin-top:.5rem;font-size:10px;color:var(--muted);font-family:monospace"></div>`;
+  if (_intruderState.selectedCat) showIntruderCatPreview(_intruderState.selectedCat);
+}
+
+function selectIntruderCat(cat) {
+  _intruderState.selectedCat = cat;
+  document.querySelectorAll('#intr-preset-btns [data-cat]').forEach(b =>
+    b.classList.toggle('active', b.dataset.cat === cat));
+  showIntruderCatPreview(cat);
+}
+
+function showIntruderCatPreview(cat) {
+  const preview = document.getElementById('intr-preset-preview');
+  if (!preview) return;
+  const payloads = PAYLOAD_PRESETS[cat] || [];
+  preview.innerHTML = payloads.slice(0,8).map(p => `<div>${esc(p)}</div>`).join('') +
+    (payloads.length > 8 ? `<div style="color:var(--muted)">…+${payloads.length-8} more</div>` : '');
+}
+
+function getIntruderPayloads() {
+  if (_intruderState.srcTab === 'paste') {
+    const txt = document.getElementById('intr-paste')?.value || '';
+    return txt.split('\n').map(l=>l.trim()).filter(Boolean);
+  }
+  return PAYLOAD_PRESETS[_intruderState.selectedCat] || [];
+}
+
+async function runIntruder() {
+  const {histId, selectedPath} = _intruderState;
+  if (!selectedPath) { showError('Select a parameter to fuzz'); return; }
+  const e = S.history[histId];
+  if (!e) return;
+  const srv = S.servers[e.url];
+  if (!srv) { showError('Server not in session'); return; }
+  const payloads = getIntruderPayloads();
+  if (!payloads.length) { showError('No payloads selected'); return; }
+
+  const btn  = document.getElementById('intr-run-btn');
+  const prog = document.getElementById('intr-prog');
+  btn.disabled = true;
+  _intruderState.results = [];
+
+  // Build base payload
+  const basePayload = e.rawPayload
+    ? JSON.parse(JSON.stringify(e.rawPayload))
+    : {jsonrpc:'2.0', id:1, method:'tools/call',
+       params:{name: e.tool, arguments: JSON.parse(JSON.stringify(e.args||{}))}};
+
+  const tbody = document.getElementById('intr-body');
+  tbody.innerHTML = '';
+  let baseSize = null;
+
+  for (let i = 0; i < payloads.length; i++) {
+    prog.textContent = `${i+1}/${payloads.length}`;
+    const pl = payloads[i];
+    // Deep clone and set the target field
+    const payload = JSON.parse(JSON.stringify(basePayload));
+    setNestedValue(payload.params?.arguments ?? payload.params ?? payload, selectedPath, pl);
+
+    const t0 = Date.now();
+    let res;
+    try {
+      const r = await fetch('/raw', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({url: srv.url, token: srv.token||null,
+          transport: srv.transport||'http', proxy: srv.proxy||null, payload}),
+      });
+      res = await r.json();
+    } catch(err) { res = {error: err.message}; }
+    const elapsed = Date.now() - t0;
+    const sz = JSON.stringify(res.result || res.error || '').length;
+    if (baseSize === null) baseSize = sz;
+    const anomaly = baseSize && Math.abs(sz - baseSize) / baseSize >= 0.20;
+    _intruderState.results.push({pl, res, elapsed, sz, anomaly});
+
+    const rpcOk = res.result && !res.result.error;
+    const rpcBadge = res.error
+      ? `<span class="cap-high">err</span>`
+      : (rpcOk ? `<span class="cap-info">ok</span>` : `<span class="cap-high">rpc err</span>`);
+    const preview = JSON.stringify(res.result || res.error || '').slice(0,80);
+    const tr = document.createElement('tr');
+    tr.className = (anomaly?'intr-anomaly ':'' ) + 'clickable';
+    tr.dataset.intrIdx = _intruderState.results.length - 1;
+    tr.innerHTML = `
+      <td class="fuzz-pl">${esc(pl)}</td>
+      <td><span class="cap-${res.status>=200&&res.status<300?'info':'high'}">${res.status||'—'}</span></td>
+      <td>${rpcBadge}</td>
+      <td>${elapsed}ms</td>
+      <td class="fuzz-pre">${esc(preview)}</td>`;
+    tbody.appendChild(tr);
+    tbody.parentElement.scrollTop = tbody.parentElement.scrollHeight;
+  }
+  prog.textContent = `Done — ${payloads.length} payloads`;
+  btn.disabled = false;
+}
+
+function setNestedValue(obj, path, value) {
+  const parts = path.split('.');
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (cur[parts[i]] === undefined) cur[parts[i]] = {};
+    cur = cur[parts[i]];
+  }
+  const last = parts[parts.length - 1];
+  // Try to preserve numeric types if possible
+  const numVal = Number(value);
+  cur[last] = !isNaN(numVal) && value.trim() !== '' ? numVal : value;
+}
+
+function closeIntruderModal() {
+  const ov = document.getElementById('intruder-overlay');
+  if (ov) { if (ov._escH) document.removeEventListener('keydown', ov._escH); ov.remove(); }
+}
+
+function exportIntruderResults() {
+  const {results} = _intruderState;
+  if (!results.length) { showError('No results to export'); return; }
+  const rows = [['Payload','HTTP Status','RPC Status','Time (ms)','Size','Anomaly','Response']];
+  for (const r of results) {
+    const rpcOk = r.res.result && !r.res.result.error;
+    rows.push([r.pl, r.res.status||'', rpcOk?'ok':'err', r.elapsed, r.sz, r.anomaly?'yes':'',
+      JSON.stringify(r.res.result||r.res.error||'').slice(0,200)]);
+  }
+  const csv = rows.map(r => r.map(c => '"' + String(c).replace(/"/g,'""') + '"').join(',')).join('\n');
+  const a = document.createElement('a');
+  a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+  a.download = 'intruder-results.csv';
+  a.click();
+}
 
 // ── Resizable panes ───────────────────────────────────────────────────────
 
