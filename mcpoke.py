@@ -772,6 +772,11 @@ async def ws_endpoint(ws: WebSocket):
                                 "message": "First message must be {action:'init'}"})
             return
         url   = msg["url"]
+        try:
+            _validate_url(url)
+        except ValueError as e:
+            await ws.send_json({"type": "error", "message": str(e)})
+            return
         token = msg.get("token")
         extra_headers: dict = {}
         if token:
@@ -1371,6 +1376,43 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 }
 #fuzz-tbl td { padding: 0.2rem 0.5rem; border-bottom: 1px solid #21262d; }
 #fuzz-tbl tr.clickable:hover td { background: #0d2040; cursor: pointer; }
+#fuzz-tbl tr.fuzz-selected td { background: #0d2040; }
+.fuzz-h-resizer {
+  height: 5px; flex-shrink: 0; background: var(--border);
+  cursor: row-resize; transition: background .15s;
+}
+.fuzz-h-resizer:hover, .fuzz-h-resizer.dragging { background: var(--accent); }
+#fuzz-detail-pane {
+  flex-shrink: 0; display: flex; overflow: hidden;
+  border-top: 1px solid var(--border);
+}
+#fuzz-detail-left, #fuzz-detail-right {
+  flex: 1; overflow: auto; display: flex; flex-direction: column;
+}
+#fuzz-detail-left { border-right: 1px solid var(--border); }
+.fuzz-detail-label {
+  font-size: 10px; font-weight: 700; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .05em;
+  padding: .2rem .5rem; background: var(--bg);
+  border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+#fuzz-detail-req, #fuzz-detail-resp {
+  margin: 0; padding: .4rem .5rem; flex: 1;
+  font-family: monospace; font-size: 11px; color: var(--text);
+  white-space: pre-wrap; word-break: break-all; overflow: auto;
+}
+#fuzz-detail-popup {
+  position: absolute; inset: 0; z-index: 10;
+  display: flex; flex-direction: column;
+  background: var(--surface);
+}
+.fuzz-detail-popup-hdr {
+  display: flex; align-items: center; gap: .5rem; flex-shrink: 0;
+  padding: .3rem .6rem; border-bottom: 1px solid var(--border); background: var(--bg);
+}
+#fuzz-detail-popup-body {
+  flex: 1; display: flex; overflow: hidden;
+}
 /* ── Auth variation tester ── */
 #auth-overlay { position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.65); }
 #auth-modal {
@@ -5013,6 +5055,7 @@ function updateFuzzBtn() {
 let _fuzzStop    = false;
 let _fuzzSrc     = 'presets';
 let _fuzzFilePls = [];
+let _fuzzRows    = [];   // {n, pl, requestPayload, fullData, elapsed} per result row
 
 function openFuzzModal(preselectedCat) {
   const raw = document.getElementById('raw-editor').value;
@@ -5093,17 +5136,30 @@ function openFuzzModal(preselectedCat) {
 
         <div class="fuzz-pane-resizer" id="fuzz-pane-resizer"></div>
 
-        <div class="fuzz-right">
+        <div class="fuzz-right" style="position:relative">
           <div class="fuzz-prog">
             <span id="fuzz-prog-txt">Ready — ${esc(Object.keys(PAYLOAD_PRESETS)[0])} loaded</span>
+            <span style="flex:1"></span>
+            <span style="font-size:10px;color:var(--muted)">Click row to preview · Double-click for full view</span>
           </div>
-          <div style="overflow-y:auto;flex:1">
+          <div style="overflow-y:auto;flex:1" id="fuzz-results-scroll">
             <table id="fuzz-tbl">
               <thead><tr>
                 <th>#</th><th>Payload</th><th>Status</th><th>Time</th><th>Size</th><th>Response preview</th>
               </tr></thead>
               <tbody id="fuzz-tbody"></tbody>
             </table>
+          </div>
+          <div class="fuzz-h-resizer" id="fuzz-h-resizer" style="display:none"></div>
+          <div id="fuzz-detail-pane" style="display:none;height:220px;min-height:60px">
+            <div id="fuzz-detail-left">
+              <div class="fuzz-detail-label">Request</div>
+              <pre id="fuzz-detail-req"></pre>
+            </div>
+            <div id="fuzz-detail-right">
+              <div class="fuzz-detail-label">Response &nbsp;<button class="btn-sm" id="fuzz-detail-expand-btn" title="Double-click to expand" style="font-size:9px">&#x26F6; Expand</button></div>
+              <pre id="fuzz-detail-resp"></pre>
+            </div>
           </div>
         </div>
 
@@ -5464,13 +5520,16 @@ function fmtBytes(n) {
   return (n / 1024).toFixed(1) + ' KB';
 }
 
-function addFuzzRow(n, pl, isErr, elapsed, preview, fullData, size, sizeAnomaly) {
+function addFuzzRow(n, pl, isErr, elapsed, preview, fullData, size, sizeAnomaly, requestPayload) {
   const tbody = document.getElementById('fuzz-tbody');
   if (!tbody) return;
+  const idx = n - 1;
+  _fuzzRows[idx] = {n, pl, requestPayload, fullData, elapsed};
   const tr = document.createElement('tr');
   if (fullData) tr.className = 'clickable';
   const sizeStyle = sizeAnomaly ? 'color:#ffa657;font-weight:600' : 'color:var(--muted)';
   const sizeTip   = sizeAnomaly ? ` title="Size differs from baseline (${sizeAnomaly})"` : '';
+  tr.dataset.fuzzIdx = idx;
   tr.innerHTML = `
     <td style="color:var(--muted);white-space:nowrap">${n}</td>
     <td class="fuzz-pl" title="${esc(pl)}">${esc(pl.slice(0, 120))}</td>
@@ -5478,9 +5537,100 @@ function addFuzzRow(n, pl, isErr, elapsed, preview, fullData, size, sizeAnomaly)
     <td style="color:var(--muted);white-space:nowrap">${elapsed}ms</td>
     <td style="${sizeStyle};white-space:nowrap;font-family:monospace"${sizeTip}>${fmtBytes(size)}</td>
     <td class="fuzz-pre">${esc((preview||'').slice(0, 300))}</td>`;
-  if (fullData) tr.addEventListener('click', () => showResponse(fullData, elapsed));
+  if (fullData) {
+    tr.addEventListener('click', () => showFuzzDetail(idx));
+    tr.addEventListener('dblclick', () => openFuzzDetailPopup(idx));
+  }
   tbody.appendChild(tr);
   tr.scrollIntoView({block: 'nearest'});
+}
+
+function showFuzzDetail(idx) {
+  const r = _fuzzRows[idx];
+  if (!r || !r.fullData) return;
+
+  // Highlight row
+  document.querySelectorAll('#fuzz-tbody tr.fuzz-selected').forEach(t => t.classList.remove('fuzz-selected'));
+  const tr = document.querySelector(`#fuzz-tbody tr[data-fuzz-idx="${idx}"]`);
+  if (tr) tr.classList.add('fuzz-selected');
+
+  // Show detail pane
+  const pane    = document.getElementById('fuzz-detail-pane');
+  const resizer = document.getElementById('fuzz-h-resizer');
+  if (pane) {
+    pane.style.display = '';
+    document.getElementById('fuzz-detail-req').textContent =
+      r.requestPayload ? JSON.stringify(r.requestPayload, null, 2) : '(not available)';
+    document.getElementById('fuzz-detail-resp').textContent =
+      JSON.stringify(r.fullData, null, 2);
+  }
+  if (resizer) resizer.style.display = '';
+
+  // Wire expand button once
+  const btn = document.getElementById('fuzz-detail-expand-btn');
+  if (btn && !btn._wired) {
+    btn._wired = true;
+    btn.addEventListener('click', () => openFuzzDetailPopup(
+      parseInt(document.querySelector('#fuzz-tbody tr.fuzz-selected')?.dataset?.fuzzIdx ?? '0')
+    ));
+  }
+  initFuzzDetailResizer();
+}
+
+function openFuzzDetailPopup(idx) {
+  const r = _fuzzRows[idx];
+  if (!r || !r.fullData) return;
+  document.getElementById('fuzz-detail-popup')?.remove();
+  const popup = document.createElement('div');
+  popup.id = 'fuzz-detail-popup';
+  popup.innerHTML = `
+    <div class="fuzz-detail-popup-hdr">
+      <span style="color:var(--accent);font-weight:700;font-family:monospace;font-size:12px">
+        #${r.n} &nbsp;·&nbsp; ${esc(r.pl.slice(0, 80))}
+      </span>
+      <span style="flex:1"></span>
+      <button class="btn-sm" onclick="document.getElementById('fuzz-detail-popup').remove()">&#x2715; Close</button>
+    </div>
+    <div id="fuzz-detail-popup-body">
+      <div style="flex:1;overflow:auto;border-right:1px solid var(--border);display:flex;flex-direction:column">
+        <div class="fuzz-detail-label">Request</div>
+        <pre style="margin:0;padding:.4rem .5rem;font-family:monospace;font-size:11px;color:var(--text);
+          white-space:pre-wrap;word-break:break-all;flex:1;overflow:auto">${esc(r.requestPayload ? JSON.stringify(r.requestPayload, null, 2) : '(not available)')}</pre>
+      </div>
+      <div style="flex:1;overflow:auto;display:flex;flex-direction:column">
+        <div class="fuzz-detail-label">Response</div>
+        <pre style="margin:0;padding:.4rem .5rem;font-family:monospace;font-size:11px;color:var(--text);
+          white-space:pre-wrap;word-break:break-all;flex:1;overflow:auto">${esc(JSON.stringify(r.fullData, null, 2))}</pre>
+      </div>
+    </div>`;
+  const modal = document.getElementById('fuzz-modal');
+  if (modal) modal.appendChild(popup);
+  const escH = e => {
+    if (e.key === 'Escape') { popup.remove(); document.removeEventListener('keydown', escH); }
+  };
+  document.addEventListener('keydown', escH);
+}
+
+function initFuzzDetailResizer() {
+  const resizer = document.getElementById('fuzz-h-resizer');
+  const pane    = document.getElementById('fuzz-detail-pane');
+  if (!resizer || !pane || resizer._wired) return;
+  resizer._wired = true;
+  resizer.addEventListener('mousedown', e => {
+    e.preventDefault();
+    const startY = e.clientY, startH = pane.offsetHeight;
+    resizer.classList.add('dragging');
+    document.body.style.userSelect = 'none';
+    const onMove = e => pane.style.height = Math.max(40, startH + (startY - e.clientY)) + 'px';
+    const onUp   = () => {
+      resizer.classList.remove('dragging');
+      document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
 }
 
 async function startFuzz() {
@@ -5494,9 +5644,15 @@ async function startFuzz() {
   if (!payloads.length) { showError('No payloads to fuzz with'); return; }
 
   _fuzzStop = false;
+  _fuzzRows = [];
   document.getElementById('fuzz-start-btn').disabled = true;
   document.getElementById('fuzz-stop-btn').disabled  = false;
   document.getElementById('fuzz-tbody').innerHTML    = '';
+  // Reset detail pane
+  const dp = document.getElementById('fuzz-detail-pane');
+  const dr = document.getElementById('fuzz-h-resizer');
+  if (dp) dp.style.display = 'none';
+  if (dr) { dr.style.display = 'none'; dr._wired = false; }
   const delay = parseInt(document.getElementById('fuzz-delay').value) || 0;
   let baselineSize = null;   // first successful response size
 
@@ -5516,7 +5672,7 @@ async function startFuzz() {
     try { parsed = JSON.parse(filled); }
     catch {
       addFuzzRow(n, pl, true, 0,
-        'Template produced invalid JSON — ensure §§ is inside a string value', null, null, null);
+        'Template produced invalid JSON — ensure §§ is inside a string value', null, null, null, null);
       continue;
     }
 
@@ -5544,10 +5700,10 @@ async function startFuzz() {
         if (pct >= 20) sizeAnomaly = `baseline ${fmtBytes(baselineSize)}, delta ${delta > 0 ? '+' : ''}${delta} B (${delta > 0 ? '+' : ''}${pct}%)`;
       }
 
-      addFuzzRow(n, pl, isErr, elapsed, preview, data, size, sizeAnomaly);
+      addFuzzRow(n, pl, isErr, elapsed, preview, data, size, sizeAnomaly, parsed);
       addHistory(srv.url, `fuzz:${parsed?.method || '?'}`, {payload: pl}, data, isErr, elapsed);
     } catch(e) {
-      addFuzzRow(n, pl, true, Date.now() - t0, e.message, null, null, null);
+      addFuzzRow(n, pl, true, Date.now() - t0, e.message, null, null, null, null);
     }
 
     if (delay > 0 && !_fuzzStop && i < payloads.length - 1)
