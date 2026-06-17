@@ -36,6 +36,7 @@ Built for red teamers and security operators evaluating MCP server attack surfac
   - **Double-click full view** — double-click a row for a full-screen popup showing the exact request payload sent and the complete response side by side
 - **Auth variation tester** — fires the same request with six auth variations automatically (current token, no auth, invalid token, empty bearer, `Authorization: null`, alg:none JWT); compares response bodies against the authenticated baseline and flags identical responses as confirmed bypass regardless of HTTP status
   - **JWT claims tamper** — when the current token is a JWT, adds six additional mutations: `role=admin`, `role=superuser`, `sub=admin`, `sub=0` (IDOR), expired (`exp=1`), far-future expiry
+  - **Custom header probing** — when custom headers are configured (e.g. `X-API-Key`), adds variations that strip or invalidate each key; prevents false positives on servers that use custom headers instead of Bearer tokens for authentication
 - **Race condition tester** — fires N concurrent requests (5–50) via the **Race** button; results table flags outliers whose HTTP status or response size deviates from the majority
 - **Intruder-lite** — open from any history entry via the **Intruder** button; select a parameter leaf as the fuzz target, choose preset categories or paste a wordlist, fire sequentially via `/raw`, view results with size anomaly detection; export as CSV
 - **Response diff viewer** — check any two history entries and click **Diff** to see a line-level diff; also auto-shown in the auth tester when a bypass is detected
@@ -48,6 +49,7 @@ Built for red teamers and security operators evaluating MCP server attack surfac
 - **Notes per tool** — inline text field per tool for operator annotations during a session; included in JSON export
 - **Session save / load** — export the full session (servers, schemas, history, findings, notes) to JSON and reload it later
 - **Request history** — every call is logged with method, args, status, and elapsed time; replay any entry, export as JSON or Markdown
+- **Custom request headers** — set arbitrary headers per server (e.g. `X-API-Key`, `X-Tenant-ID`) sent on every request alongside the Bearer token; shown as a green **hdrs** badge in the sidebar
 - **HTTP/SOCKS proxy support** — route traffic per-server through Burp Suite or any HTTP/SOCKS proxy
 
 ### UI
@@ -164,6 +166,8 @@ Click **⚡ Auth** in the raw editor action bar to fire six auth variations agai
 
 If the current token is a JWT, six additional claim-mutation rows are added: `role=admin`, `role=superuser`, `sub=admin`, `sub=0` (IDOR probe), `exp=1` (expired), `exp=9999999999` (far future).
 
+If the server has **custom headers** configured (e.g. `X-API-Key`), additional rows are added for each key (up to 3): all custom headers removed, the specific key removed, and the key set to `invalid`. This covers servers that use a custom header instead of (or in addition to) Bearer tokens for authentication — preventing false positives when the Bearer token column is empty.
+
 Responses are compared body-to-body against the authenticated baseline. A `≡ match` badge on any unauthenticated row is a confirmed auth bypass.
 
 ### Race condition tester
@@ -204,6 +208,17 @@ The Findings panel (bottom tabs, or double-click to expand full-screen) aggregat
 | accepted | Accepted risk |
 
 Click the badge to cycle through states. Status persists in `localStorage` across browser sessions and page reloads.
+
+### Custom request headers
+
+Some MCP servers require auth or routing headers beyond a Bearer token (e.g. `X-API-Key`, `X-Tenant-ID`, `X-Forwarded-For`). Click **▸ Custom headers** in the connect form to reveal a textarea and enter headers one per line:
+
+```
+X-API-Key: abc123
+X-Tenant: myorg
+```
+
+Headers are sent on every request to that server — connect, send, fuzz, auth test, race, and intruder. If you also set a Bearer token, the `Authorization` header always takes priority. A green **hdrs** badge appears in the sidebar when headers are configured; hovering shows the header names. Custom headers are restored into the form when you click a cached server entry to reconnect.
 
 ### Proxy (Burp Suite)
 

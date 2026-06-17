@@ -388,8 +388,11 @@ async def _probe_sse(session: aiohttp.ClientSession, url: str,
 
 
 async def probe_target(url: str, auth_token: Optional[str] = None,
-                       proxy: Optional[str] = None) -> dict:
+                       proxy: Optional[str] = None,
+                       custom_headers: Optional[dict] = None) -> dict:
     extra_headers: dict = {}
+    if custom_headers:
+        extra_headers.update(custom_headers)
     if auth_token:
         extra_headers["Authorization"] = f"Bearer {auth_token}"
     try:
@@ -476,9 +479,10 @@ def _validate_url(v: str) -> str:
 
 
 class ConnectRequest(BaseModel):
-    url:   str
-    token: Optional[str] = None
-    proxy: Optional[str] = None
+    url:            str
+    token:          Optional[str]  = None
+    proxy:          Optional[str]  = None
+    custom_headers: Optional[dict] = None
 
     @field_validator("url")
     @classmethod
@@ -487,12 +491,13 @@ class ConnectRequest(BaseModel):
 
 
 class CallRequest(BaseModel):
-    url:       str
-    token:     Optional[str] = None
-    transport: Literal["http", "sse"] = "http"
-    tool:      str
-    args:      dict = {}
-    proxy:     Optional[str] = None
+    url:            str
+    token:          Optional[str]  = None
+    transport:      Literal["http", "sse"] = "http"
+    tool:           str
+    args:           dict = {}
+    proxy:          Optional[str]  = None
+    custom_headers: Optional[dict] = None
 
     @field_validator("url")
     @classmethod
@@ -501,12 +506,13 @@ class CallRequest(BaseModel):
 
 
 class RawRequest(BaseModel):
-    url:         str
-    token:       Optional[str] = None
-    auth_header: Optional[str] = None  # verbatim Authorization value; "" = no auth
-    transport:   Literal["http", "sse"] = "http"
-    proxy:       Optional[str] = None
-    payload:     dict
+    url:            str
+    token:          Optional[str]  = None
+    auth_header:    Optional[str]  = None  # verbatim Authorization value; "" = no auth
+    transport:      Literal["http", "sse"] = "http"
+    proxy:          Optional[str]  = None
+    payload:        dict
+    custom_headers: Optional[dict] = None
 
     @field_validator("url")
     @classmethod
@@ -527,6 +533,8 @@ async def root():
 async def raw_call(req: RawRequest):
     """Send any JSON-RPC payload verbatim — used by the raw editor."""
     extra_headers: dict = {}
+    if req.custom_headers:
+        extra_headers.update(req.custom_headers)
     if req.auth_header is not None:
         if req.auth_header:
             extra_headers["Authorization"] = req.auth_header
@@ -560,7 +568,7 @@ async def raw_call(req: RawRequest):
 
 @app.post("/connect")
 async def connect(req: ConnectRequest):
-    result = await probe_target(req.url, req.token, req.proxy)
+    result = await probe_target(req.url, req.token, req.proxy, req.custom_headers)
     if not result.get("error"):
         _update_cache(req.url, result)
     return result
@@ -569,6 +577,8 @@ async def connect(req: ConnectRequest):
 @app.post("/call")
 async def call_tool(req: CallRequest):
     extra_headers: dict = {}
+    if req.custom_headers:
+        extra_headers.update(req.custom_headers)
     if req.token:
         extra_headers["Authorization"] = f"Bearer {req.token}"
     payload = {
@@ -697,12 +707,13 @@ def _fetch_cert_sync(host: str, port: int) -> dict:
 
 
 class RaceRequest(BaseModel):
-    url:       str
-    token:     Optional[str] = None
-    transport: Literal["http", "sse"] = "http"
-    proxy:     Optional[str] = None
-    payload:   dict
-    count:     int = 10
+    url:            str
+    token:          Optional[str]  = None
+    transport:      Literal["http", "sse"] = "http"
+    proxy:          Optional[str]  = None
+    payload:        dict
+    count:          int = 10
+    custom_headers: Optional[dict] = None
 
     @field_validator("url")
     @classmethod
@@ -719,6 +730,8 @@ class RaceRequest(BaseModel):
 async def race_call(req: RaceRequest):
     """Fire N concurrent requests and return all results for race condition testing."""
     extra_headers: dict = {}
+    if req.custom_headers:
+        extra_headers.update(req.custom_headers)
     if req.token:
         extra_headers["Authorization"] = f"Bearer {req.token}"
 
@@ -953,6 +966,14 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   display: flex; flex-direction: column; gap: 0.35rem; flex-shrink: 0;
 }
 #add-srv-form input { width: 100%; font-size: 12px; }
+#add-headers-row { display:flex; align-items:center; gap:.3rem; }
+#add-headers-toggle { font-size:10px; color:var(--muted); cursor:pointer;
+  background:none; border:none; padding:0; flex-shrink:0; }
+#add-headers-toggle:hover { color:var(--fg); }
+#add-headers { width:100%; font-size:11px; font-family:monospace; resize:vertical;
+  background:var(--bg); color:var(--fg); border:1px solid var(--border);
+  border-radius:4px; padding:.25rem .4rem; line-height:1.5; min-height:44px; }
+#add-headers-hint { font-size:10px; color:var(--muted); }
 
 /* ── Tools panel ── */
 .tool-item {
@@ -1607,6 +1628,13 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
              title="Auth token">
       <input id="add-proxy" type="text" placeholder="Optional proxy (http://127.0.0.1:8080 or socks5://...)"
              title="HTTP or SOCKS4/5 proxy URL — routes all traffic for this server through here">
+      <div id="add-headers-row">
+        <button id="add-headers-toggle" onclick="toggleAddHeaders()" title="Add custom request headers">▸ Custom headers</button>
+      </div>
+      <textarea id="add-headers" style="display:none" rows="2"
+        placeholder="X-API-Key: abc123&#10;X-Tenant: myorg"
+        title="Custom headers sent on every request to this server (one per line, Key: Value)"></textarea>
+      <span id="add-headers-hint" style="display:none">One header per line — Key: Value</span>
       <button class="btn-green" onclick="addServerFromForm()">+ Connect</button>
     </div>
   </div>
@@ -1781,11 +1809,40 @@ const S = {
   histChecked: [],  // up to 2 history entry IDs selected for diff
 };
 
-function mkServer(url, token, proxy) {
+function mkServer(url, token, proxy, customHeaders) {
   return {url, token: token || null, proxy: proxy || null,
+          customHeaders: customHeaders || null,
           status: 'disconnected', transport: null, serverInfo: {}, tools: [],
           resources: [], prompts: [],
           fromCache: false, lastSeen: null, error: null};
+}
+
+function toggleAddHeaders() {
+  const ta   = document.getElementById('add-headers');
+  const hint = document.getElementById('add-headers-hint');
+  const btn  = document.getElementById('add-headers-toggle');
+  const show = ta.style.display === 'none';
+  ta.style.display   = show ? '' : 'none';
+  hint.style.display = show ? '' : 'none';
+  btn.textContent    = (show ? '▾' : '▸') + ' Custom headers';
+  if (show) ta.focus();
+}
+
+function parseCustomHeaders(raw) {
+  const result = {};
+  for (const line of (raw || '').split('\n')) {
+    const idx = line.indexOf(':');
+    if (idx < 1) continue;
+    const key = line.slice(0, idx).trim();
+    const val = line.slice(idx + 1).trim();
+    if (key) result[key] = val;
+  }
+  return Object.keys(result).length ? result : null;
+}
+
+function customHeadersToText(hdrs) {
+  if (!hdrs || typeof hdrs !== 'object') return '';
+  return Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join('\n');
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────
@@ -1873,36 +1930,40 @@ async function clearAllCache() {
 // ── Server management ──────────────────────────────────────────────────────
 
 function addServerFromForm() {
-  const url   = normalizeUrl(document.getElementById('add-url').value);
-  const token = document.getElementById('add-tok').value.trim() || null;
-  const proxy = document.getElementById('add-proxy').value.trim() || null;
+  const url     = normalizeUrl(document.getElementById('add-url').value);
+  const token   = document.getElementById('add-tok').value.trim() || null;
+  const proxy   = document.getElementById('add-proxy').value.trim() || null;
+  const hdrs    = parseCustomHeaders(document.getElementById('add-headers').value);
   if (!url) return;
-  document.getElementById('add-url').value   = '';
-  document.getElementById('add-tok').value   = '';
-  document.getElementById('add-proxy').value = '';
-  connectServer(url, token, proxy);
+  document.getElementById('add-url').value     = '';
+  document.getElementById('add-tok').value     = '';
+  document.getElementById('add-proxy').value   = '';
+  document.getElementById('add-headers').value = '';
+  connectServer(url, token, proxy, hdrs);
 }
 
 document.getElementById('add-url').addEventListener('keydown', e => {
   if (e.key === 'Enter') addServerFromForm();
 });
 
-async function connectServer(url, token, proxy) {
+async function connectServer(url, token, proxy, customHeaders) {
   url = normalizeUrl(url);
   if (!url) return;
   hideError();
 
-  if (!S.servers[url]) S.servers[url] = mkServer(url, token, proxy);
+  if (!S.servers[url]) S.servers[url] = mkServer(url, token, proxy, customHeaders);
   const srv = S.servers[url];
   srv.status = 'connecting'; srv.error = null;
-  if (token !== undefined) srv.token = token;
-  if (proxy !== undefined) srv.proxy = proxy || null;
+  if (token         !== undefined) srv.token         = token;
+  if (proxy         !== undefined) srv.proxy         = proxy || null;
+  if (customHeaders !== undefined) srv.customHeaders = customHeaders || null;
   renderServers();
 
   try {
     const res  = await fetch('/connect', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({url, token: srv.token, proxy: srv.proxy})
+      body: JSON.stringify({url, token: srv.token, proxy: srv.proxy,
+                            custom_headers: srv.customHeaders || null})
     });
     const data = await res.json();
     if (data.error) {
@@ -2026,9 +2087,16 @@ function setActiveServer(url) {
 
   if (srv.status === 'disconnected') {
     // Populate the add-server form so the user can fill in auth and reconnect
-    document.getElementById('add-url').value   = srv.url;
-    document.getElementById('add-tok').value   = srv.token || '';
-    document.getElementById('add-proxy').value = srv.proxy || '';
+    document.getElementById('add-url').value     = srv.url;
+    document.getElementById('add-tok').value     = srv.token || '';
+    document.getElementById('add-proxy').value   = srv.proxy || '';
+    const hText = customHeadersToText(srv.customHeaders);
+    document.getElementById('add-headers').value = hText;
+    if (hText) {
+      document.getElementById('add-headers').style.display = '';
+      document.getElementById('add-headers-hint').style.display = '';
+      document.getElementById('add-headers-toggle').textContent = '▾ Custom headers';
+    }
     document.getElementById('add-url').focus();
     // Still show cached tools/info as a preview
     S.activeUrl   = url;
@@ -2090,6 +2158,8 @@ function renderServers() {
       ? '<span class="badge badge-cache">cached</span>' : '';
     const pBadge   = srv.proxy
       ? `<span class="badge" style="background:#2a1a3a;color:#c792ea" title="${esc(srv.proxy)}">proxy</span>` : '';
+    const hBadge   = srv.customHeaders
+      ? `<span class="badge" style="background:#1a2a1a;color:#7ee787" title="${esc(Object.keys(srv.customHeaders).join(', '))}">hdrs</span>` : '';
     const errText  = srv.error
       ? `<span class="srv-err">${esc(srv.error.slice(0,44))}</span>` : '';
     const lsText   = (!srv.error && srv.lastSeen && srv.fromCache)
@@ -2124,7 +2194,7 @@ function renderServers() {
         ${discBtn}
         <button class="srv-close btn-sm" data-close="${esc(srv.url)}">&#x2715;</button>
       </div>
-      <div class="srv-meta">${tBadge}${certBadge}${cBadge}${pBadge}${injText}${cveText}${fpText}${shadowText}${errText}${lsText}</div>
+      <div class="srv-meta">${tBadge}${certBadge}${cBadge}${pBadge}${hBadge}${injText}${cveText}${fpText}${shadowText}${errText}${lsText}</div>
       ${capBadgesHtml ? `<div class="srv-caps">${capBadgesHtml}</div>` : ''}
     </div>`;
   }).join('');
@@ -4346,7 +4416,8 @@ async function doSend() {
       args      = payload?.params?.arguments || payload?.params || {};
       fetchUrl  = '/raw';
       fetchBody = {url:srv.url, token:srv.token, proxy:srv.proxy,
-                   transport:srv.transport, payload};
+                   transport:srv.transport, payload,
+                   custom_headers: srv.customHeaders || null};
     } else {
       // Form mode: normal tool call
       if (S.selectedIdx < 0) return;
@@ -4356,7 +4427,8 @@ async function doSend() {
       toolName  = tool.name;
       fetchUrl  = '/call';
       fetchBody = {url:srv.url, token:srv.token, proxy:srv.proxy,
-                   transport:srv.transport, tool:tool.name, args};
+                   transport:srv.transport, tool:tool.name, args,
+                   custom_headers: srv.customHeaders || null};
     }
 
     const res     = await fetch(fetchUrl, {
@@ -5264,27 +5336,50 @@ function makeClaimMutationJwt(origToken, mutations) {
   return `${hdr}.${pay}.`;
 }
 
-function authVariations(currentToken) {
+function authVariations(currentToken, customHeaders) {
   const noneJwt = makeAlgNoneJwt();
+  const tok = currentToken ? `Bearer ${currentToken}` : null;
   const vars = [
-    { name: 'Current token',   header: currentToken ? `Bearer ${currentToken}` : null },
-    { name: 'No auth',         header: '' },
-    { name: 'Invalid token',   header: 'Bearer invalid' },
-    { name: 'Empty bearer',    header: 'Bearer ' },
-    { name: 'Null header',     header: 'null' },
-    { name: 'alg:none JWT',    header: `Bearer ${noneJwt}` },
+    { name: 'Current token',   header: tok,                 displayHdr: tok || '(none)' },
+    { name: 'No auth',         header: '',                  displayHdr: '(none)' },
+    { name: 'Invalid token',   header: 'Bearer invalid',    displayHdr: 'Bearer invalid' },
+    { name: 'Empty bearer',    header: 'Bearer ',           displayHdr: 'Bearer ' },
+    { name: 'Null header',     header: 'null',              displayHdr: 'Authorization: null' },
+    { name: 'alg:none JWT',    header: `Bearer ${noneJwt}`, displayHdr: 'Bearer [alg:none JWT]' },
   ];
   if (!currentToken) vars.shift();
   // JWT claim mutations — only when current token looks like a JWT
   if (currentToken && currentToken.split('.').length === 3) {
     vars.push(
-      { name: 'JWT: role=admin',      header: `Bearer ${makeClaimMutationJwt(currentToken, {role:'admin'})}` },
-      { name: 'JWT: role=superuser',  header: `Bearer ${makeClaimMutationJwt(currentToken, {role:'superuser',groups:['admin']})}` },
-      { name: 'JWT: sub=admin',       header: `Bearer ${makeClaimMutationJwt(currentToken, {sub:'admin'})}` },
-      { name: 'JWT: sub=0 (IDOR)',    header: `Bearer ${makeClaimMutationJwt(currentToken, {sub:'0'})}` },
-      { name: 'JWT: expired (exp=1)', header: `Bearer ${makeClaimMutationJwt(currentToken, {exp:1})}` },
-      { name: 'JWT: far future exp',  header: `Bearer ${makeClaimMutationJwt(currentToken, {exp:9999999999})}` },
+      { name: 'JWT: role=admin',      header: `Bearer ${makeClaimMutationJwt(currentToken, {role:'admin'})}`,                      displayHdr: 'Bearer [role=admin]' },
+      { name: 'JWT: role=superuser',  header: `Bearer ${makeClaimMutationJwt(currentToken, {role:'superuser',groups:['admin']})}`, displayHdr: 'Bearer [role=superuser]' },
+      { name: 'JWT: sub=admin',       header: `Bearer ${makeClaimMutationJwt(currentToken, {sub:'admin'})}`,                       displayHdr: 'Bearer [sub=admin]' },
+      { name: 'JWT: sub=0 (IDOR)',    header: `Bearer ${makeClaimMutationJwt(currentToken, {sub:'0'})}`,                           displayHdr: 'Bearer [sub=0]' },
+      { name: 'JWT: expired (exp=1)', header: `Bearer ${makeClaimMutationJwt(currentToken, {exp:1})}`,                             displayHdr: 'Bearer [exp=1]' },
+      { name: 'JWT: far future exp',  header: `Bearer ${makeClaimMutationJwt(currentToken, {exp:9999999999})}`,                    displayHdr: 'Bearer [exp far future]' },
     );
+  }
+  // Custom header variations — probe whether server uses custom headers for auth
+  if (customHeaders && Object.keys(customHeaders).length) {
+    const keys = Object.keys(customHeaders).slice(0, 3);
+    vars.push({
+      name: 'No custom headers', header: null,
+      customHeadersOverride: null,
+      displayHdr: 'custom hdrs: (all removed)',
+    });
+    for (const key of keys) {
+      const without = Object.fromEntries(Object.entries(customHeaders).filter(([k]) => k !== key));
+      vars.push({
+        name: `No ${key}`, header: null,
+        customHeadersOverride: Object.keys(without).length ? without : null,
+        displayHdr: `${key}: (removed)`,
+      });
+      vars.push({
+        name: `${key}: invalid`, header: null,
+        customHeadersOverride: {...customHeaders, [key]: 'invalid'},
+        displayHdr: `${key}: invalid`,
+      });
+    }
   }
   return vars;
 }
@@ -5340,13 +5435,15 @@ async function runAuthTests(srv, payload) {
   const tbody = document.getElementById('auth-tbody');
   const prog  = document.getElementById('auth-prog');
   if (!tbody) return;
-  const vars    = authVariations(srv.token);
+  const vars    = authVariations(srv.token, srv.customHeaders);
   const results = [];
   for (let i = 0; i < vars.length; i++) {
     const v = vars[i];
     if (prog) prog.textContent = `${i + 1} / ${vars.length}`;
-    const displayHeader = v.header === null ? `Bearer ${srv.token || '(none)'}` :
-                          v.header === ''   ? '(none)'                           : v.header;
+    const displayHeader = v.displayHdr ?? (
+      v.header === null ? `Bearer ${srv.token || '(none)'}` :
+      v.header === ''   ? '(none)'                           : v.header);
+    const isCustomVar = 'customHeadersOverride' in v;
     const t0 = Date.now();
     let data = null, elapsed = 0, isErr = false;
     try {
@@ -5355,8 +5452,9 @@ async function runAuthTests(srv, payload) {
         body: JSON.stringify({
           url: srv.url, proxy: srv.proxy, transport: srv.transport || 'http',
           payload,
-          token:       v.header === null ? (srv.token || null) : null,
-          auth_header: v.header === null ? null : v.header,
+          token:          isCustomVar ? (srv.token || null) : (v.header === null ? (srv.token || null) : null),
+          auth_header:    isCustomVar ? null                : (v.header === null ? null : v.header),
+          custom_headers: isCustomVar ? v.customHeadersOverride : (srv.customHeaders || null),
         }),
       });
       data    = await res.json();
@@ -5426,13 +5524,21 @@ function analyzeAuthFindings(srv, vars, results) {
       ? 'Definitive bypass — response body identical to authenticated baseline'
       : 'Probable bypass — server returned success without rejecting the request (response content differs from baseline)';
 
+    const isCustomVar = 'customHeadersOverride' in v;
     let what;
-    if (v.name === 'No auth')       what = 'no Authorization header — endpoint does not enforce authentication';
+    if (v.name === 'No auth')            what = 'no Authorization header — endpoint does not enforce authentication';
     else if (v.name === 'Invalid token') what = '"Bearer invalid" — server is not validating token value';
     else if (v.name === 'Empty bearer')  what = '"Bearer " (empty value) — auth header presence alone is sufficient';
     else if (v.name === 'Null header')   what = 'Authorization: null — server accepted a null header value';
     else if (v.name === 'alg:none JWT')  what = 'unsigned alg:none JWT — server is not validating JWT signatures';
+    else if (v.name === 'No custom headers') what = 'all custom headers removed — server does not enforce custom header authentication';
+    else if (v.name.startsWith('No '))   what = `${v.name.slice(3)} header removed — removing this header did not block the request`;
+    else if (v.name.endsWith(': invalid')) what = `${v.name} — server accepted an invalid value for this authentication header`;
     else                                 what = `variation "${v.name}"`;
+
+    const remediation = isCustomVar
+      ? `Validate the ${v.name.startsWith('No ') ? v.name.slice(3) : v.name.split(':')[0]} header server-side on every request. Missing or invalid values should return HTTP 401/403 before any handler executes.`
+      : 'Enforce authentication at the middleware layer on every request — not only during the initialize handshake. Validate the Authorization header before any handler executes and reject missing, empty, null, or unsigned tokens with HTTP 401.';
 
     newFindings.push({
       severity: 'high',
@@ -5440,7 +5546,7 @@ function analyzeAuthFindings(srv, vars, results) {
       server:   srvShort,
       item:     'auth-test',
       detail:   `${confidence}. Succeeded with ${what}`,
-      remediation: 'Enforce authentication at the middleware layer on every request — not only during the initialize handshake. Validate the Authorization header before any handler executes and reject missing, empty, null, or unsigned tokens with HTTP 401.',
+      remediation,
     });
   }
 
@@ -5683,6 +5789,7 @@ async function startFuzz() {
         body: JSON.stringify({
           url: srv.url, token: srv.token, proxy: srv.proxy,
           transport: srv.transport || 'http', payload: parsed,
+          custom_headers: srv.customHeaders || null,
         }),
       });
       const raw     = await res.text();
@@ -5822,7 +5929,8 @@ async function runRace() {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({url: srv.url, token: srv.token || null,
-        transport: srv.transport || 'http', proxy: srv.proxy || null, payload, count}),
+        transport: srv.transport || 'http', proxy: srv.proxy || null, payload, count,
+        custom_headers: srv.customHeaders || null}),
     });
     data = await resp.json();
   } catch (err) {
@@ -5947,6 +6055,10 @@ function openIntruderModal(histId) {
     </div>`;
   document.body.appendChild(ov);
 
+  // Auto-select first preset category so Run always has payloads ready
+  if (!_intruderState.selectedCat) {
+    _intruderState.selectedCat = Object.keys(PAYLOAD_PRESETS)[0] || null;
+  }
   renderIntruderParams();
   renderIntruderSrc();
 
@@ -6077,19 +6189,25 @@ function getIntruderPayloads() {
   return PAYLOAD_PRESETS[_intruderState.selectedCat] || [];
 }
 
+function intrErr(msg) {
+  const p = document.getElementById('intr-prog');
+  if (p) { p.textContent = '⚠ ' + msg; p.style.color = '#e85c5c'; }
+}
+
 async function runIntruder() {
   const {histId, selectedPath} = _intruderState;
-  if (!selectedPath) { showError('Select a parameter to fuzz'); return; }
+  if (!selectedPath) { intrErr('Select a parameter first'); return; }
   const e = S.history[histId];
-  if (!e) return;
+  if (!e) { intrErr('History entry not found'); return; }
   const srv = S.servers[e.url];
-  if (!srv) { showError('Server not in session'); return; }
+  if (!srv) { intrErr('Server ' + e.url + ' not in current session — reconnect first'); return; }
   const payloads = getIntruderPayloads();
-  if (!payloads.length) { showError('No payloads selected'); return; }
+  if (!payloads.length) { intrErr('No payloads — select a preset category or paste a list'); return; }
 
   const btn  = document.getElementById('intr-run-btn');
   const prog = document.getElementById('intr-prog');
   btn.disabled = true;
+  prog.style.color = 'var(--muted)';
   _intruderState.results = [];
 
   // Build base payload
@@ -6116,7 +6234,8 @@ async function runIntruder() {
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({url: srv.url, token: srv.token||null,
-          transport: srv.transport||'http', proxy: srv.proxy||null, payload}),
+          transport: srv.transport||'http', proxy: srv.proxy||null, payload,
+          custom_headers: srv.customHeaders || null}),
       });
       res = await r.json();
     } catch(err) { res = {error: err.message}; }
