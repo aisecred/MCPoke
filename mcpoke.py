@@ -2,8 +2,11 @@
 """MCPoke — interactive MCP server exploration tool (Burp Repeater for MCP)."""
 
 import asyncio
+import atexit
 import json
+import os
 import re
+import shlex
 import socket
 import ssl
 import subprocess
@@ -13,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 import aiohttp
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, field_validator
 
@@ -723,7 +726,7 @@ class RaceRequest(BaseModel):
     @field_validator("count")
     @classmethod
     def clamp_count(cls, v: int) -> int:
-        return max(2, min(50, v))
+        return max(2, min(500, v))
 
 
 @app.post("/race")
@@ -736,7 +739,8 @@ async def race_call(req: RaceRequest):
         extra_headers["Authorization"] = f"Bearer {req.token}"
 
     async def _one(idx: int) -> dict:
-        t0 = asyncio.get_event_loop().time()
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
         try:
             session_ctx = _make_session(req.proxy)
         except RuntimeError as e:
@@ -746,12 +750,12 @@ async def race_call(req: RaceRequest):
                 body, status = await _post_json(session, req.url, req.payload,
                                                 extra_headers=extra_headers,
                                                 proxy=req.proxy)
-            elapsed = round((asyncio.get_event_loop().time() - t0) * 1000)
+            elapsed = round((loop.time() - t0) * 1000)
             if body is None:
                 return {"idx": idx, "status": status, "error": f"HTTP {status}", "elapsed": elapsed}
             return {"idx": idx, "status": status, "result": body, "elapsed": elapsed}
         except Exception as exc:
-            elapsed = round((asyncio.get_event_loop().time() - t0) * 1000)
+            elapsed = round((loop.time() - t0) * 1000)
             return {"idx": idx, "error": str(exc), "elapsed": elapsed}
 
     results = await asyncio.gather(*[_one(i) for i in range(req.count)])
@@ -767,73 +771,296 @@ async def cert_info(url: str):
     port = parsed.port or 443
     if not host:
         return {"error": "Could not parse host from URL"}
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _fetch_cert_sync, host, port)
 
 
-@app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket):
-    """SSE transport relay (kept for future streaming support)."""
-    await ws.accept()
-    http_session = _make_session()
-    sse: Optional[SSESession] = None
-    call_id = 100
+# ── OAuth 2.0 probe ───────────────────────────────────────────────────────────
+
+class OAuthProbeRequest(BaseModel):
+    url:   str
+    proxy: Optional[str] = None
+
+    @field_validator("url")
+    @classmethod
+    def url_scheme(cls, v: str) -> str:
+        return _validate_url(v)
+
+
+async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None) -> dict:
+    base   = base_url.rstrip("/")
+    meta   = {}
+    tests  = []
+    finds  = []
+
     try:
-        msg = await asyncio.wait_for(ws.receive_json(), timeout=10.0)
-        if msg.get("action") != "init":
-            await ws.send_json({"type": "error",
-                                "message": "First message must be {action:'init'}"})
-            return
-        url   = msg["url"]
+        session_ctx = _make_session(proxy)
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+    async with session_ctx as session:
+        # 1 — discovery
+        for path in ("/.well-known/oauth-authorization-server",
+                     "/.well-known/openid-configuration"):
+            try:
+                async with session.get(base + path,
+                                       timeout=aiohttp.ClientTimeout(total=10),
+                                       allow_redirects=True) as r:
+                    if r.status == 200:
+                        meta = await r.json(content_type=None)
+                        meta["_discovered_at"] = base + path
+                        break
+            except Exception:
+                pass
+
+        if not meta:
+            return {"metadata": None, "tests": [],
+                    "findings": [{"severity": "info",
+                                  "detail": "No OAuth discovery endpoint found "
+                                            "(/.well-known/oauth-authorization-server "
+                                            "and /.well-known/openid-configuration both absent)"}]}
+
+        auth_ep  = meta.get("authorization_endpoint")
+        token_ep = meta.get("token_endpoint")
+
+        # 2 — authorization endpoint: request without code_challenge (PKCE bypass)
+        if auth_ep:
+            params = urllib.parse.urlencode({
+                "response_type": "code",
+                "client_id":     "mcpoke-probe",
+                "redirect_uri":  "http://localhost:9999/callback",
+                "state":         "mcpokestate",
+            })
+            try:
+                async with session.get(f"{auth_ep}?{params}",
+                                       timeout=aiohttp.ClientTimeout(total=10),
+                                       allow_redirects=False) as r:
+                    loc = r.headers.get("Location", "")
+                    tests.append({"name": "No PKCE", "status": r.status, "location": loc})
+                    if r.status in (302, 303) and "code=" in loc:
+                        finds.append({"severity": "high", "category": "OAuth",
+                                      "detail": "Authorization endpoint issued code without PKCE — PKCE not enforced",
+                                      "remediation": "Require code_challenge (S256 method) on all authorization requests and reject requests that omit it."})
+                    elif r.status not in (400, 401, 403):
+                        tests[-1]["note"] = "Did not explicitly reject missing PKCE"
+            except Exception as e:
+                tests.append({"name": "No PKCE", "error": str(e)})
+
+        # 3 — authorization endpoint: open redirect via unregistered redirect_uri
+        if auth_ep:
+            params = urllib.parse.urlencode({
+                "response_type": "code",
+                "client_id":     "mcpoke-probe",
+                "redirect_uri":  "https://evil.example.com/callback",
+                "state":         "mcpokestate",
+            })
+            try:
+                async with session.get(f"{auth_ep}?{params}",
+                                       timeout=aiohttp.ClientTimeout(total=10),
+                                       allow_redirects=False) as r:
+                    loc = r.headers.get("Location", "")
+                    tests.append({"name": "Open redirect", "status": r.status, "location": loc})
+                    if "evil.example.com" in loc:
+                        finds.append({"severity": "high", "category": "OAuth",
+                                      "detail": "Authorization endpoint redirected to unregistered URI — open redirect vulnerability",
+                                      "remediation": "Validate redirect_uri against a strict allowlist of pre-registered URIs. Reject any URI not in the allowlist with HTTP 400."})
+            except Exception as e:
+                tests.append({"name": "Open redirect", "error": str(e)})
+
+        # 4 — token endpoint: exchange without client auth
+        if token_ep:
+            try:
+                async with session.post(token_ep,
+                                        data={"grant_type": "authorization_code",
+                                              "code": "mcpoke-probe-code"},
+                                        timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    body = await r.text()
+                    tests.append({"name": "Token: no client_id", "status": r.status,
+                                  "body": body[:300]})
+                    if r.status == 200:
+                        finds.append({"severity": "high", "category": "OAuth",
+                                      "detail": "Token endpoint returned 200 with no client_id or client_secret",
+                                      "remediation": "Require client authentication on the token endpoint for all grant types."})
+            except Exception as e:
+                tests.append({"name": "Token: no client_id", "error": str(e)})
+
+        # 5 — token endpoint: client_credentials with bogus creds
+        if token_ep:
+            try:
+                async with session.post(token_ep,
+                                        data={"grant_type":    "client_credentials",
+                                              "client_id":     "mcpoke-probe",
+                                              "client_secret": "mcpoke-secret"},
+                                        timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    body = await r.text()
+                    tests.append({"name": "Token: client_credentials (bogus)", "status": r.status,
+                                  "body": body[:300]})
+                    if r.status == 200:
+                        finds.append({"severity": "high", "category": "OAuth",
+                                      "detail": "Token endpoint issued token via client_credentials to unrecognised client",
+                                      "remediation": "Validate client_id and client_secret against a registered client store before issuing tokens."})
+            except Exception as e:
+                tests.append({"name": "Token: client_credentials (bogus)", "error": str(e)})
+
+        # 6 — scope enumeration: request admin/wildcard scopes
+        if auth_ep:
+            for scope in ("*", "admin", "openid profile email offline_access"):
+                params = urllib.parse.urlencode({
+                    "response_type":         "code",
+                    "client_id":             "mcpoke-probe",
+                    "redirect_uri":          "http://localhost:9999/callback",
+                    "scope":                 scope,
+                    "code_challenge":        "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                    "code_challenge_method": "S256",
+                    "state":                 "mcpokestate",
+                })
+                try:
+                    async with session.get(f"{auth_ep}?{params}",
+                                           timeout=aiohttp.ClientTimeout(total=10),
+                                           allow_redirects=False) as r:
+                        loc = r.headers.get("Location", "")
+                        tests.append({"name": f"Scope: {scope}", "status": r.status,
+                                      "location": loc})
+                        if r.status in (302, 303) and "code=" in loc:
+                            finds.append({"severity": "medium", "category": "OAuth",
+                                          "detail": f"Authorization endpoint accepted privileged scope '{scope}' without rejection",
+                                          "remediation": "Validate requested scopes against the registered client's allowed scope list and reject unknown or overly broad scopes."})
+                        break  # only probe until one accepted
+                except Exception as e:
+                    tests.append({"name": f"Scope: {scope}", "error": str(e)})
+
+    return {"metadata": meta, "tests": tests, "findings": finds}
+
+
+@app.post("/oauth-probe")
+async def oauth_probe(req: OAuthProbeRequest):
+    return await _run_oauth_probes(req.url, req.proxy)
+
+
+# ── stdio transport ───────────────────────────────────────────────────────────
+
+_stdio_procs: dict = {}  # command -> asyncio.subprocess.Process
+_stdio_locks: dict = {}  # command -> asyncio.Lock
+
+def _cleanup_stdio_procs():
+    for proc in _stdio_procs.values():
         try:
-            _validate_url(url)
-        except ValueError as e:
-            await ws.send_json({"type": "error", "message": str(e)})
-            return
-        token = msg.get("token")
-        extra_headers: dict = {}
-        if token:
-            extra_headers["Authorization"] = f"Bearer {token}"
-        sse = SSESession(http_session, url, extra_headers=extra_headers)
-        await sse.__aenter__()
-        if not sse.ready:
-            await ws.send_json({"type": "error",
-                                "message": "SSE session failed to establish"})
-            return
-        init_resp = await sse.send(make_initialize())
-        if not init_resp:
-            await ws.send_json({"type": "error",
-                                "message": "SSE: no initialize response"})
-            return
-        await sse.send(INITIALIZED_NOTIF)
-        await ws.send_json({"type": "ready",
-                            "server_info": _extract_server_info(init_resp)})
-        while True:
-            msg = await ws.receive_json()
-            if msg.get("action") == "call":
-                payload = {
-                    "jsonrpc": "2.0", "id": call_id,
-                    "method": "tools/call",
-                    "params": {"name": msg["tool"], "arguments": msg.get("args", {})},
-                }
-                call_id += 1
-                resp = await sse.send(payload)
-                await ws.send_json({"type": "result",
-                                    "req_id": msg.get("req_id"),
-                                    "data": resp})
-            elif msg.get("action") == "disconnect":
-                break
-    except (WebSocketDisconnect, asyncio.TimeoutError):
-        pass
-    except Exception as e:
-        try:
-            await ws.send_json({"type": "error", "message": str(e)})
+            if proc.returncode is None:
+                proc.terminate()
         except Exception:
             pass
-    finally:
-        if sse:
-            await sse.__aexit__(None, None, None)
-        await http_session.close()
+
+atexit.register(_cleanup_stdio_procs)
+
+
+async def _stdio_send(command: str, payload: dict, timeout: float = 30.0) -> dict:
+    proc = _stdio_procs.get(command)
+    if proc is None or proc.returncode is not None:
+        raise ValueError("stdio process is not running — reconnect the server")
+    lock = _stdio_locks[command]
+    async with lock:
+        line = (json.dumps(payload) + "\n").encode()
+        proc.stdin.write(line)
+        await proc.stdin.drain()
+        resp = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
+        if not resp:
+            raise ValueError("stdio process closed unexpectedly")
+        return json.loads(resp.decode())
+
+
+async def _connect_stdio(command: str, env: Optional[dict] = None) -> dict:
+    # Kill dead process
+    existing = _stdio_procs.get(command)
+    if existing is not None and existing.returncode is not None:
+        del _stdio_procs[command]
+        _stdio_locks.pop(command, None)
+
+    # Spawn if not running
+    if command not in _stdio_procs:
+        args      = shlex.split(command)
+        # Strip env keys that can hijack dynamic linker / interpreter loading
+        _BLOCKED_ENV = frozenset({
+            "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG",
+            "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+            "PYTHONPATH", "PYTHONSTARTUP", "RUBYLIB",
+            "NODE_OPTIONS", "NODE_PATH", "PERL5LIB", "PERL5OPT",
+            "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
+        })
+        safe_env  = {k: v for k, v in (env or {}).items()
+                     if isinstance(k, str) and isinstance(v, str)
+                     and k not in _BLOCKED_ENV}
+        proc_env  = {**os.environ, **safe_env}
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=proc_env,
+        )
+        _stdio_procs[command] = proc
+        _stdio_locks[command] = asyncio.Lock()
+
+    # MCP handshake
+    init_resp   = await _stdio_send(command, make_initialize(), timeout=15.0)
+    server_info = _extract_server_info(init_resp)
+
+    notif_line = (json.dumps(INITIALIZED_NOTIF) + "\n").encode()
+    _stdio_procs[command].stdin.write(notif_line)
+    await _stdio_procs[command].stdin.drain()
+
+    tools_resp   = await _stdio_send(command, TOOLS_LIST)
+    res_resp     = await _stdio_send(command, RESOURCES_LIST)
+    prompts_resp = await _stdio_send(command, PROMPTS_LIST)
+
+    return {
+        "transport":   "stdio",
+        "server_info": server_info,
+        "tools":       _extract_tools(tools_resp)     or [],
+        "resources":   _extract_resources(res_resp)   or [],
+        "prompts":     _extract_prompts(prompts_resp) or [],
+    }
+
+
+class StdioConnectRequest(BaseModel):
+    command: str
+    env:     Optional[dict] = None
+
+
+class StdioRawRequest(BaseModel):
+    command: str
+    payload: dict
+
+
+@app.post("/stdio/connect")
+async def stdio_connect(req: StdioConnectRequest):
+    if not req.command.strip():
+        return {"error": "Command cannot be empty"}
+    try:
+        return await _connect_stdio(req.command, req.env)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/stdio/raw")
+async def stdio_raw(req: StdioRawRequest):
+    try:
+        result = await _stdio_send(req.command, req.payload)
+        return {"status": 200, "result": result}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.delete("/stdio/disconnect")
+async def stdio_disconnect(command: str):
+    proc = _stdio_procs.pop(command, None)
+    _stdio_locks.pop(command, None)
+    if proc and proc.returncode is None:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+    return {"ok": True}
 
 
 # ── HTML UI ───────────────────────────────────────────────────────────────────
@@ -855,6 +1082,8 @@ HTML = r"""<!DOCTYPE html>
   --cyan:    #79c0ff;
   --red:     #f85149;
   --yellow:  #e3b341;
+  --fg:      #c9d1d9;
+  --error:   #f85149;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -1015,6 +1244,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   background: #2d1800; border: 1px solid #5c3000; border-radius: 3px; padding: 1px 4px; cursor: default; }
 .cap-medium   { font-size: 9px; color: #e3b341;
   background: #2d2200; border: 1px solid #5a4000; border-radius: 3px; padding: 1px 4px; cursor: default; }
+.cap-low      { font-size: 9px; color: #8b949e;
+  background: #1c2128; border: 1px solid #30363d; border-radius: 3px; padding: 1px 4px; cursor: default; }
 .cap-info     { font-size: 9px; color: #79c0ff;
   background: #0d1f33; border: 1px solid #1a3a5a; border-radius: 3px; padding: 1px 4px; cursor: default; }
 .srv-caps     { margin-top: 3px; display: flex; flex-wrap: wrap; gap: 3px; }
@@ -1230,6 +1461,11 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 .badge-warn  { background: #2d1800; color: #ffa657; }
 .badge-http  { background: #1c3a1c; color: var(--green); }
 .badge-sse   { background: #1c3a5e; color: var(--cyan); }
+.badge-stdio { background: #3a2a1c; color: #e3b341; }
+.hfuzz-pl-item { font-family:monospace;font-size:10px;padding:.2rem .4rem;cursor:pointer;
+  border-radius:3px;border:1px solid transparent;word-break:break-all;margin-bottom:1px; }
+.hfuzz-pl-item:hover { background:var(--surface); }
+.hfuzz-pl-item.hfuzz-pl-selected { background:#2a1a00;border-color:#e3b341;color:#e3b341; }
 .badge-cache { background: #2d2500; color: var(--yellow); font-size: 9px; }
 .empty { color: var(--muted); font-style: italic; font-size: 12px; }
 ::-webkit-scrollbar { width: 5px; height: 5px; }
@@ -1507,50 +1743,50 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 }
 .race-h-resizer:hover,.race-h-resizer.dragging { background:var(--accent); }
 
-/* ── Intruder modal ── */
-#intruder-overlay { position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.65); }
-#intruder-modal {
+/* ── History Fuzzer modal ── */
+#hfuzz-overlay { position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.65); }
+#hfuzz-modal {
   background:var(--surface);border:none;border-radius:0;
   width:100vw;height:100vh;
   display:flex;flex-direction:column;
   position:fixed;top:0;left:0;overflow:hidden;
 }
-.intruder-hdr {
+.hfuzz-hdr {
   display:flex;align-items:center;gap:.6rem;flex-shrink:0;
   padding:.35rem .75rem;border-bottom:1px solid var(--border);background:var(--bg);
 }
-.intruder-hdr-title { color:var(--accent);font-weight:700;font-family:monospace;font-size:13px; }
-.intruder-body { display:flex;flex:1;overflow:hidden;gap:0; }
-.intruder-left { width:280px;flex-shrink:0;border-right:1px solid var(--border);
+.hfuzz-hdr-title { color:var(--accent);font-weight:700;font-family:monospace;font-size:13px; }
+.hfuzz-body { display:flex;flex:1;overflow:hidden;gap:0; }
+.hfuzz-left { width:280px;flex-shrink:0;border-right:1px solid var(--border);
   display:flex;flex-direction:column;overflow:hidden; }
-.intruder-right { flex:1;display:flex;flex-direction:column;overflow:hidden; }
-.intruder-section-hdr { font-size:10px;font-weight:700;color:var(--muted);
+.hfuzz-right { flex:1;display:flex;flex-direction:column;overflow:hidden; }
+.hfuzz-section-hdr { font-size:10px;font-weight:700;color:var(--muted);
   text-transform:uppercase;letter-spacing:.05em;
   padding:.3rem .5rem;background:var(--bg);border-bottom:1px solid var(--border);flex-shrink:0; }
-.intruder-param-list { flex:1;overflow-y:auto;padding:.3rem; }
-.intruder-param-item { font-size:11px;font-family:monospace;padding:.25rem .4rem;
+.hfuzz-param-list { flex:1;overflow-y:auto;padding:.3rem; }
+.hfuzz-param-item { font-size:11px;font-family:monospace;padding:.25rem .4rem;
   border-radius:3px;cursor:pointer;word-break:break-all; }
-.intruder-param-item:hover { background:var(--surface); }
-.intruder-param-item.selected { background:#2a1a00;border:1px solid #e3b341; }
-.intruder-param-item .ipkey { color:var(--muted); }
-.intruder-param-item .ipval { color:var(--accent); }
-.intruder-src-tabs { display:flex;gap:2px;padding:.25rem .4rem;
+.hfuzz-param-item:hover { background:var(--surface); }
+.hfuzz-param-item.selected { background:#2a1a00;border:1px solid #e3b341; }
+.hfuzz-param-item .ipkey { color:var(--muted); }
+.hfuzz-param-item .ipval { color:var(--accent); }
+.hfuzz-src-tabs { display:flex;gap:2px;padding:.25rem .4rem;
   background:var(--bg);border-bottom:1px solid var(--border);flex-shrink:0; }
-.intruder-src-tab { font-size:11px;padding:.15rem .4rem;border-radius:3px;
+.hfuzz-src-tab { font-size:11px;padding:.15rem .4rem;border-radius:3px;
   border:1px solid transparent;background:none;color:var(--muted);cursor:pointer; }
-.intruder-src-tab.active { background:#0d2040;border-color:var(--accent);color:var(--accent);font-weight:600; }
-.intruder-source-pane { flex:1;overflow-y:auto;padding:.4rem; }
-#intruder-tbl { width:100%;border-collapse:collapse;font-size:11px; }
-#intruder-tbl th {
+.hfuzz-src-tab.active { background:#0d2040;border-color:var(--accent);color:var(--accent);font-weight:600; }
+.hfuzz-source-pane { flex:1;overflow-y:auto;padding:.4rem; }
+#hfuzz-tbl { width:100%;border-collapse:collapse;font-size:11px; }
+#hfuzz-tbl th {
   background:var(--bg);color:var(--muted);font-size:10px;
   text-transform:uppercase;letter-spacing:.06em;
   padding:.2rem .5rem;text-align:left;position:sticky;top:0;z-index:1;
 }
-#intruder-tbl td { padding:.3rem .5rem;border-bottom:1px solid #21262d;vertical-align:middle; }
-#intruder-tbl tr.intr-anomaly td { background:#2d1a00; }
-#intruder-tbl tr.clickable:hover td { background:#0d2040;cursor:pointer; }
-#intruder-tbl tr.intr-selected td { background:#0d2040; }
-#intruder-response-pane {
+#hfuzz-tbl td { padding:.3rem .5rem;border-bottom:1px solid #21262d;vertical-align:middle; }
+#hfuzz-tbl tr.intr-anomaly td { background:#2d1a00; }
+#hfuzz-tbl tr.clickable:hover td { background:#0d2040;cursor:pointer; }
+#hfuzz-tbl tr.intr-selected td { background:#0d2040; }
+#hfuzz-response-pane {
   flex-shrink:0;overflow-y:auto;background:var(--bg);
   border-top:1px solid var(--border);font-family:monospace;font-size:11px;
   padding:.5rem .75rem;color:var(--text);white-space:pre-wrap;word-break:break-all;
@@ -1622,8 +1858,17 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
       <div class="empty" style="padding:.5rem">No servers added</div>
     </div>
     <div id="add-srv-form">
+      <div style="display:flex;gap:0.3rem;margin-bottom:0.25rem;align-items:center">
+        <span style="font-size:10px;color:var(--muted)">Transport:</span>
+        <button id="trans-http-btn" class="btn-sm" style="font-size:10px;padding:0.1rem 0.45rem"
+          onclick="setConnectTransport('http')">HTTP/SSE</button>
+        <button id="trans-stdio-btn" class="btn-sm" style="font-size:10px;padding:0.1rem 0.45rem;opacity:0.45"
+          onclick="setConnectTransport('stdio')" title="Local stdio subprocess (node, python, etc.)">stdio</button>
+      </div>
       <input id="add-url" type="text" placeholder="http://host:port/mcp"
              title="MCP server URL">
+      <input id="add-command" type="text" placeholder="node /path/to/server.js arg1 arg2"
+             title="Command to spawn the stdio MCP server" style="display:none">
       <input id="add-tok" type="text" placeholder="Bearer token (optional)"
              title="Auth token">
       <input id="add-proxy" type="text" placeholder="Optional proxy (http://127.0.0.1:8080 or socks5://...)"
@@ -1635,6 +1880,12 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
         placeholder="X-API-Key: abc123&#10;X-Tenant: myorg"
         title="Custom headers sent on every request to this server (one per line, Key: Value)"></textarea>
       <span id="add-headers-hint" style="display:none">One header per line — Key: Value</span>
+      <div id="add-env-row" style="display:none">
+        <button id="add-env-toggle" onclick="toggleAddEnv()" title="Set environment variables for the stdio subprocess">▸ Env vars</button>
+      </div>
+      <textarea id="add-env" style="display:none" rows="2"
+        placeholder="DATABASE_URL=postgres://...&#10;API_KEY=secret"
+        title="Environment variables injected into the subprocess (one per line, KEY=VALUE)"></textarea>
       <button class="btn-green" onclick="addServerFromForm()">+ Connect</button>
     </div>
   </div>
@@ -1697,9 +1948,19 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
             <button class="btn-sm" onclick="syncRawToForm()">&#8592; Sync to form</button>
             <button class="btn-sm" onclick="markSection()" title="Wrap selection with §§ injection markers">&#167; Mark</button>
             <button class="btn-sm" id="fuzz-btn" style="display:none" onclick="toggleFuzzer()" title="Show / hide Fuzzer">&#9889; Fuzz</button>
-            <button class="btn-sm" onclick="openAuthTestModal()" title="Test auth bypass variations">&#9919; Auth</button>
-            <button class="btn-sm" onclick="openRaceModal()" title="Fire concurrent requests to test for race conditions">&#9651; Race</button>
+            <button class="btn-sm" id="auth-test-btn" onclick="openAuthTestModal()" title="Test auth bypass variations">&#9919; Auth</button>
+            <button class="btn-sm" id="race-btn" onclick="openRaceModal()" title="Fire concurrent requests to test for race conditions">&#9651; Race</button>
+            <button class="btn-sm" id="oauth-btn" onclick="openOAuthModal()" title="Probe OAuth 2.0 / PKCE implementation">OAuth</button>
             <button class="btn-sm" onclick="substituteOobInEditor()" title="Replace placeholder domains with your OOB URL">Sub OOB</button>
+            <div style="position:relative">
+              <button class="btn-sm" id="copy-format-btn" onclick="toggleCopyMenu()" title="Copy request as cURL or Python">&#8669; Copy &#9662;</button>
+              <div id="copy-format-menu" style="display:none;position:absolute;left:0;top:100%;margin-top:2px;
+                   background:var(--surface);border:1px solid var(--border);border-radius:4px;
+                   z-index:100;min-width:150px;box-shadow:0 4px 12px rgba(0,0,0,.4)">
+                <div class="pp-item" onclick="copyAsFormat('curl')">Copy as cURL</div>
+                <div class="pp-item" onclick="copyAsFormat('python')">Copy as Python</div>
+              </div>
+            </div>
             <div style="position:relative">
               <button class="btn-sm" onclick="toggleProtocolMenu()" title="Inject MCP protocol edge-case payload">Protocol &#9662;</button>
               <div id="protocol-preset-menu" style="display:none;position:absolute;left:0;top:100%;margin-top:2px;
@@ -1757,6 +2018,12 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
       </div>
     </div>
   </div>
+  <div style="padding:.25rem .4rem;border-bottom:1px solid var(--border);display:none" id="hist-filter-bar">
+    <input id="hist-filter-input" type="text" placeholder="Filter by tool, server, args…"
+      style="width:100%;box-sizing:border-box;background:var(--bg);color:var(--fg);
+             border:1px solid var(--border);border-radius:4px;padding:.2rem .4rem;font-size:11px;font-family:monospace"
+      oninput="renderHistory()">
+  </div>
   <div style="overflow-y:auto;flex:1">
     <div id="hist-view">
       <table id="hist-table">
@@ -1772,12 +2039,17 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
       </table>
     </div>
     <div id="findings-view" style="display:none">
+      <div style="padding:.25rem .4rem;border-bottom:1px solid var(--border)">
+        <input id="findings-filter" type="text" placeholder="Filter findings…" oninput="renderFindings()"
+          style="width:100%;box-sizing:border-box;background:var(--surface);color:var(--text);
+                 border:1px solid var(--border);border-radius:3px;padding:.2rem .4rem;font-size:11px">
+      </div>
       <table id="findings-table">
         <thead>
-          <tr><th>Sev</th><th>Status</th><th>Category</th><th>Server</th><th>Item</th><th>Detail</th><th>Remediation</th><th></th></tr>
+          <tr><th>Sev</th><th>Status</th><th>Category</th><th>Server</th><th>Item</th><th>Detail</th><th>Remediation</th><th>Notes</th><th></th></tr>
         </thead>
         <tbody id="findings-body">
-          <tr><td colspan="8" class="empty" style="padding:.3rem .5rem">No findings — connect a server to scan</td></tr>
+          <tr><td colspan="9" class="empty" style="padding:.3rem .5rem">No findings — connect a server to scan</td></tr>
         </tbody>
       </table>
     </div>
@@ -1806,15 +2078,55 @@ const S = {
   notifications: [],
   rawMode: false,
   findingStatus: JSON.parse(localStorage.getItem('mcpoke-finding-status') || '{}'),
+  findingNotes:  JSON.parse(localStorage.getItem('mcpoke-finding-notes')  || '{}'),
   histChecked: [],  // up to 2 history entry IDs selected for diff
 };
 
-function mkServer(url, token, proxy, customHeaders) {
+function mkServer(url, token, proxy, customHeaders, command) {
   return {url, token: token || null, proxy: proxy || null,
           customHeaders: customHeaders || null,
+          command: command || null, env: null,
           status: 'disconnected', transport: null, serverInfo: {}, tools: [],
           resources: [], prompts: [],
           fromCache: false, lastSeen: null, error: null};
+}
+
+let _connectTransport = 'http';
+
+function setConnectTransport(mode) {
+  _connectTransport = mode;
+  const isStdio = mode === 'stdio';
+  document.getElementById('add-url').style.display       = isStdio ? 'none' : '';
+  document.getElementById('add-command').style.display   = isStdio ? ''     : 'none';
+  document.getElementById('add-tok').style.display       = isStdio ? 'none' : '';
+  document.getElementById('add-proxy').style.display     = isStdio ? 'none' : '';
+  document.getElementById('add-headers-row').style.display = isStdio ? 'none' : '';
+  document.getElementById('add-env-row').style.display   = isStdio ? ''     : 'none';
+  document.getElementById('trans-http-btn').style.opacity  = isStdio ? '0.45' : '1';
+  document.getElementById('trans-stdio-btn').style.opacity = isStdio ? '1'    : '0.45';
+  if (isStdio) document.getElementById('add-command').focus();
+  else         document.getElementById('add-url').focus();
+}
+
+function toggleAddEnv() {
+  const ta  = document.getElementById('add-env');
+  const btn = document.getElementById('add-env-toggle');
+  const show = ta.style.display === 'none';
+  ta.style.display = show ? '' : 'none';
+  btn.textContent  = (show ? '▾' : '▸') + ' Env vars';
+  if (show) ta.focus();
+}
+
+function parseEnvVars(raw) {
+  const result = {};
+  for (const line of (raw || '').split('\n')) {
+    const idx = line.indexOf('=');
+    if (idx < 1) continue;
+    const key = line.slice(0, idx).trim();
+    const val = line.slice(idx + 1).trim();
+    if (key) result[key] = val;
+  }
+  return Object.keys(result).length ? result : null;
 }
 
 function toggleAddHeaders() {
@@ -1862,6 +2174,7 @@ function normalizeUrl(raw) {
 
 function srvLabel(srv) {
   if (srv.serverInfo && srv.serverInfo.name) return srv.serverInfo.name;
+  if (srv.command) return srv.command.trim().split(/\s+/)[0].split('/').pop();
   try { return new URL(srv.url).host; } catch { return srv.url; }
 }
 
@@ -1930,6 +2243,15 @@ async function clearAllCache() {
 // ── Server management ──────────────────────────────────────────────────────
 
 function addServerFromForm() {
+  if (_connectTransport === 'stdio') {
+    const command = document.getElementById('add-command').value.trim();
+    if (!command) return;
+    const env = parseEnvVars(document.getElementById('add-env').value);
+    document.getElementById('add-command').value = '';
+    document.getElementById('add-env').value     = '';
+    connectStdioServer(command, env);
+    return;
+  }
   const url     = normalizeUrl(document.getElementById('add-url').value);
   const token   = document.getElementById('add-tok').value.trim() || null;
   const proxy   = document.getElementById('add-proxy').value.trim() || null;
@@ -1945,6 +2267,50 @@ function addServerFromForm() {
 document.getElementById('add-url').addEventListener('keydown', e => {
   if (e.key === 'Enter') addServerFromForm();
 });
+document.getElementById('add-command').addEventListener('keydown', e => {
+  if (e.key === 'Enter') addServerFromForm();
+});
+
+async function connectStdioServer(command, env) {
+  const url = 'stdio://' + command;
+  if (!S.servers[url]) S.servers[url] = mkServer(url, null, null, null, command);
+  const srv   = S.servers[url];
+  srv.status  = 'connecting';
+  srv.command = command;
+  srv.env     = env || null;
+  hideError();
+  renderServers();
+
+  try {
+    const res  = await fetch('/stdio/connect', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({command, env: env || null}),
+    });
+    const data = await res.json();
+    if (data.error) {
+      srv.status = 'error'; srv.error = data.error;
+    } else {
+      srv.status     = 'connected';
+      srv.transport  = 'stdio';
+      srv.serverInfo = data.server_info || {};
+      srv.tools      = data.tools     || [];
+      srv.resources  = data.resources || [];
+      srv.prompts    = data.prompts   || [];
+      srv.fromCache  = false;
+      const _preserved = (srv.findings || []).filter(f => ['auth-test','oauth-probe','cert'].includes(f.item));
+      srv.findings   = [...scanServerFindings(srv), ..._preserved];
+      const connected = Object.values(S.servers).filter(s => s.status === 'connected');
+      if (!S.activeUrl || !S.servers[S.activeUrl] ||
+          S.servers[S.activeUrl].status !== 'connected') {
+        setActiveServer(url);
+      }
+    }
+  } catch (e) {
+    srv.status = 'error'; srv.error = e.message;
+  }
+  renderServers();
+  if (srv.url === S.activeUrl) renderTabContent(srv);
+}
 
 async function connectServer(url, token, proxy, customHeaders) {
   url = normalizeUrl(url);
@@ -1977,7 +2343,8 @@ async function connectServer(url, token, proxy, customHeaders) {
       srv.prompts    = data.prompts   || [];
       srv.fromCache  = false;
       srv.certInfo   = null;
-      srv.findings   = scanServerFindings(srv);
+      const _preserved = (srv.findings || []).filter(f => ['auth-test','oauth-probe','cert'].includes(f.item));
+      srv.findings   = [...scanServerFindings(srv), ..._preserved];
       // Fetch TLS cert info in the background (non-blocking)
       if (url.startsWith('https://')) fetchCertInfo(srv);
       // If this is the only/first connected server, activate it
@@ -2003,7 +2370,7 @@ async function fetchCertInfo(srv) {
     const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
     const certFindings = [];
     if (info.expired) {
-      certFindings.push({severity:'high', category:'TLS', server:srvShort, item:'cert',
+      certFindings.push({severity:'medium', category:'TLS', server:srvShort, item:'cert',
         detail:`Certificate EXPIRED on ${info.expiry} — connections may be rejected by clients`,
         remediation:'Replace the certificate immediately. Configure automated renewal (e.g. certbot with a systemd timer or cron job) to prevent future expiry.'});
     } else if (info.expiring_soon) {
@@ -2050,11 +2417,19 @@ function tlsCertBadge(srv) {
   return `<span class="badge badge-ok" title="${tip}">TLS &#x2713;</span>`;
 }
 
+function _killStdioIfNeeded(srv) {
+  if (srv && srv.command && srv.transport === 'stdio') {
+    fetch('/stdio/disconnect?' + new URLSearchParams({command: srv.command}),
+          {method: 'DELETE'});
+  }
+}
+
 function disconnectServer(url) {
   const srv = S.servers[url];
   if (!srv) return;
+  _killStdioIfNeeded(srv);
   srv.status    = 'disconnected';
-  srv.fromCache = true;
+  srv.fromCache = srv.transport !== 'stdio';  // stdio servers don't cache
   srv.transport = null;
   srv.error     = null;
   if (S.activeUrl === url) setActiveServer(url);
@@ -2064,11 +2439,14 @@ function disconnectServer(url) {
 function removeServer(url) {
   const srv = S.servers[url];
   if (!srv) return;
+  _killStdioIfNeeded(srv);
   delete S.servers[url];
-  // Remove from cache too
-  fetch('/cache/entry', {method:'DELETE',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({url})});
+  // Remove from cache too (no-op for stdio since it was never cached)
+  if (!srv.command) {
+    fetch('/cache/entry', {method:'DELETE',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url})});
+  }
   if (S.activeUrl === url) {
     // Activate the next connected server, if any
     const next = Object.values(S.servers).find(s => s.status === 'connected');
@@ -2118,12 +2496,21 @@ function setActiveServer(url) {
   renderCapPanel(srv);
   document.getElementById('req-server').textContent =
     srv.serverInfo?.name || (function(){try{return new URL(url).host;}catch{return url;}})();
+  // Hide HTTP-only buttons for stdio servers
+  const isStdio = srv.transport === 'stdio';
+  const authBtn  = document.getElementById('auth-test-btn');
+  const raceBtn  = document.getElementById('race-btn');
+  const oauthBtn = document.getElementById('oauth-btn');
+  if (authBtn)  authBtn.style.display  = isStdio ? 'none' : '';
+  if (raceBtn)  raceBtn.style.display  = isStdio ? 'none' : '';
+  if (oauthBtn) oauthBtn.style.display = isStdio ? 'none' : '';
 }
 
 function detectShadowedTools() {
-  // Returns Map<toolName, url[]> for names present in 2+ servers
+  // Returns Map<toolName, url[]> for names present in 2+ currently-connected servers
   const nameToUrls = new Map();
   for (const srv of Object.values(S.servers)) {
+    if (srv.status !== 'connected') continue;
     for (const t of (srv.tools || [])) {
       if (!nameToUrls.has(t.name)) nameToUrls.set(t.name, []);
       nameToUrls.get(t.name).push(srv.url);
@@ -2330,6 +2717,24 @@ const PAYLOAD_PRESETS = {
   ],
 
   'Command injection': [
+    // Direct execution — no prefix needed (parameter passed straight to exec/shell)
+    'id', 'whoami', 'hostname', 'uname -a', 'uname -r',
+    'env', 'printenv PATH', 'ls', 'ls -la', 'ls -la /',
+    'cat /etc/passwd', 'cat /etc/hosts', 'cat /proc/self/environ',
+    'pwd', 'ps aux', 'ifconfig', 'ip addr', 'netstat -an',
+    // Shell binary invocation — tests direct execv / exec() with param as command path
+    // Also bypasses filters that strip metacharacters but allow path-like values
+    '/bin/sh', '/bin/bash', '/bin/sh -c id', '/bin/bash -c id',
+    '/bin/sh -c whoami', '/bin/bash -c whoami',
+    '/bin/sh -c "cat /etc/passwd"', '/bin/bash -c "cat /etc/passwd"',
+    '/bin/sh -i', '/bin/bash -i',
+    'bash', 'sh', 'bash -c id', 'sh -c id',
+    // Windows shell invocation
+    'cmd.exe', 'cmd.exe /c whoami', 'cmd.exe /c dir',
+    'powershell.exe -c whoami', 'powershell -c whoami',
+    'powershell -ExecutionPolicy Bypass -c whoami',
+    // Windows direct
+    'whoami /all', 'ipconfig /all', 'dir', 'set', 'type C:\\Windows\\win.ini',
     // Basic separators — Unix
     '; id', '| id', '`id`', '$(id)', '& id', '&& id',
     '; whoami', '| whoami', '`whoami`', '$(whoami)',
@@ -2859,7 +3264,7 @@ const INJECTION_RULES = [
      /\[SYSTEM\]/,  /\[USER\]/,  /\[ASSISTANT\]/,
      /^(Human|User|Assistant|System)\s*:/m,
    ]},
-  {cat: 'template injection',
+  {cat: 'template injection', severity: 'medium',
    pats: [
      /\{\{.{0,80}\}\}/,          // Jinja2 / Twig / Angular / Vue
      /\{%.{0,80}%\}/,            // Jinja2 / Twig block tags
@@ -2871,13 +3276,13 @@ const INJECTION_RULES = [
      /\[#(if|list|assign)\b/i,                    // Freemarker alt syntax
      /\{(smarty|literal|php|section)\b/i,         // Smarty
    ]},
-  {cat: 'hidden / zero-width characters',
+  {cat: 'hidden / zero-width characters', severity: 'critical',
    pats: [
      /[​‌‍‎‏﻿⁠-⁤]/,  // zero-width
      /[‪-‮]/,   // bidi override / embedding
      /[ - \u2028\u2029  　]/,  // unusual spaces
    ]},
-  {cat: 'CRLF injection',
+  {cat: 'CRLF injection', severity: 'medium',
    pats: [
      /\r\n|\r(?!\n)/,
      /%0[aAdD]/,
@@ -2898,8 +3303,8 @@ const INJECTION_RULES = [
      /\bexfiltrat/i,
      /send (all|everything|the data|results?) (to|via)\b/i,
      /forward (all|data|results?) to\b/i,
-     /http[s]?:\/\/(?!(localhost|127\.|0\.0\.0\.0))/i,
-     /\bwebhook\b/i,
+     /(?:send|forward|transmit|leak|submit|post|upload|exfiltrate)[^.]{0,60}https?:\/\//i,
+     /https?:\/\/[^\s]{0,80}(?:ngrok\.io|burpcollaborator\.net|oastify\.com|interactsh\.io|canarytokens\.com|requestbin\.com|hookbin\.com|webhook\.site)/i,
      /\bngrok\.io\b/i,
      /\bburpcollaborator\b/i,
      /\binteractsh\b/i,
@@ -2925,15 +3330,15 @@ const KNOWN_VULNS = [
   },
   {
     id: 'PATTERN-NO-AUTH',
-    title: 'No Authentication Required',
-    severity: 'high',
-    desc: 'Server accepted the connection without a bearer token, indicating no authentication is enforced.',
-    match: (_name, _ver, _proto, srv) => !srv.token && srv.status === 'connected',
+    title: 'No Bearer Token Configured',
+    severity: 'info',
+    desc: 'Server was connected without a bearer token. Run the Auth tester to confirm whether authentication is actually enforced.',
+    match: (_name, _ver, _proto, srv) => !srv.token && srv.status === 'connected' && srv.transport !== 'stdio',
   },
   {
     id: 'PATTERN-OLD-PROTO',
     title: 'Outdated Protocol Version',
-    severity: 'medium',
+    severity: 'low',
     desc: 'Server advertises a protocol version older than 2025-11-25, indicating an unpatched or legacy implementation.',
     match: (_name, _ver, proto, _srv) => !!proto && proto < '2025-11-25',
   },
@@ -2980,8 +3385,14 @@ function scanResponse(data, requestArgs) {
     const m = text.match(p.re);
     if (!m) continue;
     const matched = m[0];
+    // For patterns that require surrounding context (e.g. AWS secret key needs "aws"/"amazon"/"AKIA" nearby)
+    if (p.hint === 'near AWS') {
+      const idx = text.indexOf(matched);
+      const ctx = text.slice(Math.max(0, idx - 300), idx + matched.length + 300).toLowerCase();
+      if (!ctx.includes('aws') && !ctx.includes('amazon') && !/akia[0-9a-z]{16}/i.test(ctx)) continue;
+    }
     // Suppress if the match is just the server echoing back one of our inputs
-    const isReflection = argValues.some(av => av.includes(matched) || matched.includes(av) && av.length > 4);
+    const isReflection = argValues.some(av => av.length > 4 && (av.includes(matched) || matched.includes(av)));
     if (isReflection) continue;
     const preview = matched.length > 80 ? matched.slice(0, 77) + '…' : matched;
     hits.push({cat: p.cat, severity: p.severity, preview});
@@ -3026,7 +3437,7 @@ function fingerprintServer(srv) {
 // ── Capability analysis ───────────────────────────────────────────────────
 
 const CAP_RISKS = {
-  sampling:     {level: 'critical', label: 'sampling',     tip: 'Server can invoke AI/LLM sampling on your client — billing risk and data exfiltration vector. Treat as critical.',
+  sampling:     {level: 'high',     label: 'sampling',     tip: 'Server can invoke AI/LLM sampling on your client — billing risk and data exfiltration vector.',
                  remediation: 'Remove the sampling capability declaration if not genuinely required. If needed, enforce strict rate limits and audit every model invocation for unexpected prompts or data exfiltration attempts.'},
   experimental: {level: 'high',     label: 'experimental', tip: 'Server has undocumented experimental capabilities. Attack surface is unknown; audit all tools carefully.',
                  remediation: 'Audit all tools and endpoints on this server. Experimental capabilities have no formal spec and may bypass standard protocol safety checks — restrict access until fully reviewed.'},
@@ -3151,7 +3562,7 @@ function scanText(field, value) {
       if (m) {
         // Sanitize match for display — replace control/invisible chars
         const preview = m[0].replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f​-‏‪-‮]/g, '□');
-        hits.push({cat: rule.cat, field, preview: preview.slice(0, 60)});
+        hits.push({cat: rule.cat, severity: rule.severity || 'high', field, preview: preview.slice(0, 60)});
         break;
       }
     }
@@ -3222,6 +3633,7 @@ function switchHistTab(name) {
   document.getElementById('findings-clear').style.display       = name === 'findings' ? '' : 'none';
   document.getElementById('findings-add').style.display         = name === 'findings' ? '' : 'none';
   document.getElementById('findings-export-wrap').style.display = name === 'findings' ? '' : 'none';
+  document.getElementById('hist-filter-bar').style.display      = name === 'history'  ? '' : 'none';
 }
 
 function clearFindings() {
@@ -3362,15 +3774,21 @@ function exportFindings(fmt) {
 
   if (fmt === 'csv') {
     const escape = v => '"' + String(v || '').replace(/"/g, '""') + '"';
-    const rows = [['Severity','Status','Category','Server','Item','Detail','Remediation','Source'].map(escape).join(',')];
-    for (const f of findings)
-      rows.push([f.severity, S.findingStatus[findingFp(f)] || 'open', f.category, f.server, f.item, f.detail,
-                 f.remediation || '', f.source || 'auto'].map(escape).join(','));
+    const rows = [['Severity','Status','Category','Server','Item','Detail','Remediation','Notes','Source'].map(escape).join(',')];
+    for (const f of findings) {
+      const fp = findingFp(f);
+      rows.push([f.severity, S.findingStatus[fp] || 'open', f.category, f.server, f.item, f.detail,
+                 f.remediation || '', S.findingNotes[fp] || '', f.source || 'auto'].map(escape).join(','));
+    }
     content = rows.join('\r\n');
     mime = 'text/csv'; ext = 'csv';
 
   } else if (fmt === 'json') {
-    content = JSON.stringify({exported: now, findings}, null, 2);
+    const annotated = findings.map(f => {
+      const fp = findingFp(f);
+      return {...f, status: S.findingStatus[fp] || 'open', notes: S.findingNotes[fp] || ''};
+    });
+    content = JSON.stringify({exported: now, findings: annotated}, null, 2);
     mime = 'application/json'; ext = 'json';
 
   } else {
@@ -3382,10 +3800,12 @@ function exportFindings(fmt) {
       if (!bySev[sev]) continue;
       lines.push(`## ${sev.charAt(0).toUpperCase() + sev.slice(1)}`, '');
       for (const f of bySev[sev]) {
+        const fp = findingFp(f);
         lines.push(`### ${f.category} — ${f.item}`);
         lines.push(`**Server:** ${f.server}  `);
         lines.push(`**Detail:** ${f.detail}  `);
         if (f.remediation) lines.push(`**Remediation:** ${f.remediation}  `);
+        if (S.findingNotes[fp]) lines.push(`**Notes:** ${S.findingNotes[fp]}  `);
         if (f.source === 'manual') lines.push(`*Manually added*  `);
         lines.push('');
       }
@@ -3403,8 +3823,8 @@ function exportFindings(fmt) {
 
 function scanServerFindings(srv) {
   // Compute all findings for one server and return as a flat array.
-  // Called once on connect/cache-load; result is stored on srv.findings
-  // so findings persist even if the server later goes down.
+  // Called on connect/reconnect. Replaces passive findings but preserves active-test
+  // findings (auth-test, oauth-probe, cert) so a reconnect doesn't wipe them.
   const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
   const rows = [];
 
@@ -3412,7 +3832,7 @@ function scanServerFindings(srv) {
   if (/^http:\/\//i.test(srv.url)) {
     const hasToken = !!(srv.token || '').trim();
     rows.push({
-      severity: hasToken ? 'high' : 'medium',
+      severity: hasToken ? 'medium' : 'high',
       category: 'Insecure Transport',
       server: srvShort,
       item: 'server',
@@ -3452,13 +3872,13 @@ function scanServerFindings(srv) {
     const flags = flagTool(t);
     if (flags.length) {
       const rem = flags.map(f => DANGEROUS_TOOL_REMEDIATION[f]).filter(Boolean).join(' ');
-      rows.push({severity: 'medium', category: 'Dangerous Tool',
+      rows.push({severity: 'high', category: 'Dangerous Tool',
         server: srvShort, item: t.name,
         detail: `High-impact categories: ${flags.join(', ')}`,
         remediation: rem});
     }
     for (const f of scanTool(t)) {
-      rows.push({severity: 'high', category: 'Injection/Poisoning',
+      rows.push({severity: f.severity || 'high', category: 'Injection/Poisoning',
         server: srvShort, item: t.name,
         detail: `${f.cat} in [${f.field}]: ${f.preview}`,
         remediation: INJECTION_REMEDIATION});
@@ -3468,7 +3888,7 @@ function scanServerFindings(srv) {
   // Resources — injection findings
   for (const r of (srv.resources || [])) {
     for (const f of scanResource(r)) {
-      rows.push({severity: 'high', category: 'Injection/Poisoning',
+      rows.push({severity: f.severity || 'high', category: 'Injection/Poisoning',
         server: srvShort, item: r.name || r.uri,
         detail: `${f.cat} in [${f.field}]: ${f.preview}`,
         remediation: INJECTION_REMEDIATION});
@@ -3478,7 +3898,7 @@ function scanServerFindings(srv) {
   // Prompts — injection findings
   for (const p of (srv.prompts || [])) {
     for (const f of scanPrompt(p)) {
-      rows.push({severity: 'high', category: 'Injection/Poisoning',
+      rows.push({severity: f.severity || 'high', category: 'Injection/Poisoning',
         server: srvShort, item: p.name,
         detail: `${f.cat} in [${f.field}]: ${f.preview}`,
         remediation: INJECTION_REMEDIATION});
@@ -3489,23 +3909,27 @@ function scanServerFindings(srv) {
 }
 
 function buildFindings() {
-  const SEV_ORD = {critical: 0, high: 1, medium: 2, info: 3};
+  const SEV_ORD = {critical: 0, high: 1, medium: 2, low: 3, info: 4};
   // Snapshotted per-server findings (persist across disconnects)
   const rows = Object.values(S.servers).flatMap(srv => srv.findings || []);
 
-  // Response-time sensitive data findings (from history)
+  // Response-time sensitive data findings (from history) — deduplicated by fingerprint
+  const _seenSensitive = new Set();
   for (const e of S.history) {
     for (const h of (e.sensitiveHits || [])) {
       let host = e.url;
       try { host = new URL(e.url).host; } catch {}
-      rows.push({
+      const f = {
         severity: h.severity,
         category: 'Sensitive Data in Response',
         server:   host,
         item:     e.tool,
         detail:   `${h.cat}: ${h.preview}`,
         remediation: 'Audit the tool\'s response and remove or redact sensitive fields at the server layer before returning data to the client. Rotate any credentials confirmed as exposed.',
-      });
+        historyId: e.id,
+      };
+      const fp = findingFp(f);
+      if (!_seenSensitive.has(fp)) { _seenSensitive.add(fp); rows.push(f); }
     }
   }
 
@@ -3542,29 +3966,53 @@ function cycleFindingStatus(fp) {
   renderFindings();
 }
 
-function buildFindingRows(findings) {
-  if (!findings.length)
-    return '<tr><td colspan="8" class="empty" style="padding:.3rem .5rem">No findings — connect a server to scan</td></tr>';
-  return findings.map(f => {
+function saveFindingNote(fp, value) {
+  if (value.trim()) S.findingNotes[fp] = value.trim();
+  else delete S.findingNotes[fp];
+  localStorage.setItem('mcpoke-finding-notes', JSON.stringify(S.findingNotes));
+}
+
+function buildFindingRows(findings, filterQ) {
+  const q = (filterQ || '').trim().toLowerCase();
+  const visible = q
+    ? findings.filter(f =>
+        [f.severity, f.category, f.server, f.item, f.detail, f.remediation]
+          .some(v => (v||'').toLowerCase().includes(q)))
+    : findings;
+  if (!visible.length) {
+    const msg = q ? `No findings match "${esc(q)}"` : 'No findings — connect a server to scan';
+    return `<tr><td colspan="9" class="empty" style="padding:.3rem .5rem">${msg}</td></tr>`;
+  }
+  return visible.map(f => {
     const fp     = findingFp(f);
     const status = S.findingStatus[fp] || 'open';
+    const note   = S.findingNotes[fp] || '';
     const remCell = f.remediation
       ? `<td class="findings-remediation">${esc(f.remediation)}</td>`
       : `<td style="color:var(--border);font-size:10px">—</td>`;
     const delBtn = f.source === 'manual'
       ? `<button class="btn-sm" title="Delete finding" onclick="deleteManualFinding('${esc(f.id)}')">&#x2715;</button>`
       : '';
+    const histBtn = f.historyId !== undefined
+      ? `<button class="btn-sm" title="Show request/response from history" style="color:var(--accent)" onclick="openHistEntryPopup(${f.historyId})">&#8594; hist</button>`
+      : '';
     const rowStyle = status === 'false_positive' ? ' style="opacity:.45;text-decoration:line-through"' : '';
+    const safeFp = esc(fp);
     return `<tr${rowStyle}>
       <td><span class="cap-${esc(f.severity)}">${esc(f.severity)}</span></td>
       <td><button class="btn-sm" style="font-size:9px;color:${FINDING_STATUS_COLOR[status]};white-space:nowrap"
-          title="Click to cycle status" onclick="cycleFindingStatus('${esc(fp)}')">${FINDING_STATUS_LABEL[status]}</button></td>
+          title="Click to cycle status" onclick="cycleFindingStatus('${safeFp}')">${FINDING_STATUS_LABEL[status]}</button></td>
       <td>${esc(f.category)}</td>
       <td style="color:var(--muted)">${esc(f.server)}</td>
       <td style="color:var(--accent)">${esc(f.item)}</td>
       <td class="findings-detail">${esc(f.detail)}</td>
       ${remCell}
-      <td style="white-space:nowrap">${delBtn}</td>
+      <td style="min-width:120px"><input type="text" class="finding-note-input" value="${esc(note)}"
+          placeholder="add note…" data-fp="${safeFp}"
+          style="width:100%;box-sizing:border-box;background:transparent;border:none;border-bottom:1px solid var(--border);
+                 color:var(--text);font-size:10px;font-family:monospace;outline:none;padding:.1rem .2rem"
+          onchange="saveFindingNote(this.dataset.fp, this.value)"></td>
+      <td style="white-space:nowrap">${histBtn}${delBtn}</td>
     </tr>`;
   }).join('');
 }
@@ -3573,11 +4021,13 @@ function renderFindings() {
   const findings = buildFindings();
   const tab = document.getElementById('htab-findings');
   tab.textContent = findings.length ? `Findings (${findings.length})` : 'Findings';
-  document.getElementById('findings-body').innerHTML = buildFindingRows(findings);
+  const inlineQ = document.getElementById('findings-filter')?.value || '';
+  document.getElementById('findings-body').innerHTML = buildFindingRows(findings, inlineQ);
   // Keep modal in sync if open
   const modalBody = document.getElementById('findings-modal-body');
   if (modalBody) {
-    modalBody.innerHTML = buildFindingRows(findings);
+    const modalQ = document.getElementById('findings-modal-filter')?.value || '';
+    modalBody.innerHTML = buildFindingRows(findings, modalQ);
     const cnt = document.getElementById('findings-modal-count');
     if (cnt) cnt.textContent = findings.length
       ? `${findings.length} finding${findings.length === 1 ? '' : 's'}`
@@ -3611,10 +4061,15 @@ function openFindingsModal() {
         ${exportMenu}
         <button class="btn-sm" onclick="closeFindingsModal()">&#x2715; Close</button>
       </div>
+      <div style="padding:.25rem .5rem;border-bottom:1px solid var(--border)">
+        <input id="findings-modal-filter" type="text" placeholder="Filter findings…" oninput="renderFindings()"
+          style="width:100%;box-sizing:border-box;background:var(--surface);color:var(--text);
+                 border:1px solid var(--border);border-radius:3px;padding:.2rem .4rem;font-size:11px">
+      </div>
       <div style="overflow-y:auto;flex:1">
         <table id="findings-modal-table">
           <thead>
-            <tr><th>Sev</th><th>Status</th><th>Category</th><th>Server</th><th>Item</th><th>Detail</th><th>Remediation</th><th></th></tr>
+            <tr><th>Sev</th><th>Status</th><th>Category</th><th>Server</th><th>Item</th><th>Detail</th><th>Remediation</th><th>Notes</th><th></th></tr>
           </thead>
           <tbody id="findings-modal-body"></tbody>
         </table>
@@ -3877,8 +4332,8 @@ function renderOverview(srv) {
     ${card('Dangerous Tools', toolBody)}
     ${card('Capabilities', capBody)}
     ${card('Transport', `<div style="padding:.2rem 0">${transportHtml}</div>
-      ${certInfo?.subject_cn ? `<div class="ov-cap-tip" style="margin-top:.3rem">CN: ${esc(certInfo.subject_cn)}</div>` : ''}
-      ${certInfo?.not_after  ? `<div class="ov-cap-tip">Expires: ${esc(certInfo.not_after)}</div>` : ''}
+      ${certInfo?.cn      ? `<div class="ov-cap-tip" style="margin-top:.3rem">CN: ${esc(certInfo.cn)}</div>` : ''}
+      ${certInfo?.expiry  ? `<div class="ov-cap-tip">Expires: ${esc(certInfo.expiry)}</div>` : ''}
     `)}
   </div>`;
 }
@@ -4260,6 +4715,54 @@ const PROTOCOL_PRESETS = [
   },
 ];
 
+function toggleCopyMenu() {
+  const menu = document.getElementById('copy-format-menu');
+  if (menu.style.display !== 'none') { menu.style.display = 'none'; return; }
+  menu.style.display = '';
+  setTimeout(() => document.addEventListener('click', e => {
+    if (!menu.contains(e.target)) menu.style.display = 'none';
+  }, {once: true, capture: true}), 0);
+}
+
+function copyAsFormat(fmt) {
+  document.getElementById('copy-format-menu').style.display = 'none';
+  const srv = S.servers[S.activeUrl];
+  if (!srv || srv.status !== 'connected') { showError('No active connected server'); return; }
+  const raw = document.getElementById('raw-editor').value.trim();
+  if (!raw) { showError('Raw editor is empty — load a request first'); return; }
+  let payload;
+  try { payload = JSON.parse(raw); } catch { showError('Raw editor contains invalid JSON'); return; }
+
+  const hdrs = {};
+  if (srv.customHeaders) Object.assign(hdrs, srv.customHeaders);
+  if (srv.token) hdrs['Authorization'] = `Bearer ${srv.token}`;
+
+  const url        = srv.url;
+  const bodyJson   = JSON.stringify(payload);
+  let text;
+  if (fmt === 'curl') {
+    const hArgs = Object.entries(hdrs)
+      .map(([k, v]) => `  -H '${k}: ${v.replace(/'/g, "'\\''")}'`)
+      .join(' \\\n');
+    const sep = hArgs ? ' \\\n' : '';
+    text = `curl -s -X POST '${url}' \\\n  -H 'Content-Type: application/json'${hArgs ? ' \\\n' + hArgs : ''} \\\n  -d '${bodyJson.replace(/'/g, "'\\''")}'`;
+  } else {
+    const hLines = Object.entries(hdrs)
+      .map(([k, v]) => `    '${k}': '${v.replace(/\\/g,'\\\\').replace(/'/g,"\\'")}',`)
+      .join('\n');
+    const hBlock = hLines ? `    headers={\n${hLines}\n    },\n    ` : '';
+    text = `import json, requests\n\nresp = requests.post(\n    '${url}',\n    ${hBlock}json=json.loads(r'''${bodyJson}'''),\n)\nprint(resp.json())`;
+  }
+
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.getElementById('copy-format-btn');
+    if (!btn) return;
+    const orig = btn.innerHTML;
+    btn.textContent = '✓ Copied!';
+    setTimeout(() => { btn.innerHTML = orig; }, 1500);
+  });
+}
+
 function toggleProtocolMenu() {
   const menu = document.getElementById('protocol-preset-menu');
   if (menu.style.display !== 'none') { menu.style.display = 'none'; return; }
@@ -4393,6 +4896,24 @@ function fillArgs(args) {
 
 // ── Send ───────────────────────────────────────────────────────────────────
 
+// rawFetch: route raw JSON-RPC calls through the correct backend endpoint
+async function rawFetch(srv, payload) {
+  if (srv.transport === 'stdio') {
+    return fetch('/stdio/raw', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({command: srv.command, payload}),
+    });
+  }
+  return fetch('/raw', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      url: srv.url, token: srv.token, proxy: srv.proxy,
+      transport: srv.transport || 'http', payload,
+      custom_headers: srv.customHeaders || null,
+    }),
+  });
+}
+
 document.getElementById('send-btn').addEventListener('click', doSend);
 
 async function doSend() {
@@ -4406,20 +4927,36 @@ async function doSend() {
 
   try {
     let fetchUrl, fetchBody, toolName, args;
+    const isStdio = srv.transport === 'stdio';
 
-    if (S.rawMode) {
-      // Raw mode: send verbatim payload
+    if (S.rawMode || isStdio) {
+      // Raw mode OR stdio (form mode not supported on stdio — serialize to tools/call)
       let payload;
-      try { payload = JSON.parse(document.getElementById('raw-editor').value); }
-      catch { showError('Raw editor contains invalid JSON'); return; }
+      if (S.rawMode) {
+        try { payload = JSON.parse(document.getElementById('raw-editor').value); }
+        catch { showError('Raw editor contains invalid JSON'); return; }
+      } else {
+        // Form mode on stdio: build tools/call payload
+        if (S.selectedIdx < 0) return;
+        const tool = srv.tools[S.selectedIdx];
+        args = collectArgs();
+        if (args === null) return;
+        payload = {jsonrpc:'2.0', id:10, method:'tools/call',
+                   params:{name:tool.name, arguments:args}};
+      }
       toolName  = payload?.params?.name || payload?.method || '(raw)';
-      args      = payload?.params?.arguments || payload?.params || {};
-      fetchUrl  = '/raw';
-      fetchBody = {url:srv.url, token:srv.token, proxy:srv.proxy,
-                   transport:srv.transport, payload,
-                   custom_headers: srv.customHeaders || null};
+      args      = args || payload?.params?.arguments || payload?.params || {};
+      if (isStdio) {
+        fetchUrl  = '/stdio/raw';
+        fetchBody = {command: srv.command, payload};
+      } else {
+        fetchUrl  = '/raw';
+        fetchBody = {url:srv.url, token:srv.token, proxy:srv.proxy,
+                     transport:srv.transport, payload,
+                     custom_headers: srv.customHeaders || null};
+      }
     } else {
-      // Form mode: normal tool call
+      // Form mode on HTTP/SSE: normal tool call
       if (S.selectedIdx < 0) return;
       const tool = srv.tools[S.selectedIdx];
       args = collectArgs();
@@ -4512,10 +5049,19 @@ function statusBadges(data, isErr) {
   return html || `<span class="badge ${isErr ? 'badge-error' : 'badge-ok'}">${isErr ? 'err' : 'ok'}</span>`;
 }
 
-function buildHistoryRows() {
+function buildHistoryRows(filterText) {
   if (!S.history.length)
     return '<tr><td colspan="7" class="empty" style="padding:.3rem .5rem">No history</td></tr>';
-  return S.history.slice().reverse().map(e => {
+  const q = (filterText || '').trim().toLowerCase();
+  const entries = S.history.slice().reverse().filter(e => {
+    if (!q) return true;
+    return e.tool.toLowerCase().includes(q) ||
+           e.url.toLowerCase().includes(q) ||
+           JSON.stringify(e.args).toLowerCase().includes(q);
+  });
+  if (!entries.length)
+    return '<tr><td colspan="7" class="empty" style="padding:.3rem .5rem">No matching entries</td></tr>';
+  return entries.map(e => {
     let host = e.url;
     try { host = new URL(e.url).host; } catch {}
     const argStr = JSON.stringify(e.args);
@@ -4532,17 +5078,19 @@ function buildHistoryRows() {
           ${e.sensitiveHits?.length ? `<span class="shadow-badge" style="color:#ffa657;background:#2d1800;border-color:#5c3000" title="${e.sensitiveHits.map(h=>h.cat).join(', ')}">&#9888; data</span>` : ''}</td>
       <td style="white-space:nowrap">
         <button class="btn-sm" data-replay="${e.id}">Replay</button>
-        <button class="btn-sm" data-intruder="${e.id}" title="Intruder-lite: fuzz a parameter from this entry" style="color:#e3b341;border-color:#4a3a10">&#9889; Intruder</button>
+        <button class="btn-sm" data-hfuzz="${e.id}" title="Fuzz a parameter from this history entry" style="color:#e3b341;border-color:#4a3a10">&#9889; Fuzz</button>
       </td>
     </tr>`;
   }).join('');
 }
 
 function renderHistory() {
-  document.getElementById('hist-body').innerHTML = buildHistoryRows();
+  const q = document.getElementById('hist-filter-input')?.value || '';
+  document.getElementById('hist-body').innerHTML = buildHistoryRows(q);
   const modalBody = document.getElementById('hist-modal-body');
   if (modalBody) {
-    modalBody.innerHTML = buildHistoryRows();
+    const mq = document.getElementById('hist-modal-filter-input')?.value || '';
+    modalBody.innerHTML = buildHistoryRows(mq);
     const cnt = document.getElementById('hist-modal-count');
     if (cnt) cnt.textContent = S.history.length
       ? `${S.history.length} entr${S.history.length === 1 ? 'y' : 'ies'}`
@@ -4569,9 +5117,52 @@ document.addEventListener('change', e => {
 document.getElementById('hist-body').addEventListener('click', e => {
   const btn = e.target.closest('[data-replay]');
   if (btn) replayEntry(parseInt(btn.dataset.replay));
-  const ib = e.target.closest('[data-intruder]');
-  if (ib) openIntruderModal(parseInt(ib.dataset.intruder));
+  const ib = e.target.closest('[data-hfuzz]');
+  if (ib) openHistFuzzModal(parseInt(ib.dataset.hfuzz));
 });
+
+document.getElementById('hist-body').addEventListener('dblclick', e => {
+  const chk = e.target.closest('.hist-chk');
+  if (chk) return;
+  const btn = e.target.closest('button');
+  if (btn) return;
+  const tr = e.target.closest('tr');
+  if (!tr) return;
+  const chkEl = tr.querySelector('.hist-chk');
+  if (!chkEl) return;
+  openHistEntryPopup(parseInt(chkEl.dataset.hid));
+});
+
+function openHistEntryPopup(id) {
+  const e = S.history[id];
+  if (!e) return;
+  document.getElementById('hist-entry-overlay')?.remove();
+  const ov = document.createElement('div');
+  ov.id = 'hist-entry-overlay';
+  ov.style.cssText = 'position:fixed;inset:0;z-index:3000;display:flex;flex-direction:column;background:var(--bg)';
+  const reqText  = e.rawPayload ? JSON.stringify(e.rawPayload, null, 2) : JSON.stringify({method: e.tool, params: {arguments: e.args}}, null, 2);
+  const respText = JSON.stringify(e.result, null, 2) || '(no response)';
+  ov.innerHTML = `
+    <div class="panel-modal-hdr">
+      <span style="color:var(--accent);font-weight:700;font-family:monospace;font-size:13px">&#9654; History #${id}</span>
+      <span style="color:var(--muted);font-size:11px;margin-left:.5rem;flex:1">${esc(e.tool)} &nbsp;·&nbsp; ${e.time} &nbsp;·&nbsp; ${e.elapsed}ms</span>
+      <button class="btn-sm" onclick="document.getElementById('hist-entry-overlay').remove()">&#x2715; Close</button>
+    </div>
+    <div style="display:flex;flex:1;overflow:hidden;gap:1px;background:var(--border)">
+      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)">
+        <div style="padding:.3rem .5rem;font-size:11px;color:var(--muted);border-bottom:1px solid var(--border)">Request</div>
+        <pre style="flex:1;overflow:auto;margin:0;padding:.5rem;font-size:11px;font-family:monospace;white-space:pre-wrap;word-break:break-all">${esc(reqText)}</pre>
+      </div>
+      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)">
+        <div style="padding:.3rem .5rem;font-size:11px;color:var(--muted);border-bottom:1px solid var(--border)">Response</div>
+        <pre style="flex:1;overflow:auto;margin:0;padding:.5rem;font-size:11px;font-family:monospace;white-space:pre-wrap;word-break:break-all">${esc(respText)}</pre>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener('click', ev => { if (ev.target === ov) ov.remove(); });
+  const onKey = ev => { if (ev.key === 'Escape') { ov.remove(); document.removeEventListener('keydown', onKey); } };
+  document.addEventListener('keydown', onKey);
+}
 
 // ── Response Diff Viewer ───────────────────────────────────────────────────
 
@@ -4640,6 +5231,12 @@ function openHistoryModal() {
         <button class="btn-sm" onclick="clearHistory()">Clear</button>
         <button class="btn-sm" onclick="closeHistoryModal()">&#x2715; Close</button>
       </div>
+      <div style="padding:.25rem .4rem;border-bottom:1px solid var(--border)">
+        <input id="hist-modal-filter-input" type="text" placeholder="Filter by tool, server, args…"
+          style="width:100%;box-sizing:border-box;background:var(--bg);color:var(--fg);
+                 border:1px solid var(--border);border-radius:4px;padding:.2rem .4rem;font-size:11px;font-family:monospace"
+          oninput="renderHistory()">
+      </div>
       <div style="overflow-y:auto;flex:1">
         <table id="hist-modal-table">
           <thead>
@@ -4653,8 +5250,19 @@ function openHistoryModal() {
   ov.addEventListener('click', e => {
     const btn = e.target.closest('[data-replay]');
     if (btn) { closeHistoryModal(); replayEntry(parseInt(btn.dataset.replay)); return; }
-    const ib  = e.target.closest('[data-intruder]');
-    if (ib)  { closeHistoryModal(); openIntruderModal(parseInt(ib.dataset.intruder)); }
+    const ib  = e.target.closest('[data-hfuzz]');
+    if (ib)  { closeHistoryModal(); openHistFuzzModal(parseInt(ib.dataset.hfuzz)); }
+  });
+  ov.addEventListener('dblclick', e => {
+    const chk = e.target.closest('.hist-chk');
+    if (chk) return;
+    const btn = e.target.closest('button');
+    if (btn) return;
+    const tr = e.target.closest('tr');
+    if (!tr) return;
+    const chkEl = tr.querySelector('.hist-chk');
+    if (!chkEl) return;
+    openHistEntryPopup(parseInt(chkEl.dataset.hid));
   });
   renderHistory();
   document.addEventListener('keydown', _histModalEsc);
@@ -4703,16 +5311,19 @@ function saveSession() {
   }
   const servers = Object.values(S.servers).map(srv => ({
     url: srv.url, token: srv.token, proxy: srv.proxy,
+    customHeaders: srv.customHeaders || null,
     transport: srv.transport, serverInfo: srv.serverInfo,
     tools: srv.tools, resources: srv.resources, prompts: srv.prompts,
     findings: srv.findings || [], lastSeen: srv.lastSeen,
   }));
   const session = {
-    version: 1,
+    version: 2,
     saved: new Date().toISOString(),
     servers,
     history:       S.history,
     notifications: S.notifications,
+    findingStatus: S.findingStatus,
+    findingNotes:  S.findingNotes,
     notes,
   };
   const ts   = session.saved.replace(/[:.]/g, '-').slice(0, 19);
@@ -4730,27 +5341,35 @@ function loadSessionFile(input) {
   reader.onload = ev => {
     try {
       const session = JSON.parse(ev.target.result);
-      if (!session.version || session.version !== 1)
+      if (!session.version || session.version < 1)
         throw new Error('Unsupported session file version');
 
       // Restore servers
       S.servers = {};
       for (const s of (session.servers || [])) {
-        const srv      = mkServer(s.url, s.token, s.proxy);
-        srv.transport  = s.transport  || null;
-        srv.serverInfo = s.serverInfo || {};
-        srv.tools      = s.tools      || [];
-        srv.resources  = s.resources  || [];
-        srv.prompts    = s.prompts    || [];
-        srv.findings   = s.findings   || [];
-        srv.lastSeen   = s.lastSeen   || null;
-        srv.fromCache  = true;
+        const srv        = mkServer(s.url, s.token, s.proxy, s.customHeaders || null);
+        srv.transport    = s.transport    || null;
+        srv.serverInfo   = s.serverInfo   || {};
+        srv.tools        = s.tools        || [];
+        srv.resources    = s.resources    || [];
+        srv.prompts      = s.prompts      || [];
+        srv.findings     = s.findings     || [];
+        srv.lastSeen     = s.lastSeen     || null;
+        srv.fromCache    = true;
         S.servers[s.url] = srv;
       }
 
-      // Restore history, notifications, notes
+      // Restore history, notifications, finding triage status, notes
       S.history       = session.history       || [];
       S.notifications = session.notifications || [];
+      if (session.findingStatus) {
+        S.findingStatus = session.findingStatus;
+        localStorage.setItem('mcpoke-finding-status', JSON.stringify(S.findingStatus));
+      }
+      if (session.findingNotes) {
+        S.findingNotes = session.findingNotes;
+        localStorage.setItem('mcpoke-finding-notes', JSON.stringify(S.findingNotes));
+      }
       for (const [k, v] of Object.entries(session.notes || {}))
         if (k.startsWith('mcpoke-note-')) localStorage.setItem(k, v);
 
@@ -5395,6 +6014,7 @@ function openAuthTestModal() {
   document.getElementById('auth-overlay')?.remove();
   const ov = document.createElement('div');
   ov.id = 'auth-overlay';
+  const noCredentials = !srv.token && !srv.customHeaders;
   ov.innerHTML = `
     <div id="auth-modal">
       <div class="auth-hdr">
@@ -5402,6 +6022,12 @@ function openAuthTestModal() {
         <span id="auth-prog" style="color:var(--muted);font-size:11px;flex:1">Ready</span>
         <button class="btn-sm" onclick="document.getElementById('auth-overlay').remove()">&#x2715; Close</button>
       </div>
+      ${noCredentials ? `<div style="padding:.4rem .6rem;background:#2d1a00;border-bottom:1px solid #5c3000;
+          font-size:11px;color:#ffa657">
+        &#9888; No token or custom headers configured — the baseline request is itself unauthenticated.
+        Variations that succeed are confirming the server requires no auth, not detecting a bypass.
+        Configure a token first if the server is supposed to require one.
+      </div>` : ''}
       <div style="overflow-y:auto;flex:1;min-height:0">
         <table id="auth-tbl">
           <colgroup>
@@ -5506,67 +6132,105 @@ function analyzeAuthFindings(srv, vars, results) {
   const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
   const newFindings = [];
 
-  const baseline = results[0];
-  const baseFp   = baseline?.fp;
-  const baseOk   = baseline && !baseline.isErr && baseline.data?.status === 200;
+  const baseline        = results[0];
+  const baseFp          = baseline?.fp;
+  const baseOk          = baseline && !baseline.isErr && baseline.data?.status === 200;
+  // When no credentials are configured the baseline IS unauthenticated — matches
+  // are trivially true and don't indicate bypass; generate a single accurate finding instead.
+  const noCredentials   = !srv.token && !srv.customHeaders;
 
-  for (let i = 1; i < results.length; i++) {
-    const r  = results[i];
-    const v  = vars[i];
-    if (!r || !r.data) continue;
+  if (noCredentials) {
+    if (baseOk) {
+      newFindings.push({
+        severity: 'critical',
+        category: 'No Authentication',
+        server:   srvShort,
+        item:     'auth-test',
+        detail:   'Server responds successfully to requests with no credentials — authentication is not enforced',
+        remediation: 'Require authentication on all MCP endpoints. Validate an Authorization header (Bearer token or signed JWT) before any handler executes and reject unauthenticated requests with HTTP 401.',
+      });
+    }
+    // Still flag the inconsistency case: baseline failed but some variation succeeded
+    if (!baseOk && results.slice(1).some(r => !r.isErr && r.data?.status === 200)) {
+      newFindings.push({
+        severity: 'critical',
+        category: 'Auth Bypass',
+        server:   srvShort,
+        item:     'auth-test',
+        detail:   'Request succeeded with a crafted variation when the unauthenticated baseline failed — inconsistent auth enforcement',
+        remediation: 'Audit authentication logic for consistency. Ensure all auth validation is centralised in middleware and applied uniformly to every request.',
+      });
+    }
+  } else {
+    // Credentials ARE configured — evaluate variations for genuine bypass
+    // If "No auth" (index 1) already matches baseline content, the endpoint enforces no auth
+    // at all — subsequent same-content matches are the same root cause, not separate bypasses
+    const noAuthSame = baseFp && results[1]?.fp === baseFp;
 
-    const sameContent = baseFp && r.fp === baseFp;
-    const httpOk      = !r.isErr && r.data?.status === 200 && !r.data?.result?.error;
+    for (let i = 1; i < results.length; i++) {
+      const r  = results[i];
+      const v  = vars[i];
+      if (!r || !r.data) continue;
 
-    if (!sameContent && !httpOk) continue;
+      const sameContent = baseFp && r.fp === baseFp;
+      const httpOk      = !r.isErr && r.data?.status === 200 && !r.data?.result?.error;
 
-    const confidence = sameContent
-      ? 'Definitive bypass — response body identical to authenticated baseline'
-      : 'Probable bypass — server returned success without rejecting the request (response content differs from baseline)';
+      if (!sameContent && !httpOk) continue;
 
-    const isCustomVar = 'customHeadersOverride' in v;
-    let what;
-    if (v.name === 'No auth')            what = 'no Authorization header — endpoint does not enforce authentication';
-    else if (v.name === 'Invalid token') what = '"Bearer invalid" — server is not validating token value';
-    else if (v.name === 'Empty bearer')  what = '"Bearer " (empty value) — auth header presence alone is sufficient';
-    else if (v.name === 'Null header')   what = 'Authorization: null — server accepted a null header value';
-    else if (v.name === 'alg:none JWT')  what = 'unsigned alg:none JWT — server is not validating JWT signatures';
-    else if (v.name === 'No custom headers') what = 'all custom headers removed — server does not enforce custom header authentication';
-    else if (v.name.startsWith('No '))   what = `${v.name.slice(3)} header removed — removing this header did not block the request`;
-    else if (v.name.endsWith(': invalid')) what = `${v.name} — server accepted an invalid value for this authentication header`;
-    else                                 what = `variation "${v.name}"`;
+      // Suppress duplicate findings when the endpoint is simply unauthenticated
+      if (i > 1 && noAuthSame && sameContent) continue;
 
-    const remediation = isCustomVar
-      ? `Validate the ${v.name.startsWith('No ') ? v.name.slice(3) : v.name.split(':')[0]} header server-side on every request. Missing or invalid values should return HTTP 401/403 before any handler executes.`
-      : 'Enforce authentication at the middleware layer on every request — not only during the initialize handshake. Validate the Authorization header before any handler executes and reject missing, empty, null, or unsigned tokens with HTTP 401.';
+      const confidence = sameContent
+        ? 'Definitive bypass — response body identical to authenticated baseline'
+        : 'Probable bypass — server returned success without rejecting the request (response content differs from baseline)';
 
-    newFindings.push({
-      severity: 'high',
-      category: 'Auth Bypass',
-      server:   srvShort,
-      item:     'auth-test',
-      detail:   `${confidence}. Succeeded with ${what}`,
-      remediation,
-    });
+      const isCustomVar = 'customHeadersOverride' in v;
+      let what;
+      if (v.name === 'No auth')            what = 'no Authorization header — endpoint does not enforce authentication';
+      else if (v.name === 'Invalid token') what = '"Bearer invalid" — server is not validating token value';
+      else if (v.name === 'Empty bearer')  what = '"Bearer " (empty value) — auth header presence alone is sufficient';
+      else if (v.name === 'Null header')   what = 'Authorization: null — server accepted a null header value';
+      else if (v.name === 'alg:none JWT')  what = 'unsigned alg:none JWT — server is not validating JWT signatures';
+      else if (v.name === 'No custom headers') what = 'all custom headers removed — server does not enforce custom header authentication';
+      else if (v.name.startsWith('No '))   what = `${v.name.slice(3)} header removed — removing this header did not block the request`;
+      else if (v.name.endsWith(': invalid')) what = `${v.name} — server accepted an invalid value for this authentication header`;
+      else                                 what = `variation "${v.name}"`;
+
+      const remediation = isCustomVar
+        ? `Validate the ${v.name.startsWith('No ') ? v.name.slice(3) : v.name.split(':')[0]} header server-side on every request. Missing or invalid values should return HTTP 401/403 before any handler executes.`
+        : 'Enforce authentication at the middleware layer on every request — not only during the initialize handshake. Validate the Authorization header before any handler executes and reject missing, empty, null, or unsigned tokens with HTTP 401.';
+
+      newFindings.push({
+        severity: 'critical',
+        category: 'Auth Bypass',
+        server:   srvShort,
+        item:     'auth-test',
+        detail:   `${confidence}. Succeeded with ${what}`,
+        remediation,
+      });
+    }
+
+    if (!baseOk && results.slice(1).some(r => !r.isErr && r.data?.status === 200)) {
+      newFindings.push({
+        severity: 'critical',
+        category: 'Auth Bypass',
+        server:   srvShort,
+        item:     'auth-test',
+        detail:   'Request succeeded with alternate auth when baseline (current token) failed — inconsistent auth enforcement',
+        remediation: 'Audit the authentication logic for consistency across all endpoints. Ensure auth validation is centralised in middleware rather than duplicated per-handler, and that all failure paths return HTTP 401.',
+      });
+    }
   }
 
-  if (!baseOk && results.slice(1).some(r => !r.isErr && r.data?.status === 200)) {
-    newFindings.push({
-      severity: 'high',
-      category: 'Auth Bypass',
-      server:   srvShort,
-      item:     'auth-test',
-      detail:   'Request succeeded with alternate auth when baseline (current token) failed — inconsistent auth enforcement',
-      remediation: 'Audit the authentication logic for consistency across all endpoints. Ensure auth validation is centralised in middleware rather than duplicated per-handler, and that all failure paths return HTTP 401.',
-    });
-  }
-
-  if (newFindings.length) {
-    srv.findings = (srv.findings || []).filter(f => f.item !== 'auth-test');
-    srv.findings.push(...newFindings);
-    renderFindings();
-    renderServers();
-  }
+  // Always remove previous auth-test findings and the passive "no token" hint
+  // (both are superseded once an actual auth test has run)
+  srv.findings = (srv.findings || []).filter(f =>
+    f.item !== 'auth-test' &&
+    !(f.category === 'Vulnerability' && f.detail?.includes('[PATTERN-NO-AUTH]'))
+  );
+  srv.findings.push(...newFindings);
+  renderFindings();
+  if (newFindings.length) renderServers();
 }
 
 function initAuthResizer() {
@@ -5771,7 +6435,8 @@ async function startFuzz() {
     // Escape payload as a JSON string value, then substitute
     const escaped = pl.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
                       .replace(/\n/g, '\\n').replace(/\r/g, '\\r')
-                      .replace(/\t/g, '\\t');
+                      .replace(/\t/g, '\\t')
+                      .replace(/[\x00-\x1f\x7f]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4,'0')}`);
     const filled = rawTemplate.replace(/§[^§]*§/g, escaped);
 
     let parsed;
@@ -5784,14 +6449,7 @@ async function startFuzz() {
 
     const t0 = Date.now();
     try {
-      const res  = await fetch('/raw', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          url: srv.url, token: srv.token, proxy: srv.proxy,
-          transport: srv.transport || 'http', payload: parsed,
-          custom_headers: srv.customHeaders || null,
-        }),
-      });
+      const res  = await rawFetch(srv, parsed);
       const raw     = await res.text();
       const data    = JSON.parse(raw);
       const elapsed = Date.now() - t0;
@@ -5815,6 +6473,26 @@ async function startFuzz() {
 
     if (delay > 0 && !_fuzzStop && i < payloads.length - 1)
       await new Promise(r => setTimeout(r, delay));
+  }
+
+  // Post-loop timing anomaly detection: flag rows >= 2× median elapsed
+  const times = _fuzzRows.filter(r => r && r.elapsed > 0).map(r => r.elapsed).sort((a,b) => a-b);
+  if (times.length >= 3) {
+    const mid = Math.floor(times.length / 2);
+    const median = times.length % 2 ? times[mid] : (times[mid-1] + times[mid]) / 2;
+    const thresh = median * 2;
+    for (let i = 0; i < _fuzzRows.length; i++) {
+      const row = _fuzzRows[i];
+      if (!row || row.elapsed < thresh) continue;
+      const tr = document.querySelector(`#fuzz-tbody tr[data-fuzz-idx="${i}"]`);
+      if (!tr) continue;
+      const elapsedCell = tr.children[3];
+      if (elapsedCell) {
+        elapsedCell.style.color = '#ffa657';
+        elapsedCell.style.fontWeight = '600';
+        elapsedCell.title = `Slow response — ${row.elapsed}ms vs median ${Math.round(median)}ms (≥2×)`;
+      }
+    }
   }
 
   const s = document.getElementById('fuzz-start-btn');
@@ -5860,12 +6538,14 @@ function openRaceModal() {
         <span class="race-hdr-title">&#9651; Race Condition Tester</span>
         <span id="race-prog" style="color:var(--muted);font-size:11px;flex:1">Configure and run</span>
         <label style="font-size:11px;color:var(--muted);margin-right:.3rem">Count:</label>
-        <select id="race-count" class="btn-sm" style="width:5rem">
-          <option value="5">5</option>
-          <option value="10" selected>10</option>
-          <option value="20">20</option>
-          <option value="50">50</option>
-        </select>
+        <input id="race-count" type="number" value="10" min="2" max="500"
+          style="width:4.5rem;background:var(--surface);color:var(--text);border:1px solid var(--border);
+                 border-radius:3px;padding:.15rem .3rem;font-size:11px;text-align:center">
+        <span style="font-size:10px;color:var(--muted);margin:0 .2rem">quick:</span>
+        ${[5,10,20,50,100].map(n =>
+          `<button class="btn-sm" style="font-size:10px;padding:.1rem .3rem"
+            onclick="document.getElementById('race-count').value=${n}">${n}</button>`
+        ).join('')}
         <button class="btn-sm btn-cyan" id="race-run-btn" onclick="runRace()">&#9654; Run</button>
         <button class="btn-sm" onclick="closeRaceModal()">&#x2715; Close</button>
       </div>
@@ -5997,49 +6677,160 @@ async function runRace() {
   };
 }
 
-// ── Intruder-lite ─────────────────────────────────────────────────────────
+// ── OAuth 2.0 tester ──────────────────────────────────────────────────────
 
-let _intruderState = {histId: null, params: [], selectedPath: null, results: [], srcTab: 'presets', selectedCat: null};
+function openOAuthModal() {
+  const srv = S.servers[S.activeUrl];
+  if (!srv || srv.status !== 'connected') { showError('No active connected server'); return; }
 
-function openIntruderModal(histId) {
+  document.getElementById('oauth-overlay')?.remove();
+  const ov = document.createElement('div');
+  ov.id = 'oauth-overlay';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:3000;display:flex;align-items:center;justify-content:center';
+  ov.innerHTML = `
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;
+                width:min(860px,96vw);max-height:88vh;display:flex;flex-direction:column;overflow:hidden">
+      <div style="display:flex;align-items:center;gap:0.6rem;padding:0.7rem 1rem;
+                  border-bottom:1px solid var(--border);background:var(--bg)">
+        <span style="font-weight:700;font-size:13px">OAuth 2.0 Probe</span>
+        <span id="oauth-prog" style="flex:1;color:var(--muted);font-size:11px">Probing…</span>
+        <button class="btn-sm" onclick="document.getElementById('oauth-overlay').remove()">&#x2715; Close</button>
+      </div>
+      <div style="overflow-y:auto;padding:0.8rem 1rem;flex:1;min-height:0">
+        <div id="oauth-meta" style="margin-bottom:0.8rem"></div>
+        <h4 style="font-size:11px;color:var(--muted);margin:0 0 0.4rem">Probe results</h4>
+        <table id="oauth-tbl" style="width:100%;border-collapse:collapse;font-size:11px">
+          <thead><tr style="border-bottom:1px solid var(--border)">
+            <th style="text-align:left;padding:0.3rem 0.4rem">Test</th>
+            <th style="text-align:left;padding:0.3rem 0.4rem;width:60px">HTTP</th>
+            <th style="text-align:left;padding:0.3rem 0.4rem">Detail</th>
+          </tr></thead>
+          <tbody id="oauth-tbody"></tbody>
+        </table>
+        <div id="oauth-finds" style="margin-top:0.8rem"></div>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener('click', e => { if (e.target === ov) ov.remove(); });
+
+  const baseUrl = srv.url.replace(/\/[^/]*$/, '');  // strip path
+  runOAuthProbe(srv, baseUrl);
+}
+
+async function runOAuthProbe(srv, baseUrl) {
+  const prog  = document.getElementById('oauth-prog');
+  const tbody = document.getElementById('oauth-tbody');
+  const meta  = document.getElementById('oauth-meta');
+  const finds = document.getElementById('oauth-finds');
+  if (!prog || !tbody) return;
+
+  try {
+    const res  = await fetch('/oauth-probe', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url: baseUrl, proxy: srv.proxy || null}),
+    });
+    const data = await res.json();
+
+    if (data.error) { prog.textContent = '⚠ ' + data.error; return; }
+    prog.textContent = 'Done';
+
+    if (data.metadata) {
+      const m = data.metadata;
+      const rows = [
+        ['Discovery URL',          m._discovered_at || '—'],
+        ['Authorization endpoint', m.authorization_endpoint || '—'],
+        ['Token endpoint',         m.token_endpoint || '—'],
+        ['Scopes supported',       (m.scopes_supported || []).join(', ') || '—'],
+        ['PKCE methods',           (m.code_challenge_methods_supported || []).join(', ') || '—'],
+        ['Response types',         (m.response_types_supported || []).join(', ') || '—'],
+        ['Issuer',                 m.issuer || '—'],
+      ];
+      meta.innerHTML = `<h4 style="font-size:11px;color:var(--muted);margin:0 0 0.4rem">Discovery metadata</h4>
+        <table style="width:100%;border-collapse:collapse;font-size:11px;margin-bottom:0.6rem">
+          ${rows.map(([k,v]) => `<tr><td style="color:var(--muted);padding:0.15rem 0.4rem;width:180px">${esc(k)}</td>
+            <td style="padding:0.15rem 0.4rem;word-break:break-all">${esc(v)}</td></tr>`).join('')}
+        </table>`;
+    } else {
+      meta.textContent = 'No OAuth discovery metadata found.';
+    }
+
+    for (const t of (data.tests || [])) {
+      const tr = document.createElement('tr');
+      tr.style.borderBottom = '1px solid var(--border)';
+      const statusBg = t.error ? 'var(--error)'
+                     : (t.status >= 200 && t.status < 300) ? 'var(--green)'
+                     : t.status >= 400 ? '#7a3a3a' : 'var(--muted)';
+      const detail = t.error ? `Error: ${t.error}`
+                   : (t.location ? `→ ${t.location.slice(0,80)}` : (t.body || '').slice(0,80));
+      tr.innerHTML = `
+        <td style="padding:0.25rem 0.4rem;white-space:nowrap">${esc(t.name)}</td>
+        <td style="padding:0.25rem 0.4rem"><span class="badge" style="background:${statusBg};color:#fff">${t.error ? 'err' : t.status}</span></td>
+        <td style="padding:0.25rem 0.4rem;color:var(--muted);word-break:break-all">${esc(detail)}</td>`;
+      tbody.appendChild(tr);
+    }
+
+    const newFinds = data.findings || [];
+    if (newFinds.length) {
+      const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+      srv.findings = (srv.findings || []).filter(f => f.item !== 'oauth-probe');
+      for (const f of newFinds) {
+        srv.findings.push({...f, server: srvShort, item: 'oauth-probe',
+          source: 'active',
+          remediation: f.remediation || 'Review the OAuth implementation against RFC 6749 and the MCP OAuth profile.'});
+      }
+      renderFindings();
+      finds.innerHTML = `<span style="color:var(--error);font-size:11px">&#9632; ${newFinds.length} finding${newFinds.length>1?'s':''} added to the Findings panel</span>`;
+    } else if (data.metadata) {
+      finds.innerHTML = '<span style="color:var(--green);font-size:11px">&#10003; No issues found in automated checks</span>';
+    }
+  } catch (e) {
+    if (prog) prog.textContent = '⚠ ' + e.message;
+  }
+}
+
+// ── History Fuzzer ─────────────────────────────────────────────────────────
+
+let _hfuzzState = {histId: null, params: [], selectedPath: null, results: [], srcTab: 'presets', selectedCat: null, selectedPayload: null};
+
+function openHistFuzzModal(histId) {
   const e = S.history[histId];
   if (!e) return;
-  _intruderState = {histId, params: [], selectedPath: null, results: [], srcTab: 'presets', selectedCat: null};
+  _hfuzzState = {histId, params: [], selectedPath: null, results: [], srcTab: 'presets', selectedCat: null, selectedPayload: null};
 
   // Flatten params from args or rawPayload
   const source = e.rawPayload?.params?.arguments ?? e.rawPayload?.params ?? e.args ?? {};
-  _intruderState.params = flattenParams(source, '');
+  _hfuzzState.params = flattenParams(source, '');
 
-  document.getElementById('intruder-overlay')?.remove();
+  document.getElementById('hfuzz-overlay')?.remove();
   const ov = document.createElement('div');
-  ov.id = 'intruder-overlay';
+  ov.id = 'hfuzz-overlay';
   ov.innerHTML = `
-    <div id="intruder-modal">
-      <div class="intruder-hdr">
-        <span class="intruder-hdr-title">&#9889; Intruder</span>
+    <div id="hfuzz-modal">
+      <div class="hfuzz-hdr">
+        <span class="hfuzz-hdr-title">&#9889; History Fuzzer</span>
         <span style="color:var(--muted);font-size:11px;flex:1">&nbsp;#${histId} · ${esc(e.tool)}</span>
-        <button class="btn-sm btn-cyan" id="intr-run-btn" onclick="runIntruder()" disabled>&#9654; Run</button>
-        <button class="btn-sm" onclick="exportIntruderResults()">Export CSV</button>
+        <button class="btn-sm btn-cyan" id="intr-run-btn" onclick="runHistFuzz()" disabled>&#9654; Run</button>
+        <button class="btn-sm" onclick="exportHistFuzzResults()">Export CSV</button>
         <span id="intr-prog" style="color:var(--muted);font-size:11px;margin-left:.5rem"></span>
-        <button class="btn-sm" style="margin-left:.5rem" onclick="closeIntruderModal()">&#x2715; Close</button>
+        <button class="btn-sm" style="margin-left:.5rem" onclick="closeHistFuzzModal()">&#x2715; Close</button>
       </div>
-      <div class="intruder-body">
+      <div class="hfuzz-body">
         <!-- Left: param selector -->
-        <div class="intruder-left">
-          <div class="intruder-section-hdr">Select fuzz target</div>
-          <div class="intruder-param-list" id="intr-param-list"></div>
+        <div class="hfuzz-left">
+          <div class="hfuzz-section-hdr">Select fuzz target <span id="intr-param-selected" style="font-size:10px;color:var(--accent);font-weight:normal;font-family:monospace"></span></div>
+          <div class="hfuzz-param-list" id="intr-param-list"></div>
         </div>
         <!-- Right: payload source + results -->
-        <div class="intruder-right">
-          <div class="intruder-src-tabs">
-            <button class="intruder-src-tab active" id="intr-tab-presets"
-              onclick="switchIntruderSrc('presets')">Presets</button>
-            <button class="intruder-src-tab" id="intr-tab-paste"
-              onclick="switchIntruderSrc('paste')">Paste list</button>
+        <div class="hfuzz-right">
+          <div class="hfuzz-src-tabs">
+            <button class="hfuzz-src-tab active" id="intr-tab-presets"
+              onclick="switchHistFuzzSrc('presets')">Presets</button>
+            <button class="hfuzz-src-tab" id="intr-tab-paste"
+              onclick="switchHistFuzzSrc('paste')">Paste list</button>
           </div>
-          <div class="intruder-source-pane" id="intr-src-pane"></div>
+          <div class="hfuzz-source-pane" id="intr-src-pane"></div>
           <div style="border-top:1px solid var(--border);overflow-y:auto;flex:1">
-            <table id="intruder-tbl">
+            <table id="hfuzz-tbl">
               <colgroup>
                 <col style="width:auto"><col style="width:6rem"><col style="width:5rem">
                 <col style="width:5rem"><col style="width:auto">
@@ -6049,22 +6840,22 @@ function openIntruderModal(histId) {
             </table>
           </div>
           <div class="intr-h-resizer" id="intr-resizer"></div>
-          <div id="intruder-response-pane" style="height:160px;min-height:40px"></div>
+          <div id="hfuzz-response-pane" style="height:160px;min-height:40px"></div>
         </div>
       </div>
     </div>`;
   document.body.appendChild(ov);
 
   // Auto-select first preset category so Run always has payloads ready
-  if (!_intruderState.selectedCat) {
-    _intruderState.selectedCat = Object.keys(PAYLOAD_PRESETS)[0] || null;
+  if (!_hfuzzState.selectedCat) {
+    _hfuzzState.selectedCat = Object.keys(PAYLOAD_PRESETS)[0] || null;
   }
-  renderIntruderParams();
-  renderIntruderSrc();
+  renderHistFuzzParams();
+  renderHistFuzzSrc();
 
   // Wire resizer
   const resizer  = document.getElementById('intr-resizer');
-  const respPane = document.getElementById('intruder-response-pane');
+  const respPane = document.getElementById('hfuzz-response-pane');
   resizer.addEventListener('mousedown', ev => {
     ev.preventDefault();
     const startY = ev.clientY, startH = respPane.offsetHeight;
@@ -6078,18 +6869,18 @@ function openIntruderModal(histId) {
   });
 
   // Results table click
-  document.getElementById('intruder-tbl').addEventListener('click', ev => {
+  document.getElementById('hfuzz-tbl').addEventListener('click', ev => {
     const row = ev.target.closest('[data-intr-idx]');
     if (!row) return;
-    document.querySelectorAll('#intruder-tbl tr.intr-selected').forEach(r=>r.classList.remove('intr-selected'));
+    document.querySelectorAll('#hfuzz-tbl tr.intr-selected').forEach(r=>r.classList.remove('intr-selected'));
     row.classList.add('intr-selected');
     const idx = parseInt(row.dataset.intrIdx);
-    const res = _intruderState.results[idx];
-    document.getElementById('intruder-response-pane').textContent =
+    const res = _hfuzzState.results[idx];
+    document.getElementById('hfuzz-response-pane').textContent =
       res ? JSON.stringify(res.result || res.error, null, 2) : '';
   });
 
-  const escH = ev => { if (ev.key === 'Escape') closeIntruderModal(); };
+  const escH = ev => { if (ev.key === 'Escape') closeHistFuzzModal(); };
   document.addEventListener('keydown', escH);
   ov._escH = escH;
 }
@@ -6112,16 +6903,16 @@ function flattenParams(obj, prefix) {
   return out;
 }
 
-function renderIntruderParams() {
+function renderHistFuzzParams() {
   const list = document.getElementById('intr-param-list');
   if (!list) return;
-  const {params, selectedPath} = _intruderState;
+  const {params, selectedPath} = _hfuzzState;
   if (!params.length) {
     list.innerHTML = '<div class="empty" style="padding:.4rem">No parameters found</div>';
     return;
   }
   list.innerHTML = params.map(p =>
-    `<div class="intruder-param-item${p.path===selectedPath?' selected':''}" data-path="${esc(p.path)}">
+    `<div class="hfuzz-param-item${p.path===selectedPath?' selected':''}" data-path="${esc(p.path)}">
       <span class="ipkey">${esc(p.path)}: </span>
       <span class="ipval">${esc(String(p.value).slice(0,60))}</span>
     </div>`
@@ -6129,23 +6920,26 @@ function renderIntruderParams() {
   list.onclick = e => {
     const item = e.target.closest('[data-path]');
     if (!item) return;
-    _intruderState.selectedPath = item.dataset.path;
-    renderIntruderParams();
+    _hfuzzState.selectedPath = item.dataset.path;
+    renderHistFuzzParams();
+    const lbl = document.getElementById('intr-param-selected');
+    if (lbl) lbl.textContent = '→ ' + _hfuzzState.selectedPath;
     document.getElementById('intr-run-btn').disabled = false;
   };
 }
 
-function switchIntruderSrc(tab) {
-  _intruderState.srcTab = tab;
-  document.querySelectorAll('.intruder-src-tab').forEach(b =>
+function switchHistFuzzSrc(tab) {
+  _hfuzzState.srcTab = tab;
+  if (tab !== 'presets') _hfuzzState.selectedPayload = null;
+  document.querySelectorAll('.hfuzz-src-tab').forEach(b =>
     b.classList.toggle('active', b.id === 'intr-tab-' + tab));
-  renderIntruderSrc();
+  renderHistFuzzSrc();
 }
 
-function renderIntruderSrc() {
+function renderHistFuzzSrc() {
   const pane = document.getElementById('intr-src-pane');
   if (!pane) return;
-  if (_intruderState.srcTab === 'paste') {
+  if (_hfuzzState.srcTab === 'paste') {
     pane.innerHTML = `
       <div style="font-size:11px;color:var(--muted);margin-bottom:.3rem">One payload per line</div>
       <textarea id="intr-paste" style="width:100%;height:140px;box-sizing:border-box;
@@ -6159,34 +6953,54 @@ function renderIntruderSrc() {
   pane.innerHTML = `
     <div style="font-size:11px;color:var(--muted);margin-bottom:.4rem">Select a payload category:</div>
     <div style="display:flex;flex-wrap:wrap;gap:.3rem" id="intr-preset-btns">
-      ${cats.map(c => `<button class="btn-sm${c===_intruderState.selectedCat?' active':''}"
-        data-cat="${esc(c)}" onclick="selectIntruderCat('${esc(c)}')">${esc(c)}</button>`).join('')}
+      ${cats.map(c => `<button class="btn-sm${c===_hfuzzState.selectedCat?' active':''}"
+        data-cat="${esc(c)}" onclick="selectHistFuzzCat('${esc(c)}')">${esc(c)}</button>`).join('')}
     </div>
     <div id="intr-preset-preview" style="margin-top:.5rem;font-size:10px;color:var(--muted);font-family:monospace"></div>`;
-  if (_intruderState.selectedCat) showIntruderCatPreview(_intruderState.selectedCat);
+  if (_hfuzzState.selectedCat) showHistFuzzCatPreview(_hfuzzState.selectedCat);
 }
 
-function selectIntruderCat(cat) {
-  _intruderState.selectedCat = cat;
+function selectHistFuzzCat(cat) {
+  _hfuzzState.selectedCat     = cat;
+  _hfuzzState.selectedPayload = null;
   document.querySelectorAll('#intr-preset-btns [data-cat]').forEach(b =>
     b.classList.toggle('active', b.dataset.cat === cat));
-  showIntruderCatPreview(cat);
+  showHistFuzzCatPreview(cat);
 }
 
-function showIntruderCatPreview(cat) {
+function showHistFuzzCatPreview(cat) {
   const preview = document.getElementById('intr-preset-preview');
   if (!preview) return;
   const payloads = PAYLOAD_PRESETS[cat] || [];
-  preview.innerHTML = payloads.slice(0,8).map(p => `<div>${esc(p)}</div>`).join('') +
-    (payloads.length > 8 ? `<div style="color:var(--muted)">…+${payloads.length-8} more</div>` : '');
+  preview.innerHTML =
+    `<div style="font-size:10px;color:var(--muted);margin-bottom:.3rem">
+       Click a payload to select it (runs just that one) — or leave unselected to run all ${payloads.length}
+     </div>` +
+    payloads.map((p, i) =>
+      `<div class="hfuzz-pl-item${p === _hfuzzState.selectedPayload ? ' hfuzz-pl-selected' : ''}"
+            data-pl-idx="${i}">${esc(p)}</div>`
+    ).join('');
+  // Use .onclick to replace any previous handler (avoids stacking listeners on re-render)
+  preview.onclick = ev => {
+    const item = ev.target.closest('.hfuzz-pl-item');
+    if (!item) return;
+    const pl = payloads[parseInt(item.dataset.plIdx)];
+    if (pl !== undefined) selectHistFuzzPayload(pl);
+  };
 }
 
-function getIntruderPayloads() {
-  if (_intruderState.srcTab === 'paste') {
+function selectHistFuzzPayload(pl) {
+  _hfuzzState.selectedPayload = (_hfuzzState.selectedPayload === pl) ? null : pl;
+  showHistFuzzCatPreview(_hfuzzState.selectedCat);
+}
+
+function getHistFuzzPayloads() {
+  if (_hfuzzState.srcTab === 'paste') {
     const txt = document.getElementById('intr-paste')?.value || '';
     return txt.split('\n').map(l=>l.trim()).filter(Boolean);
   }
-  return PAYLOAD_PRESETS[_intruderState.selectedCat] || [];
+  if (_hfuzzState.selectedPayload !== null) return [_hfuzzState.selectedPayload];
+  return PAYLOAD_PRESETS[_hfuzzState.selectedCat] || [];
 }
 
 function intrErr(msg) {
@@ -6194,21 +7008,21 @@ function intrErr(msg) {
   if (p) { p.textContent = '⚠ ' + msg; p.style.color = '#e85c5c'; }
 }
 
-async function runIntruder() {
-  const {histId, selectedPath} = _intruderState;
-  if (!selectedPath) { intrErr('Select a parameter first'); return; }
+async function runHistFuzz() {
+  const {histId, selectedPath} = _hfuzzState;
+  if (selectedPath === null || selectedPath === undefined) { intrErr('Select a parameter first'); return; }
   const e = S.history[histId];
   if (!e) { intrErr('History entry not found'); return; }
   const srv = S.servers[e.url];
   if (!srv) { intrErr('Server ' + e.url + ' not in current session — reconnect first'); return; }
-  const payloads = getIntruderPayloads();
+  const payloads = getHistFuzzPayloads();
   if (!payloads.length) { intrErr('No payloads — select a preset category or paste a list'); return; }
 
   const btn  = document.getElementById('intr-run-btn');
   const prog = document.getElementById('intr-prog');
   btn.disabled = true;
   prog.style.color = 'var(--muted)';
-  _intruderState.results = [];
+  _hfuzzState.results = [];
 
   // Build base payload
   const basePayload = e.rawPayload
@@ -6218,7 +7032,15 @@ async function runIntruder() {
 
   const tbody = document.getElementById('intr-body');
   tbody.innerHTML = '';
+
+  // Establish baseline size from the unmodified request before fuzzing
   let baseSize = null;
+  try {
+    prog.textContent = 'baseline…';
+    const br = await rawFetch(srv, JSON.parse(JSON.stringify(basePayload)));
+    const bd = await br.json();
+    baseSize = JSON.stringify(bd.result || bd.error || '').length;
+  } catch (_) {}
 
   for (let i = 0; i < payloads.length; i++) {
     prog.textContent = `${i+1}/${payloads.length}`;
@@ -6230,20 +7052,18 @@ async function runIntruder() {
     const t0 = Date.now();
     let res;
     try {
-      const r = await fetch('/raw', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({url: srv.url, token: srv.token||null,
-          transport: srv.transport||'http', proxy: srv.proxy||null, payload,
-          custom_headers: srv.customHeaders || null}),
-      });
+      const r = await rawFetch(srv, payload);
       res = await r.json();
     } catch(err) { res = {error: err.message}; }
     const elapsed = Date.now() - t0;
-    const sz = JSON.stringify(res.result || res.error || '').length;
-    if (baseSize === null) baseSize = sz;
-    const anomaly = baseSize && Math.abs(sz - baseSize) / baseSize >= 0.20;
-    _intruderState.results.push({pl, res, elapsed, sz, anomaly});
+    const sz      = JSON.stringify(res.result || res.error || '').length;
+    const anomaly = baseSize !== null && Math.abs(sz - baseSize) / (baseSize || 1) >= 0.20;
+    const isErr   = !!(res?.error || res?.result?.error || res?.result?.isError);
+    const resIdx  = _hfuzzState.results.length;
+    _hfuzzState.results.push({pl, res, elapsed, sz, anomaly, sentPayload: payload});
+
+    // Add to session history
+    addHistory(srv.url, `hfuzz:${payload?.method || '?'}`, {payload: pl}, res, isErr, elapsed);
 
     const rpcOk = res.result && !res.result.error;
     const rpcBadge = res.error
@@ -6251,18 +7071,39 @@ async function runIntruder() {
       : (rpcOk ? `<span class="cap-info">ok</span>` : `<span class="cap-high">rpc err</span>`);
     const preview = JSON.stringify(res.result || res.error || '').slice(0,80);
     const tr = document.createElement('tr');
-    tr.className = (anomaly?'intr-anomaly ':'' ) + 'clickable';
-    tr.dataset.intrIdx = _intruderState.results.length - 1;
+    tr.className = (anomaly ? 'intr-anomaly ' : '') + 'clickable';
+    tr.dataset.intrIdx = resIdx;
+    tr.title = 'Double-click for full request / response';
     tr.innerHTML = `
       <td class="fuzz-pl">${esc(pl)}</td>
       <td><span class="cap-${res.status>=200&&res.status<300?'info':'high'}">${res.status||'—'}</span></td>
       <td>${rpcBadge}</td>
       <td>${elapsed}ms</td>
       <td class="fuzz-pre">${esc(preview)}</td>`;
+    tr.addEventListener('dblclick', () => openHfuzzDetailPopup(resIdx));
+    _hfuzzState.results[resIdx].tr = tr;
     tbody.appendChild(tr);
     tbody.parentElement.scrollTop = tbody.parentElement.scrollHeight;
   }
-  prog.textContent = `Done — ${payloads.length} payloads`;
+
+  // Post-loop timing anomaly detection: flag rows >= 2× median elapsed
+  const htimes = _hfuzzState.results.filter(r => r.elapsed > 0).map(r => r.elapsed).sort((a,b) => a-b);
+  if (htimes.length >= 3) {
+    const mid = Math.floor(htimes.length / 2);
+    const median = htimes.length % 2 ? htimes[mid] : (htimes[mid-1] + htimes[mid]) / 2;
+    const thresh = median * 2;
+    for (const r of _hfuzzState.results) {
+      if (!r.tr || r.elapsed < thresh) continue;
+      const elCell = r.tr.children[3];
+      if (elCell) {
+        elCell.style.color = '#ffa657';
+        elCell.style.fontWeight = '600';
+        elCell.title = `Slow response — ${r.elapsed}ms vs median ${Math.round(median)}ms (≥2×)`;
+      }
+    }
+  }
+
+  prog.textContent = `Done — ${payloads.length} payload${payloads.length===1?'':'s'}`;
   btn.disabled = false;
 }
 
@@ -6273,19 +7114,54 @@ function setNestedValue(obj, path, value) {
     if (cur[parts[i]] === undefined) cur[parts[i]] = {};
     cur = cur[parts[i]];
   }
-  const last = parts[parts.length - 1];
-  // Try to preserve numeric types if possible
-  const numVal = Number(value);
-  cur[last] = !isNaN(numVal) && value.trim() !== '' ? numVal : value;
+  // Use JSON.parse so type-confusion payloads (null, true, [], {}, -1) arrive as their
+  // correct types. Arbitrary injection strings (../etc/passwd, ' OR 1=1) fail to parse
+  // and fall back to string, which is correct.
+  let parsed = value;
+  try { parsed = JSON.parse(value); } catch (_) {}
+  cur[parts[parts.length - 1]] = parsed;
 }
 
-function closeIntruderModal() {
-  const ov = document.getElementById('intruder-overlay');
+function openHfuzzDetailPopup(idx) {
+  const r = _hfuzzState.results[idx];
+  if (!r) return;
+  document.getElementById('hfuzz-detail-popup')?.remove();
+  const ov = document.createElement('div');
+  ov.id = 'hfuzz-detail-popup';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:4000;display:flex;align-items:center;justify-content:center';
+  ov.innerHTML = `
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;
+                width:min(940px,96vw);height:82vh;display:flex;flex-direction:column;overflow:hidden">
+      <div style="display:flex;align-items:center;gap:.6rem;padding:0.6rem 1rem;
+                  border-bottom:1px solid var(--border);background:var(--bg)">
+        <span style="font-weight:700;font-size:12px">Result ${idx+1}</span>
+        <code style="font-size:11px;color:var(--accent);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.pl)}</code>
+        <button class="btn-sm" onclick="document.getElementById('hfuzz-detail-popup').remove()">&#x2715; Close</button>
+      </div>
+      <div style="display:flex;flex:1;overflow:hidden">
+        <div style="flex:1;display:flex;flex-direction:column;border-right:1px solid var(--border);overflow:hidden">
+          <div style="font-size:10px;font-weight:700;color:var(--muted);padding:0.3rem 0.6rem;background:var(--bg)">Request sent</div>
+          <pre style="flex:1;overflow:auto;padding:0.6rem;margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all">${esc(JSON.stringify(r.sentPayload, null, 2))}</pre>
+        </div>
+        <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+          <div style="font-size:10px;font-weight:700;color:var(--muted);padding:0.3rem 0.6rem;background:var(--bg)">Response</div>
+          <pre style="flex:1;overflow:auto;padding:0.6rem;margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all">${esc(JSON.stringify(r.res, null, 2))}</pre>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener('click', e => { if (e.target === ov) ov.remove(); });
+  const escH = ev => { if (ev.key === 'Escape') ov.remove(); };
+  document.addEventListener('keydown', escH, {once: true});
+}
+
+function closeHistFuzzModal() {
+  const ov = document.getElementById('hfuzz-overlay');
   if (ov) { if (ov._escH) document.removeEventListener('keydown', ov._escH); ov.remove(); }
 }
 
-function exportIntruderResults() {
-  const {results} = _intruderState;
+function exportHistFuzzResults() {
+  const {results} = _hfuzzState;
   if (!results.length) { showError('No results to export'); return; }
   const rows = [['Payload','HTTP Status','RPC Status','Time (ms)','Size','Anomaly','Response']];
   for (const r of results) {
@@ -6296,7 +7172,7 @@ function exportIntruderResults() {
   const csv = rows.map(r => r.map(c => '"' + String(c).replace(/"/g,'""') + '"').join(',')).join('\n');
   const a = document.createElement('a');
   a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
-  a.download = 'intruder-results.csv';
+  a.download = 'fuzz-history-results.csv';
   a.click();
 }
 

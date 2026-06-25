@@ -39,6 +39,12 @@ Priority order within each section. Tick items off as they land.
 - [x] **Protocol edge case presets**
   Dropdown in the raw editor with MCP-specific malformed payloads: wrong `protocolVersion`, missing `jsonrpc` field, `id: null` vs omitted, notification-sent-as-request, unknown method, batch requests. Surfaces how strictly the server validates the protocol.
 
+- [x] **stdio transport**
+  Connect to local MCP servers that communicate over stdin/stdout (subprocess). Select "stdio" transport in the connect form, enter the launch command (e.g. `node server.js`), optionally set env vars. Covers the majority of real-world MCP servers (filesystem, git, database tools, etc.).
+
+- [x] **MCP OAuth 2.0 / PKCE tester**
+  Probe OAuth flows on connected servers: discover `/.well-known/oauth-authorization-server`, test PKCE enforcement, open redirect validation, token endpoint client auth, bogus client_credentials, and privileged scope acceptance. Findings roll into the Findings panel.
+
 ---
 
 ## Medium priority
@@ -52,6 +58,9 @@ Priority order within each section. Tick items off as they land.
 - [x] **Notes per tool**
   Inline text field per tool for operator annotations during a session (e.g. "confirmed path traversal via `path` param", "returns internal DB error on empty input"). Notes included in the JSON export under each history entry.
 
+- [x] **Copy request as cURL / Python**
+  One-click export of the current raw editor payload as a `curl` command or Python `requests` snippet, including auth headers and custom headers. Copies to clipboard.
+
 ---
 
 ## Low priority / nice to have
@@ -62,8 +71,11 @@ Priority order within each section. Tick items off as they land.
 - [x] **Session save / load**
   Export the full session (server list + history + notes) to a JSON file and reload it later. Lets operators resume a test across restarts without re-enumerating tools.
 
-- [x] **Repeat with modifications (Intruder-lite)**
+- [x] **Repeat with modifications (Fuzzer from history)**
   Take a history entry, mark one parameter as the fuzz target, supply a wordlist or value range, fire N sequential calls. Results shown in a mini table. Useful for iterating on injection payloads without manual re-send.
 
 - [x] **Transport security info**
   Show TLS/plaintext indicator per server (already knowable from the URL scheme). Optionally surface the server's TLS cert details (CN, expiry, self-signed flag) in the server panel on hover.
+
+- [x] **Timing anomaly detection in fuzzer**
+  Flag fuzzer results where the response time is statistically slower than the baseline (e.g. ≥2× median). Surfaces blind time-based injection without operator intervention — SQL `SLEEP()`, shell `sleep`, etc.
