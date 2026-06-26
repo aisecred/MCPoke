@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MCPoke — interactive MCP server exploration tool (Burp Repeater for MCP)."""
+"""MCPoke — interactive MCP server exploration tool (Repeater for MCP)."""
 
 import asyncio
 import atexit
