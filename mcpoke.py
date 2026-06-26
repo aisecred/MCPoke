@@ -1072,19 +1072,54 @@ HTML = r"""<!DOCTYPE html>
 <title>MCPoke</title>
 <style>
 :root {
-  --bg:      #0d1117;
-  --surface: #161b22;
-  --border:  #30363d;
-  --text:    #c9d1d9;
-  --muted:   #8b949e;
-  --accent:  #58a6ff;
-  --green:   #56d364;
-  --cyan:    #79c0ff;
-  --red:     #f85149;
-  --yellow:  #e3b341;
-  --fg:      #c9d1d9;
-  --error:   #f85149;
+  --bg:             #0d1117;
+  --surface:        #161b22;
+  --border:         #30363d;
+  --text:           #c9d1d9;
+  --muted:          #8b949e;
+  --accent:         #58a6ff;
+  --green:          #56d364;
+  --cyan:           #79c0ff;
+  --red:            #f85149;
+  --yellow:         #e3b341;
+  --fg:             #c9d1d9;
+  --error:          #f85149;
+  --surface-active: var(--surface-active);
 }
+[data-theme="light"] {
+  --bg:             #e8eaed;
+  --surface:        #d8dce2;
+  --border:         #b0b8c4;
+  --text:           #1f2328;
+  --muted:          #556270;
+  --accent:         #0969da;
+  --green:          #1a7f37;
+  --cyan:           #0969da;
+  --red:            #cf222e;
+  --yellow:         #9a6700;
+  --fg:             #1f2328;
+  --error:          #cf222e;
+  --surface-active: #c8d8f0;
+}
+[data-theme="light"] .cap-critical {
+  color: #cf222e; background: #ffebe9; border-color: #ffd8d4; }
+[data-theme="light"] .cap-high {
+  color: #bc4c00; background: #fff1e5; border-color: #ffd8b5; }
+[data-theme="light"] .cap-medium {
+  color: #9a6700; background: #fff8c5; border-color: #e3c14d; }
+[data-theme="light"] .cap-low {
+  color: #656d76; background: #f6f8fa; border-color: #d0d7de; }
+[data-theme="light"] .cap-info {
+  color: #0969da; background: #ddf4ff; border-color: #a8d1f5; }
+[data-theme="light"] .badge-ok    { background: #dafbe1; color: #1a7f37; }
+[data-theme="light"] .badge-error { background: #ffebe9; color: #cf222e; }
+[data-theme="light"] .badge-warn  { background: #fff8c5; color: #9a6700; }
+[data-theme="light"] .btn-green {
+  background: #dafbe1; border-color: #1a7f37; color: #1a7f37; }
+[data-theme="light"] .btn-green:hover { background: #c6efce; }
+[data-theme="light"] .btn-cyan {
+  background: #ddf4ff; border-color: #0969da; color: #0969da; }
+[data-theme="light"] .btn-cyan:hover { background: #c8e6ff; }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
   background: var(--bg); color: var(--text);
@@ -1163,7 +1198,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   border: 1px solid transparent; margin-bottom: 2px; position: relative;
 }
 .srv-item:hover  { background: var(--surface); border-color: var(--border); }
-.srv-item.active { background: #0d2040; border-color: var(--accent); }
+.srv-item.active { background: var(--surface-active); border-color: var(--accent); }
 .srv-row1 { display: flex; align-items: center; gap: 0.4rem; }
 .sdot {
   width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
@@ -1176,7 +1211,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
 .sname {
   font-family: monospace; font-size: 12px; color: var(--accent);
-  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .srv-close {
   opacity: 0; font-size: 13px; line-height: 1; padding: 0 3px;
@@ -1210,7 +1245,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   border: 1px solid transparent; margin-bottom: 2px;
 }
 .tool-item:hover  { background: var(--surface); border-color: var(--border); }
-.tool-item.active { background: #0d2040; border-color: var(--accent); }
+.tool-item.active { background: var(--surface-active); border-color: var(--accent); }
 .tn { color: var(--accent); font-family: monospace; font-size: 12px; }
 .td { color: var(--muted); font-size: 11px; margin-top: 1px;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1294,7 +1329,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 }
 .mode-btn:hover { color: var(--text); border-color: var(--muted); }
 .mode-btn.active {
-  background: #0d2040; border-color: var(--accent); color: var(--accent);
+  background: var(--surface-active); border-color: var(--accent); color: var(--accent);
   font-weight: 600;
 }
 #raw-editor {
@@ -1544,7 +1579,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   border: none; color: var(--muted); cursor: pointer; white-space: nowrap;
 }
 .pp-cat-btn:hover  { background: #0d1f3a; color: var(--text); }
-.pp-cat-btn.active { background: #0d2040; color: var(--accent); font-weight: 600; }
+.pp-cat-btn.active { background: var(--surface-active); color: var(--accent); font-weight: 600; }
 .pp-items { flex: 1; overflow-y: auto; padding: 3px; }
 .pp-item {
   display: block; width: 100%; text-align: left; padding: 3px 7px;
@@ -1552,7 +1587,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   color: var(--text); background: none; border: none; cursor: pointer;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.pp-item:hover { background: #0d2040; color: var(--accent); }
+.pp-item:hover { background: var(--surface-active); color: var(--accent); }
 .pp-file-btn { width: 100%; margin-top: 4px; font-size: 11px; color: var(--accent); }
 
 /* ── §§ fuzz button ── */
@@ -1632,8 +1667,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   padding: 0.2rem 0.5rem; text-align: left; position: sticky; top: 0;
 }
 #fuzz-tbl td { padding: 0.2rem 0.5rem; border-bottom: 1px solid #21262d; }
-#fuzz-tbl tr.clickable:hover td { background: #0d2040; cursor: pointer; }
-#fuzz-tbl tr.fuzz-selected td { background: #0d2040; }
+#fuzz-tbl tr.clickable:hover td { background: var(--surface-active); cursor: pointer; }
+#fuzz-tbl tr.fuzz-selected td { background: var(--surface-active); }
 .fuzz-h-resizer {
   height: 5px; flex-shrink: 0; background: var(--border);
   cursor: row-resize; transition: background .15s;
@@ -1690,8 +1725,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   padding:.2rem .5rem;text-align:left;position:sticky;top:0;z-index:1;overflow:hidden;
 }
 #auth-tbl td { padding:.3rem .5rem;border-bottom:1px solid #21262d;vertical-align:middle;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
-#auth-tbl tr.selected td { background:#0d2040; }
-#auth-tbl tr.clickable:hover td { background:#0d2040;cursor:pointer; }
+#auth-tbl tr.selected td { background:var(--surface-active); }
+#auth-tbl tr.clickable:hover td { background:var(--surface-active);cursor:pointer; }
 #auth-tbl col.col-n    { width:2.5rem; }
 #auth-tbl col.col-var  { width:130px; }
 #auth-tbl col.col-hdr  { width:auto; }
@@ -1731,8 +1766,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 }
 #race-tbl td { padding:.3rem .5rem;border-bottom:1px solid #21262d;vertical-align:middle;font-family:monospace; }
 #race-tbl tr.race-outlier td { background:#2d1a00; }
-#race-tbl tr.clickable:hover td { background:#0d2040;cursor:pointer; }
-#race-tbl tr.race-selected td { background:#0d2040; }
+#race-tbl tr.clickable:hover td { background:var(--surface-active);cursor:pointer; }
+#race-tbl tr.race-selected td { background:var(--surface-active); }
 #race-response-pane {
   flex-shrink:0;overflow-y:auto;background:var(--bg);
   border-top:1px solid var(--border);font-family:monospace;font-size:11px;
@@ -1774,7 +1809,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   background:var(--bg);border-bottom:1px solid var(--border);flex-shrink:0; }
 .hfuzz-src-tab { font-size:11px;padding:.15rem .4rem;border-radius:3px;
   border:1px solid transparent;background:none;color:var(--muted);cursor:pointer; }
-.hfuzz-src-tab.active { background:#0d2040;border-color:var(--accent);color:var(--accent);font-weight:600; }
+.hfuzz-src-tab.active { background:var(--surface-active);border-color:var(--accent);color:var(--accent);font-weight:600; }
 .hfuzz-source-pane { flex:1;overflow-y:auto;padding:.4rem; }
 #hfuzz-tbl { width:100%;border-collapse:collapse;font-size:11px; }
 #hfuzz-tbl th {
@@ -1784,8 +1819,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 }
 #hfuzz-tbl td { padding:.3rem .5rem;border-bottom:1px solid #21262d;vertical-align:middle; }
 #hfuzz-tbl tr.intr-anomaly td { background:#2d1a00; }
-#hfuzz-tbl tr.clickable:hover td { background:#0d2040;cursor:pointer; }
-#hfuzz-tbl tr.intr-selected td { background:#0d2040; }
+#hfuzz-tbl tr.clickable:hover td { background:var(--surface-active);cursor:pointer; }
+#hfuzz-tbl tr.intr-selected td { background:var(--surface-active); }
 #hfuzz-response-pane {
   flex-shrink:0;overflow-y:auto;background:var(--bg);
   border-top:1px solid var(--border);font-family:monospace;font-size:11px;
@@ -1804,7 +1839,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
            border: 1px solid transparent; background: none;
            color: var(--muted); cursor: pointer; }
 .tab-btn:hover  { color: var(--text); border-color: var(--border); }
-.tab-btn.active { background: #0d2040; border-color: var(--accent);
+.tab-btn.active { background: var(--surface-active); border-color: var(--accent);
                   color: var(--accent); font-weight: 600; }
 /* Resource items */
 .res-item {
@@ -1812,7 +1847,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   border: 1px solid transparent; margin-bottom: 2px;
 }
 .res-item:hover  { background: var(--surface); border-color: var(--border); }
-.res-item.active { background: #0d2040; border-color: var(--accent); }
+.res-item.active { background: var(--surface-active); border-color: var(--accent); }
 .rn { color: var(--green); font-family: monospace; font-size: 12px; }
 .ru { color: var(--muted); font-size: 10px; margin-top: 1px;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1822,7 +1857,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   border: 1px solid transparent; margin-bottom: 2px;
 }
 .pmt-item:hover  { background: var(--surface); border-color: var(--border); }
-.pmt-item.active { background: #0d2040; border-color: var(--accent); }
+.pmt-item.active { background: var(--surface-active); border-color: var(--accent); }
 .pn { color: var(--yellow); font-family: monospace; font-size: 12px; }
 </style>
 </head>
@@ -1843,6 +1878,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   <button class="btn-sm" onclick="saveSession()" title="Save session to JSON file">Save Session</button>
   <label class="btn-sm" style="cursor:pointer" title="Load session from JSON file">Load Session<input type="file" accept=".json" style="display:none" onchange="loadSessionFile(this)"></label>
   <button class="btn-sm" onclick="clearAllCache()" title="Clear saved server cache">Clear cache</button>
+  <button class="btn-sm" id="theme-toggle-btn" onclick="toggleTheme()" title="Switch between dark and light theme">&#9728; Light</button>
 </div>
 <div id="err-banner"></div>
 
@@ -2003,6 +2039,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
       <button class="btn-sm" id="hist-diff-btn" style="display:none;color:#58a6ff;border-color:#1a3a5c" onclick="openDiffModal()">&#8942; Diff (2)</button>
       <button class="btn-sm" id="hist-export-json" onclick="exportHistory()">Export JSON</button>
       <button class="btn-sm" id="hist-export-md"   onclick="exportMarkdown()">Export MD</button>
+      <button class="btn-sm" id="hist-export-html"  onclick="exportHTML()">Export HTML</button>
       <button class="btn-sm" id="hist-clear"        onclick="clearHistory()">Clear</button>
       <button class="btn-sm" id="findings-clear" style="display:none" onclick="clearFindings()">Clear</button>
       <button class="btn-sm" id="findings-add" style="display:none" onclick="openAddFindingModal()">&#x2b; Add Finding</button>
@@ -2014,6 +2051,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
           <div class="export-opt" onclick="exportFindings('csv')">CSV</div>
           <div class="export-opt" onclick="exportFindings('json')">JSON</div>
           <div class="export-opt" onclick="exportFindings('md')">Markdown</div>
+          <div class="export-opt" onclick="exportHTML()">Full HTML Report</div>
         </div>
       </div>
     </div>
@@ -2077,8 +2115,9 @@ const S = {
   history: [],
   notifications: [],
   rawMode: false,
-  findingStatus: JSON.parse(localStorage.getItem('mcpoke-finding-status') || '{}'),
-  findingNotes:  JSON.parse(localStorage.getItem('mcpoke-finding-notes')  || '{}'),
+  findingStatus:    JSON.parse(localStorage.getItem('mcpoke-finding-status')    || '{}'),
+  findingNotes:     JSON.parse(localStorage.getItem('mcpoke-finding-notes')     || '{}'),
+  findingDismissed: new Set(JSON.parse(localStorage.getItem('mcpoke-finding-dismissed') || '[]')),
   histChecked: [],  // up to 2 history entry IDs selected for diff
 };
 
@@ -2539,6 +2578,14 @@ function renderServers() {
   list.innerHTML = srvs.map(srv => {
     const isActive = srv.url === S.activeUrl;
     const label    = esc(srvLabel(srv));
+    let hostSub = '';
+    try {
+      const u = new URL(srv.url);
+      const hostPort = u.host; // includes port if non-default
+      if (hostPort && hostPort !== srvLabel(srv)) {
+        hostSub = `<div style="font-size:9px;color:var(--muted);font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px">${esc(hostPort)}</div>`;
+      }
+    } catch { /* stdio or unparseable */ }
     const tBadge   = srv.transport
       ? `<span class="badge badge-${srv.transport}">${srv.transport.toUpperCase()}</span>` : '';
     const cBadge   = srv.fromCache
@@ -2577,7 +2624,10 @@ function renderServers() {
     return `<div class="srv-item${isActive?' active':''}" data-url="${esc(srv.url)}">
       <div class="srv-row1">
         <div class="sdot ${srv.status}"></div>
-        <span class="sname" title="${esc(srv.url)}">${label}</span>
+        <div style="flex:1;overflow:hidden">
+          <span class="sname" title="${esc(srv.url)}">${label}</span>
+          ${hostSub}
+        </div>
         ${discBtn}
         <button class="srv-close btn-sm" data-close="${esc(srv.url)}">&#x2715;</button>
       </div>
@@ -3947,7 +3997,7 @@ function buildFindings() {
   }
 
   rows.sort((a, b) => (SEV_ORD[a.severity] ?? 4) - (SEV_ORD[b.severity] ?? 4));
-  return rows;
+  return rows.filter(f => !S.findingDismissed.has(findingFp(f)));
 }
 
 const FINDING_STATUS_CYCLE = ['open', 'confirmed', 'false_positive', 'accepted_risk'];
@@ -3972,6 +4022,12 @@ function saveFindingNote(fp, value) {
   localStorage.setItem('mcpoke-finding-notes', JSON.stringify(S.findingNotes));
 }
 
+function dismissFinding(fp) {
+  S.findingDismissed.add(fp);
+  localStorage.setItem('mcpoke-finding-dismissed', JSON.stringify([...S.findingDismissed]));
+  renderFindings();
+}
+
 function buildFindingRows(findings, filterQ) {
   const q = (filterQ || '').trim().toLowerCase();
   const visible = q
@@ -3985,6 +4041,7 @@ function buildFindingRows(findings, filterQ) {
   }
   return visible.map(f => {
     const fp     = findingFp(f);
+    const safeFp = esc(fp);
     const status = S.findingStatus[fp] || 'open';
     const note   = S.findingNotes[fp] || '';
     const remCell = f.remediation
@@ -3992,12 +4049,14 @@ function buildFindingRows(findings, filterQ) {
       : `<td style="color:var(--border);font-size:10px">—</td>`;
     const delBtn = f.source === 'manual'
       ? `<button class="btn-sm" title="Delete finding" onclick="deleteManualFinding('${esc(f.id)}')">&#x2715;</button>`
-      : '';
+      : `<button class="btn-sm" title="Dismiss finding (hides it — use status for false positive tracking)" style="color:var(--muted)" onclick="dismissFinding('${safeFp}')">&#x2715;</button>`;
     const histBtn = f.historyId !== undefined
-      ? `<button class="btn-sm" title="Show request/response from history" style="color:var(--accent)" onclick="openHistEntryPopup(${f.historyId})">&#8594; hist</button>`
+      ? `<button class="btn-sm" title="Show the request/response that triggered this finding" style="color:var(--accent);font-weight:700" onclick="openHistEntryPopup(${f.historyId})">&#8594; request</button>`
       : '';
     const rowStyle = status === 'false_positive' ? ' style="opacity:.45;text-decoration:line-through"' : '';
-    const safeFp = esc(fp);
+    const detailClick = f.historyId !== undefined
+      ? ` style="cursor:pointer;color:var(--text)" title="Click to view request/response" onclick="openHistEntryPopup(${f.historyId})"`
+      : '';
     return `<tr${rowStyle}>
       <td><span class="cap-${esc(f.severity)}">${esc(f.severity)}</span></td>
       <td><button class="btn-sm" style="font-size:9px;color:${FINDING_STATUS_COLOR[status]};white-space:nowrap"
@@ -4005,14 +4064,14 @@ function buildFindingRows(findings, filterQ) {
       <td>${esc(f.category)}</td>
       <td style="color:var(--muted)">${esc(f.server)}</td>
       <td style="color:var(--accent)">${esc(f.item)}</td>
-      <td class="findings-detail">${esc(f.detail)}</td>
+      <td class="findings-detail"${detailClick}>${esc(f.detail)}</td>
       ${remCell}
       <td style="min-width:120px"><input type="text" class="finding-note-input" value="${esc(note)}"
           placeholder="add note…" data-fp="${safeFp}"
           style="width:100%;box-sizing:border-box;background:transparent;border:none;border-bottom:1px solid var(--border);
                  color:var(--text);font-size:10px;font-family:monospace;outline:none;padding:.1rem .2rem"
           onchange="saveFindingNote(this.dataset.fp, this.value)"></td>
-      <td style="white-space:nowrap">${histBtn}${delBtn}</td>
+      <td style="white-space:nowrap">${histBtn} ${delBtn}</td>
     </tr>`;
   }).join('');
 }
@@ -4791,12 +4850,68 @@ function injectProtocolPreset(idx) {
 // ── Form generation ────────────────────────────────────────────────────────
 
 const TYPE_CONFUSION_PAYLOADS = {
-  integer: ['"1"', 'null', '[]', '{}', '-1', '2147483648', '1.5', 'true', '"abc"', '""'],
-  number:  ['"1.5"', 'null', '[]', '{}', '-1', 'Infinity', 'NaN', 'true', '"abc"'],
-  string:  ['0', 'true', 'false', 'null', '[]', '{}', '-1', '""'],
-  boolean: ['"true"', '"false"', '1', '0', 'null', '"yes"', '"no"', '[]'],
-  array:   ['null', '""', '0', '{}', 'false', '"[]"'],
-  object:  ['null', '[]', '""', '0', 'false', '"{}\"'],
+  integer: [
+    // Wrong primitive types
+    '"1"', '"0"', '"abc"', '""', '" "',
+    'true', 'false', 'null',
+    // Wrong structural types
+    '[]', '[1]', '{}', '{"value":1}',
+    // Boundary / overflow
+    '-1', '0', '2147483647', '2147483648', '-2147483649',
+    '9007199254740992', '-9007199254740992',
+    '1.5', '1e308', '-1e308',
+  ],
+  number: [
+    // Wrong primitive types
+    '"1.5"', '"0"', '"abc"', '""', '" "',
+    'true', 'false', 'null',
+    // Wrong structural types
+    '[]', '[1.5]', '{}', '{"value":1.5}',
+    // Special float values (valid JSON only allows finite numbers, but servers may produce them)
+    '-1', '0', '1e308', '-1e308', '1.7976931348623157e+308',
+  ],
+  string: [
+    // Wrong primitive types
+    '0', '-1', '1', 'true', 'false', 'null',
+    // Wrong structural types
+    '[]', '[" "]', '{}',
+    // Degenerate strings
+    '""', '" "', '"\\u0000"', '"\\n"', '"\\r\\n"',
+    // Encoding / length edge cases
+    '"𝕳𝖊𝖑𝖑𝖔"', '"' + 'A'.repeat(10000) + '"',
+    // Numeric strings (type coercion in loose langs)
+    '"0"', '"1"', '"-1"', '"1.5"', '"true"', '"false"', '"null"',
+  ],
+  boolean: [
+    // String representations
+    '"true"', '"false"', '"True"', '"False"', '"TRUE"', '"FALSE"',
+    '"1"', '"0"', '"yes"', '"no"', '"on"', '"off"',
+    // Numeric
+    '1', '0', '2', '-1',
+    // Other types
+    'null', '[]', '{}', '"null"',
+  ],
+  array: [
+    // Other types
+    'null', '""', '" "', '0', 'false', 'true',
+    // Stringified
+    '"[]"', '"[1,2,3]"',
+    // Wrong-element arrays
+    '[null]', '[{}]', '[[]]', '["a","b"]', '[1,2,3]',
+    // Single-element
+    '{}',
+  ],
+  object: [
+    // Other types
+    'null', '[]', '[{}]', '[null]', '""', '" "', '0', 'false',
+    // Stringified
+    '"{}"',
+    // Prototype pollution probe
+    '{"__proto__":{"admin":true}}',
+    '{"constructor":{"prototype":{"admin":true}}}',
+    // Empty / degenerate objects
+    '{"":null}', '{"value":null}',
+  ],
 };
 
 function generateForm(schema) {
@@ -5228,6 +5343,7 @@ function openHistoryModal() {
         <span id="hist-modal-count" style="color:var(--muted);font-size:11px;flex:1"></span>
         <button class="btn-sm" onclick="exportHistory()">Export JSON</button>
         <button class="btn-sm" onclick="exportMarkdown()">Export MD</button>
+        <button class="btn-sm" onclick="exportHTML()">Export HTML</button>
         <button class="btn-sm" onclick="clearHistory()">Clear</button>
         <button class="btn-sm" onclick="closeHistoryModal()">&#x2715; Close</button>
       </div>
@@ -5322,8 +5438,9 @@ function saveSession() {
     servers,
     history:       S.history,
     notifications: S.notifications,
-    findingStatus: S.findingStatus,
-    findingNotes:  S.findingNotes,
+    findingStatus:    S.findingStatus,
+    findingNotes:     S.findingNotes,
+    findingDismissed: [...S.findingDismissed],
     notes,
   };
   const ts   = session.saved.replace(/[:.]/g, '-').slice(0, 19);
@@ -5370,10 +5487,14 @@ function loadSessionFile(input) {
         S.findingNotes = session.findingNotes;
         localStorage.setItem('mcpoke-finding-notes', JSON.stringify(S.findingNotes));
       }
+      if (session.findingDismissed) {
+        S.findingDismissed = new Set(session.findingDismissed);
+        localStorage.setItem('mcpoke-finding-dismissed', JSON.stringify(session.findingDismissed));
+      }
       for (const [k, v] of Object.entries(session.notes || {}))
         if (k.startsWith('mcpoke-note-')) localStorage.setItem(k, v);
 
-      // Re-render
+      // Re-render, then merge any backend-cached servers not already in the session
       S.activeUrl = null; S.selectedIdx = -1;
       renderServers();
       renderHistory();
@@ -5381,6 +5502,7 @@ function loadSessionFile(input) {
       clearRequestPanel();
       clearResponsePanel();
       renderFindings();
+      loadCache(); // loadCache guards with !S.servers[url] so session servers take precedence
     } catch (err) {
       showError('Load session failed: ' + err.message);
     }
@@ -5552,6 +5674,266 @@ function exportMarkdown() {
   a.href = URL.createObjectURL(blob);
   a.download = 'mcpoke-report-' +
     new Date().toISOString().slice(0, 19).replace(/:/g, '-') + '.md';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function exportHTML() {
+  const now      = new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
+  const srvs     = Object.values(S.servers);
+  const findings = buildFindings();
+
+  function he(s) {
+    return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // ── Findings table ─────────────────────────────────────────────────────────
+  let findingsHtml = '';
+  if (findings.length) {
+    const rows = findings.map(f => {
+      const fp     = findingFp(f);
+      const status = S.findingStatus[fp] || 'open';
+      const note   = S.findingNotes[fp] || '';
+      const sev    = f.severity || 'info';
+      return `<tr>
+        <td><span class="sev sev-${he(sev)}">${he(sev)}</span></td>
+        <td><span class="status status-${he(status.replace(/_/g,'-'))}">${he(status.replace(/_/g,' '))}</span></td>
+        <td>${he(f.category)}</td>
+        <td class="mono muted">${he(f.server)}</td>
+        <td class="mono">${he(f.item)}</td>
+        <td class="wrap">${he(f.detail)}</td>
+        <td class="sm">${he(f.remediation||'')}</td>
+        <td class="sm muted italic">${he(note)}</td>
+      </tr>`;
+    }).join('');
+    findingsHtml = `
+    <h2>Findings (${findings.length})</h2>
+    <table>
+      <thead><tr><th>Sev</th><th>Status</th><th>Category</th><th>Server</th><th>Item</th><th>Detail</th><th>Remediation</th><th>Notes</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  } else {
+    findingsHtml = '<h2>Findings</h2><p class="muted">No findings.</p>';
+  }
+
+  // ── Per-server sections ────────────────────────────────────────────────────
+  let serversHtml = '<h2>Servers</h2>';
+  for (const srv of srvs) {
+    const si    = srv.serverInfo || {};
+    const fp    = fingerprintServer(srv);
+    const vulns = matchVulns(srv);
+    const caps  = si.capabilities || {};
+    const label = srvLabel(srv);
+    let host = srv.url; try { host = new URL(srv.url).host; } catch {}
+
+    let infoRows = `<tr><td>URL</td><td><code>${he(srv.url)}</code></td></tr>`;
+    infoRows += `<tr><td>Status</td><td>${he(srv.status)}</td></tr>`;
+    if (srv.transport)      infoRows += `<tr><td>Transport</td><td>${he(srv.transport.toUpperCase())}</td></tr>`;
+    if (si.protocolVersion) infoRows += `<tr><td>Protocol</td><td>${he(si.protocolVersion)}</td></tr>`;
+    if (si.name)            infoRows += `<tr><td>Server name</td><td>${he(si.name)}${si.version?' '+he(si.version):''}</td></tr>`;
+    if (fp)                 infoRows += `<tr><td>Fingerprint</td><td>${he(fp)}</td></tr>`;
+    if (srv.proxy)          infoRows += `<tr><td>Proxy</td><td>${he(srv.proxy)}</td></tr>`;
+
+    let capsHtml = '';
+    const capKeys = Object.keys(caps);
+    if (capKeys.length) {
+      const capRows = capKeys.map(k => {
+        const risk   = CAP_RISKS[k] || {level:'info', tip:`Undocumented: ${k}`};
+        const detail = typeof caps[k]==='object' && Object.keys(caps[k]).length ? JSON.stringify(caps[k]) : '';
+        return `<tr><td><code>${he(k)}</code></td><td><span class="sev sev-${he(risk.level)}">${he(risk.level)}</span></td><td class="sm">${he(risk.tip)}${detail?` <code>${he(detail)}</code>`:''}</td></tr>`;
+      }).join('');
+      capsHtml = `<h4>Capabilities</h4><table><thead><tr><th>Capability</th><th>Risk</th><th>Notes</th></tr></thead><tbody>${capRows}</tbody></table>`;
+    }
+
+    let vulnsHtml = '';
+    if (vulns.length) {
+      const vRows = vulns.map(v =>
+        `<tr><td><code>${he(v.id)}</code></td><td><span class="sev sev-${he(v.severity)}">${he(v.severity)}</span></td><td class="sm">${he(v.title)} — ${he(v.desc)}</td></tr>`
+      ).join('');
+      vulnsHtml = `<h4>Known Vulnerabilities</h4><table><thead><tr><th>ID</th><th>Sev</th><th>Description</th></tr></thead><tbody>${vRows}</tbody></table>`;
+    }
+
+    let toolsHtml = '';
+    if ((srv.tools||[]).length) {
+      const tRows = srv.tools.map(t => {
+        const flags = flagTool(t).join(', ') || '—';
+        const note  = loadNote('tool', t.name) || '—';
+        return `<tr><td><code>${he(t.name)}</code></td><td class="sm danger">${he(flags)}</td><td class="sm">${he(t.description||'')}</td><td class="sm muted italic">${he(note)}</td></tr>`;
+      }).join('');
+      toolsHtml = `<h4>Tools (${srv.tools.length})</h4><table><thead><tr><th>Name</th><th>Flags</th><th>Description</th><th>Notes</th></tr></thead><tbody>${tRows}</tbody></table>`;
+    }
+
+    let resHtml = '';
+    if ((srv.resources||[]).length) {
+      const rRows = srv.resources.map(r => {
+        const lbl  = r.name || r.uri || '';
+        const note = loadNote('resource', r.uri||r.name) || '—';
+        return `<tr><td><code>${he(lbl)}</code></td><td class="sm muted">${he(r.uri||'')}</td><td class="sm italic">${he(note)}</td></tr>`;
+      }).join('');
+      resHtml = `<h4>Resources (${srv.resources.length})</h4><table><thead><tr><th>Name</th><th>URI</th><th>Notes</th></tr></thead><tbody>${rRows}</tbody></table>`;
+    }
+
+    let pmtHtml = '';
+    if ((srv.prompts||[]).length) {
+      const pRows = srv.prompts.map(p => {
+        const note = loadNote('prompt', p.name) || '—';
+        return `<tr><td><code>${he(p.name)}</code></td><td class="sm italic">${he(note)}</td></tr>`;
+      }).join('');
+      pmtHtml = `<h4>Prompts (${srv.prompts.length})</h4><table><thead><tr><th>Name</th><th>Notes</th></tr></thead><tbody>${pRows}</tbody></table>`;
+    }
+
+    serversHtml += `
+    <div class="srv-section">
+      <h3>${he(label)} <span class="host-sub">${he(host)}</span></h3>
+      <table><tbody>${infoRows}</tbody></table>
+      ${capsHtml}${vulnsHtml}${toolsHtml}${resHtml}${pmtHtml}
+    </div>`;
+  }
+
+  // ── History table ──────────────────────────────────────────────────────────
+  let histHtml = '';
+  if (S.history.length) {
+    const hRows = S.history.map(e => {
+      let host = e.url; try { host = new URL(e.url).host; } catch {}
+      const statusCls = e.isErr ? 'status-error' : 'status-ok';
+      const statusTxt = e.isErr ? 'error' : 'ok';
+      const argsStr = JSON.stringify(e.args, null, 2);
+      const resStr  = e.result !== undefined ? (() => { try { return JSON.stringify(e.result, null, 2); } catch { return String(e.result); } })() : '';
+      return `<tr class="hist-row" onclick="var d=this.nextElementSibling;d.style.display=d.style.display==='none'?'table-row':'none'">
+        <td class="sm muted">${he(e.time)}</td>
+        <td class="mono sm">${he(host)}</td>
+        <td class="mono sm bold">${he(e.tool)}</td>
+        <td><span class="${statusCls}">${statusTxt}</span></td>
+        <td class="sm muted">${he(e.elapsed)}ms</td>
+      </tr>
+      <tr class="detail-row"><td colspan="5">
+        <strong>Args:</strong><pre>${he(argsStr)}</pre>
+        ${resStr ? `<strong>Response:</strong><pre class="response-pre">${he(resStr)}</pre>` : ''}
+      </td></tr>`;
+    }).join('');
+    histHtml = `
+    <h2>Request History (${S.history.length})</h2>
+    <p class="sm muted">Click a row to expand args / response.</p>
+    <table>
+      <thead><tr><th>Time</th><th>Server</th><th>Tool</th><th>Status</th><th>Elapsed</th></tr></thead>
+      <tbody>${hRows}</tbody>
+    </table>`;
+  }
+
+  // ── Assemble document ──────────────────────────────────────────────────────
+  const html = `<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MCPoke Report — ${he(now)}</title>
+<style>
+  :root {
+    --bg:      #0d1117; --surface: #161b22; --border: #30363d;
+    --text:    #c9d1d9; --muted:   #8b949e; --accent:  #58a6ff;
+    --red:     #f85149; --green:   #56d364; --yellow:  #e3b341;
+    --th-bg:   #21262d; --code-bg: #21262d; --pre-bg:  #161b22;
+    --hover:   #1c2a3a; --detail-bg: #0d1117;
+    --sev-critical-fg: #fca5a5; --sev-critical-bg: #3b1515;
+    --sev-high-fg:     #fdba74; --sev-high-bg:     #3b2008;
+    --sev-medium-fg:   #fcd34d; --sev-medium-bg:   #3b2f00;
+    --sev-low-fg:      #86efac; --sev-low-bg:      #0f3020;
+    --sev-info-fg:     #93c5fd; --sev-info-bg:     #0f2340;
+    --status-confirmed: #f87171; --status-open: #8b949e;
+    --status-fp: #6b7280; --status-ar: #fbbf24;
+  }
+  [data-theme="light"] {
+    --bg:      #e8eaed; --surface: #d8dce2; --border: #b0b8c4;
+    --text:    #1f2328; --muted:   #556270; --accent:  #0969da;
+    --red:     #cf222e; --green:   #1a7f37; --yellow:  #9a6700;
+    --th-bg:   #c8cdd5; --code-bg: #c8cdd5; --pre-bg:  #d0d4da;
+    --hover:   #c8d8f0; --detail-bg: #dde0e5;
+    --sev-critical-fg: #b91c1c; --sev-critical-bg: #fef2f2;
+    --sev-high-fg:     #c2410c; --sev-high-bg:     #fff7ed;
+    --sev-medium-fg:   #a16207; --sev-medium-bg:   #fefce8;
+    --sev-low-fg:      #4d7c0f; --sev-low-bg:      #f7fee7;
+    --sev-info-fg:     #0369a1; --sev-info-bg:     #eff6ff;
+    --status-confirmed: #b91c1c; --status-open: #6b7280;
+    --status-fp: #9ca3af; --status-ar: #d97706;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  body   { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: var(--bg); color: var(--text); margin: 0; padding: 0; }
+  .header { background: #0d1117; border-bottom: 1px solid var(--border);
+            padding: 1rem 2rem; display: flex; align-items: center; gap: 1rem; }
+  .header h1  { margin: 0; font-size: 1.2rem; font-family: monospace; color: #58a6ff; flex: 1; }
+  .header .ts { font-size: 11px; color: #8b949e; }
+  .theme-btn  { background: var(--surface); border: 1px solid var(--border); color: var(--text);
+                padding: .25rem .6rem; border-radius: 4px; font-size: 11px; cursor: pointer; }
+  .theme-btn:hover { border-color: var(--accent); }
+  .container { max-width: 1200px; margin: 0 auto; padding: 1.5rem 2rem; }
+  h2 { font-size: 1rem; border-bottom: 2px solid var(--border); padding-bottom: .3rem;
+       margin: 1.8rem 0 .8rem; color: var(--text); }
+  h3 { font-size: .9rem; margin: 1.2rem 0 .4rem; color: var(--accent); }
+  h4 { font-size: .82rem; margin: .9rem 0 .3rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 1rem; }
+  th  { background: var(--th-bg); text-align: left; padding: .35rem .6rem;
+        border: 1px solid var(--border); font-size: 11px; color: var(--muted);
+        font-weight: 600; white-space: nowrap; }
+  td  { padding: .3rem .6rem; border: 1px solid var(--border); vertical-align: top; }
+  tr:nth-child(4n+3) td, tr:nth-child(4n+4) td { background: color-mix(in srgb, var(--surface) 60%, transparent); }
+  tr.hist-row { cursor: pointer; }
+  tr.hist-row:hover td { background: var(--hover); }
+  tr.detail-row { display: none; }
+  tr.detail-row td { background: var(--detail-bg); padding: .5rem .8rem; }
+  .srv-section { background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+                 padding: 1rem 1.2rem; margin-bottom: 1.2rem; }
+  code { background: var(--code-bg); padding: 1px 4px; border-radius: 3px;
+         font-family: monospace; font-size: 11px; color: var(--accent); }
+  pre  { background: var(--pre-bg); border: 1px solid var(--border); border-radius: 4px;
+         padding: .4rem .6rem; font-size: 11px; overflow-x: auto; margin: .3rem 0; }
+  pre.response-pre { max-height: 300px; overflow-y: auto; }
+  .host-sub { font-weight: 400; font-size: 12px; color: var(--muted); }
+  .mono   { font-family: monospace; }
+  .sm     { font-size: 11px; }
+  .bold   { font-weight: 600; }
+  .muted  { color: var(--muted); }
+  .italic { font-style: italic; }
+  .wrap   { max-width: 260px; word-break: break-word; }
+  .danger { color: var(--red); }
+  .sev { padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+  .sev-critical { color: var(--sev-critical-fg); background: var(--sev-critical-bg); }
+  .sev-high     { color: var(--sev-high-fg);     background: var(--sev-high-bg); }
+  .sev-medium   { color: var(--sev-medium-fg);   background: var(--sev-medium-bg); }
+  .sev-low      { color: var(--sev-low-fg);       background: var(--sev-low-bg); }
+  .sev-info     { color: var(--sev-info-fg);       background: var(--sev-info-bg); }
+  .status-ok        { color: var(--green); font-size: 11px; font-weight: 600; }
+  .status-error     { color: var(--red);   font-size: 11px; font-weight: 600; }
+  .status-confirmed { color: var(--status-confirmed); font-size: 11px; }
+  .status-open      { color: var(--status-open);      font-size: 11px; }
+  .status-false-positive { color: var(--status-fp);   font-size: 11px; }
+  .status-accepted-risk  { color: var(--status-ar);   font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>&#9741; MCPoke Report</h1>
+  <span class="ts">Generated ${he(now)}</span>
+  <button class="theme-btn" id="tbtn" onclick="
+    var t=document.documentElement;
+    var next=t.getAttribute('data-theme')==='dark'?'light':'dark';
+    t.setAttribute('data-theme',next);
+    document.getElementById('tbtn').textContent=next==='dark'?'&#9728; Light':'&#9790; Dark';
+  ">&#9728; Light</button>
+</div>
+<div class="container">
+  ${findingsHtml}
+  ${serversHtml}
+  ${histHtml}
+</div>
+</body>
+</html>`;
+
+  const blob = new Blob([html], {type: 'text/html'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'mcpoke-report-' +
+    new Date().toISOString().slice(0, 19).replace(/:/g, '-') + '.html';
   a.click();
   URL.revokeObjectURL(a.href);
 }
@@ -7285,7 +7667,21 @@ function initResizers() {
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────
+function toggleTheme() {
+  const next = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('mcpoke-theme', next);
+  const btn = document.getElementById('theme-toggle-btn');
+  if (btn) btn.innerHTML = next === 'dark' ? '&#9728; Light' : '&#9790; Dark';
+}
+
 window.addEventListener('DOMContentLoaded', () => {
+  const savedTheme = localStorage.getItem('mcpoke-theme');
+  if (savedTheme === 'light') {
+    document.documentElement.setAttribute('data-theme', 'light');
+    const btn = document.getElementById('theme-toggle-btn');
+    if (btn) btn.innerHTML = '&#9790; Dark';
+  }
   initResizers();
   loadCache();
   loadOobUrl();
