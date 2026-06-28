@@ -487,6 +487,11 @@ def _update_cache(url: str, result: dict) -> None:
     _save_cache(cache)
 
 
+# ── Project file state ────────────────────────────────────────────────────────
+
+PROJECT_FILE: Optional[Path] = None        # None = no project selected (yet)
+PROJECTS_DIR = Path.home() / '.mcpoke' / 'projects'
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="MCPoke")
@@ -1101,6 +1106,130 @@ async def stdio_disconnect(command: str):
         except asyncio.TimeoutError:
             proc.kill()
     return {"ok": True}
+
+
+# ── Project file endpoints ─────────────────────────────────────────────────────
+
+def _list_projects() -> list[dict]:
+    """List .mcpoke files in PROJECTS_DIR sorted by modification time, newest first."""
+    if not PROJECTS_DIR.exists():
+        return []
+    items = []
+    for p in PROJECTS_DIR.glob('*.mcpoke'):
+        try:
+            st = p.stat()
+            items.append({
+                'name': p.stem,
+                'path': str(p),
+                'modified': datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M'),
+                'size': st.st_size,
+            })
+        except OSError:
+            pass
+    return sorted(items, key=lambda x: x['modified'], reverse=True)
+
+
+@app.get('/project/meta')
+async def get_project_meta():
+    return {
+        'has_project': PROJECT_FILE is not None,
+        'file': str(PROJECT_FILE) if PROJECT_FILE else None,
+        'name': PROJECT_FILE.stem if PROJECT_FILE else None,
+        'projects': _list_projects(),
+    }
+
+
+@app.get('/project')
+async def get_project():
+    if not PROJECT_FILE or not PROJECT_FILE.exists():
+        return JSONResponse({})
+    try:
+        return JSONResponse(json.loads(PROJECT_FILE.read_text(encoding='utf-8')))
+    except Exception:
+        return JSONResponse({})
+
+
+@app.post('/project')
+async def save_project(request: Request):
+    global PROJECT_FILE
+    if not PROJECT_FILE:
+        from fastapi import HTTPException
+        raise HTTPException(400, 'No project file set — select or create a project first')
+    data = await request.json()
+    PROJECT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PROJECT_FILE.write_text(json.dumps(data), encoding='utf-8')
+    return {'ok': True, 'name': PROJECT_FILE.stem}
+
+
+@app.post('/project/new')
+async def new_project(request: Request):
+    global PROJECT_FILE
+    from fastapi import HTTPException
+    body  = await request.json()
+    name  = body.get('name', '').strip()
+    if not name:
+        raise HTTPException(400, 'Project name required')
+    custom_path = body.get('path', '').strip()
+    if custom_path:
+        PROJECT_FILE = Path(custom_path).expanduser().resolve()
+        if not PROJECT_FILE.suffix:
+            PROJECT_FILE = PROJECT_FILE.with_suffix('.mcpoke')
+    else:
+        safe = re.sub(r'[^\w\-\. ]', '_', name).strip().replace(' ', '_')
+        PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+        PROJECT_FILE = PROJECTS_DIR / f'{safe}.mcpoke'
+    PROJECT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    return {'ok': True, 'name': PROJECT_FILE.stem, 'path': str(PROJECT_FILE)}
+
+
+@app.post('/project/open')
+async def open_project(request: Request):
+    global PROJECT_FILE
+    body = await request.json()
+    path = body.get('path', '').strip()
+    if not path:
+        from fastapi import HTTPException
+        raise HTTPException(400, 'Path required')
+    p = Path(path)
+    if not p.exists():
+        from fastapi import HTTPException
+        raise HTTPException(404, 'Project file not found')
+    PROJECT_FILE = p
+    try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        data = {}
+    return JSONResponse({'ok': True, 'name': PROJECT_FILE.stem, 'path': str(PROJECT_FILE), 'data': data})
+
+
+@app.get('/fs/list')
+async def fs_list(path: str = None):
+    from fastapi import HTTPException
+    p = Path(path).expanduser().resolve() if path else Path.home()
+    if not p.is_dir():
+        raise HTTPException(400, f'Not a directory: {p}')
+    entries = []
+    try:
+        for item in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+            try:
+                st = item.stat()
+                entries.append({
+                    'name': item.name,
+                    'path': str(item),
+                    'type': 'dir' if item.is_dir() else 'file',
+                    'size': st.st_size if item.is_file() else None,
+                    'modified': datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M'),
+                    'is_project': item.suffix in ('.mcpoke', '.json') and item.is_file(),
+                })
+            except (PermissionError, OSError):
+                pass
+    except PermissionError:
+        raise HTTPException(403, f'Permission denied: {p}')
+    return {
+        'path': str(p),
+        'parent': str(p.parent) if str(p.parent) != str(p) else None,
+        'entries': entries,
+    }
 
 
 # ── HTML UI ───────────────────────────────────────────────────────────────────
@@ -1899,6 +2028,32 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 .pmt-item:hover  { background: var(--surface); border-color: var(--border); }
 .pmt-item.active { background: var(--surface-active); border-color: var(--accent); }
 .pn { color: var(--yellow); font-family: monospace; font-size: 12px; }
+#project-overlay { position:fixed;inset:0;z-index:4000;background:rgba(0,0,0,.8);display:flex;align-items:center;justify-content:center; }
+#project-dialog { background:var(--surface);border:1px solid var(--border);border-radius:8px;width:540px;max-width:95vw;max-height:90vh;overflow-y:auto; }
+#project-dialog h2 { margin:0;padding:1rem 1.2rem .6rem;font-size:15px;color:var(--accent);border-bottom:1px solid var(--border); }
+.proj-section { padding:.8rem 1.2rem;border-bottom:1px solid var(--border); }
+.proj-section:last-child { border-bottom:none; }
+.proj-section h3 { margin:0 0 .5rem;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted); }
+.proj-row { display:flex;gap:.4rem;align-items:center;margin-bottom:.3rem; }
+.proj-row input[type=text] { flex:1;font-size:12px;padding:.3rem .5rem;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text); }
+.proj-list { display:flex;flex-direction:column;gap:.25rem;max-height:180px;overflow-y:auto; }
+.proj-item { display:flex;align-items:center;gap:.5rem;padding:.35rem .5rem;border-radius:4px;cursor:pointer;border:1px solid transparent; }
+.proj-item:hover { background:var(--surface-active);border-color:var(--border); }
+.proj-item-name { font-family:monospace;font-size:12px;color:var(--accent);flex:1; }
+.proj-item-meta { font-size:10px;color:var(--muted); }
+#fb-overlay { position:fixed;inset:0;z-index:5000;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center; }
+#fb-dialog { background:var(--surface);border:1px solid var(--border);border-radius:8px;width:600px;max-width:96vw;display:flex;flex-direction:column;max-height:80vh; }
+#fb-header { padding:.6rem .8rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:.4rem; }
+#fb-path { flex:1;font-family:monospace;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+#fb-list { flex:1;overflow-y:auto;padding:.25rem 0;min-height:220px; }
+.fb-entry { display:flex;align-items:center;gap:.5rem;padding:.3rem .8rem;cursor:pointer;font-size:12px; }
+.fb-entry:hover { background:var(--surface-active); }
+.fb-entry.selected { background:#1a2a1a;border-left:2px solid var(--green,#3fb950); }
+.fb-entry.fb-dir { color:var(--yellow); }
+.fb-entry.fb-file { color:var(--text); }
+.fb-entry.fb-proj { color:var(--accent); }
+#fb-footer { padding:.6rem .8rem;border-top:1px solid var(--border);display:flex;gap:.4rem;align-items:center; }
+#fb-filename { flex:1;font-size:12px;padding:.3rem .5rem;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:monospace; }
 </style>
 </head>
 <body>
@@ -1915,8 +2070,13 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
       oninput="saveOobUrl()" />
   </label>
   <button class="btn-sm" id="fuzzer-toggle-btn" style="display:none;color:#e3b341;border-color:#4a3a10" onclick="toggleFuzzer()" title="Show / hide Fuzzer">&#9889; Fuzzer</button>
-  <button class="btn-sm" onclick="saveSession()" title="Save session to JSON file">Save Session</button>
-  <label class="btn-sm" style="cursor:pointer" title="Load session from JSON file">Load Session<input type="file" accept=".json" style="display:none" onchange="loadSessionFile(this)"></label>
+  <span id="project-indicator" style="font-size:11px;display:flex;align-items:center;gap:0.4rem;padding:0 0.4rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);height:24px">
+    <span style="color:var(--muted)">&#128196;</span>
+    <span id="project-name" style="color:var(--accent);font-family:monospace">No project</span>
+    <span id="project-saved-ts" style="color:var(--muted)"></span>
+  </span>
+  <button class="btn-sm" onclick="saveSession()" title="Export a copy of the current session to a JSON file">Export Session</button>
+  <label class="btn-sm" style="cursor:pointer" title="Import a session from a JSON or .mcpoke file">Import Session<input type="file" accept=".json,.mcpoke" style="display:none" onchange="loadSessionFile(this)"></label>
   <button class="btn-sm" onclick="clearAllCache()" title="Clear saved server cache">Clear cache</button>
   <button class="btn-sm" id="theme-toggle-btn" onclick="toggleTheme()" title="Switch between dark and light theme">&#9728; Light</button>
 </div>
@@ -2080,8 +2240,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
       <button class="btn-sm" id="hist-export-json" onclick="exportHistory()">Export JSON</button>
       <button class="btn-sm" id="hist-export-md"   onclick="exportMarkdown()">Export MD</button>
       <button class="btn-sm" id="hist-export-html"  onclick="exportHTML()">Export HTML</button>
-      <button class="btn-sm" id="hist-clear"        onclick="clearHistory()">Clear</button>
-      <button class="btn-sm" id="findings-clear" style="display:none" onclick="clearFindings()">Clear</button>
+      <button class="btn-sm" id="hist-clear"        onclick="clearHistory()">Clear History</button>
+      <button class="btn-sm" id="findings-clear" style="display:none" onclick="clearFindings()">Clear Findings</button>
       <button class="btn-sm" id="findings-add" style="display:none" onclick="openAddFindingModal()">&#x2b; Add Finding</button>
       <div id="findings-export-wrap" style="display:none;position:relative">
         <button class="btn-sm" onclick="toggleFindingsExportMenu()">Export &#9662;</button>
@@ -2161,6 +2321,9 @@ const S = {
   findingDismissed: new Set(JSON.parse(localStorage.getItem('mcpoke-finding-dismissed') || '[]')),
   histChecked: [],  // up to 2 history entry IDs selected for diff
 };
+
+let _projectActive = false;  // true once a project is selected/created
+let _saveProjectTimer = null;
 
 function mkServer(url, token, proxy, customHeaders, command) {
   return {url, token: token || null, proxy: proxy || null,
@@ -2390,6 +2553,7 @@ async function connectStdioServer(command, env) {
   }
   renderServers();
   if (srv.url === S.activeUrl) renderTabContent(srv);
+  debouncedSaveProject();
 }
 
 async function connectServer(url, token, proxy, customHeaders) {
@@ -4156,6 +4320,7 @@ function clearFindings() {
   for (const srv of Object.values(S.servers)) srv.findings = [];
   for (const e of S.history) e.sensitiveHits = [];
   renderFindings();
+  saveProject();
 }
 
 function openAddFindingModal() {
@@ -4610,12 +4775,14 @@ function cycleFindingStatus(fp) {
   if (next === 'open') delete S.findingStatus[fp]; else S.findingStatus[fp] = next;
   localStorage.setItem('mcpoke-finding-status', JSON.stringify(S.findingStatus));
   renderFindings();
+  debouncedSaveProject();
 }
 
 function saveFindingNote(fp, value) {
   if (value.trim()) S.findingNotes[fp] = value.trim();
   else delete S.findingNotes[fp];
   localStorage.setItem('mcpoke-finding-notes', JSON.stringify(S.findingNotes));
+  debouncedSaveProject();
 }
 
 function dismissFinding(fp) {
@@ -4711,7 +4878,7 @@ function openFindingsModal() {
       <div class="panel-modal-hdr">
         <span style="color:#e3b341;font-weight:700;font-family:monospace;font-size:13px">&#9873; Findings</span>
         <span id="findings-modal-count" style="color:var(--muted);font-size:11px;flex:1"></span>
-        <button class="btn-sm" onclick="clearFindings()">Clear</button>
+        <button class="btn-sm" onclick="clearFindings()">Clear Findings</button>
         <button class="btn-sm" onclick="openAddFindingModal()">&#x2b; Add Finding</button>
         ${exportMenu}
         <button class="btn-sm" onclick="closeFindingsModal()">&#x2715; Close</button>
@@ -4793,7 +4960,7 @@ function openNotificationsModal() {
       <div class="panel-modal-hdr">
         <span style="color:var(--cyan);font-weight:700;font-family:monospace;font-size:13px">&#9656; Notifications</span>
         <span id="notif-modal-count" style="color:var(--muted);font-size:11px;flex:1"></span>
-        <button class="btn-sm" onclick="S.notifications=[];renderNotifications()">Clear</button>
+        <button class="btn-sm" onclick="S.notifications=[];renderNotifications()">Clear Notifications</button>
         <button class="btn-sm" onclick="closeNotificationsModal()">&#x2715; Close</button>
       </div>
       <div style="overflow-y:auto;flex:1">
@@ -5750,6 +5917,7 @@ function addHistory(url, tool, args, result, isErr, elapsed, sensitiveHits, rawP
   });
   renderHistory();
   if (sensitiveHits?.length) renderFindings();
+  debouncedSaveProject();
 }
 
 function statusBadges(data, isErr) {
@@ -5953,7 +6121,7 @@ function openHistoryModal() {
         <button class="btn-sm" onclick="exportHistory()">Export JSON</button>
         <button class="btn-sm" onclick="exportMarkdown()">Export MD</button>
         <button class="btn-sm" onclick="exportHTML()">Export HTML</button>
-        <button class="btn-sm" onclick="clearHistory()">Clear</button>
+        <button class="btn-sm" onclick="clearHistory()">Clear History</button>
         <button class="btn-sm" onclick="closeHistoryModal()">&#x2715; Close</button>
       </div>
       <div style="padding:.25rem .4rem;border-bottom:1px solid var(--border)">
@@ -6024,11 +6192,13 @@ function replayEntry(id) {
   }
 }
 
-function clearHistory() { S.history = []; renderHistory(); }
+function clearHistory() { S.history = []; renderHistory(); saveProject(); }
 
 // ── Session save / load ────────────────────────────────────────────────────
 
-function saveSession() {
+// ── Project file persistence ────────────────────────────────────────────────
+
+function buildProjectData() {
   const notes = {};
   for (let i = 0; i < localStorage.length; i++) {
     const key = localStorage.key(i);
@@ -6041,23 +6211,370 @@ function saveSession() {
     tools: srv.tools, resources: srv.resources, prompts: srv.prompts,
     findings: srv.findings || [], lastSeen: srv.lastSeen,
   }));
-  const session = {
+  return {
     version: 2,
     saved: new Date().toISOString(),
     servers,
-    history:       S.history,
-    notifications: S.notifications,
+    history:          S.history.slice(-300),
+    notifications:    S.notifications.slice(-100),
     findingStatus:    S.findingStatus,
     findingNotes:     S.findingNotes,
     findingDismissed: [...S.findingDismissed],
     notes,
   };
-  const ts   = session.saved.replace(/[:.]/g, '-').slice(0, 19);
-  const blob = new Blob([JSON.stringify(session, null, 2)], {type: 'application/json'});
+}
+
+async function saveProject() {
+  if (!_projectActive) return;
+  try {
+    const r = await fetch('/project', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(buildProjectData()),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const ts  = new Date().toLocaleTimeString();
+    const el  = document.getElementById('project-saved-ts');
+    if (el) { el.textContent = `Saved ${ts}`; el.style.color = 'var(--muted)'; }
+  } catch {
+    const el = document.getElementById('project-saved-ts');
+    if (el) { el.textContent = 'Save failed'; el.style.color = 'var(--red)'; }
+  }
+}
+
+function debouncedSaveProject() {
+  clearTimeout(_saveProjectTimer);
+  _saveProjectTimer = setTimeout(saveProject, 2000);
+}
+
+function _activateProject(name) {
+  _projectActive = true;
+  const el = document.getElementById('project-name');
+  if (el) el.textContent = name + '.mcpoke';
+  setInterval(saveProject, 60_000);
+  window.addEventListener('beforeunload', () => {
+    if (!_projectActive) return;
+    const blob = new Blob([JSON.stringify(buildProjectData())], {type: 'application/json'});
+    navigator.sendBeacon('/project', blob);
+  });
+}
+
+async function initProject() {
+  let meta;
+  try { meta = await fetch('/project/meta').then(r => r.json()); }
+  catch { return; }
+
+  if (meta.has_project) {
+    // Project set via --project CLI flag: load it and activate
+    const data = await fetch('/project').then(r => r.json()).catch(() => ({}));
+    if (data.servers?.length || data.history?.length) restoreSessionData(data);
+    else loadCache();
+    _activateProject(meta.name);
+  } else {
+    loadCache();
+    showProjectPicker(meta.projects);
+  }
+}
+
+function showProjectPicker(projects) {
+  const ov = document.createElement('div');
+  ov.id    = 'project-overlay';
+  const existingHtml = projects.length
+    ? projects.map(p => `
+      <div class="proj-item" onclick="openProjectFile('${esc(p.path)}', this)">
+        <span class="proj-item-name">&#128196; ${esc(p.name)}.mcpoke</span>
+        <span class="proj-item-meta">${esc(p.modified)} &middot; ${(p.size/1024).toFixed(1)} KB</span>
+      </div>`).join('')
+    : `<div style="color:var(--muted);font-size:12px;padding:.25rem 0">No projects yet</div>`;
+
+  ov.innerHTML = `
+    <div id="project-dialog">
+      <h2>&#128196; MCPoke &mdash; Select Project</h2>
+      <div class="proj-section">
+        <h3>New Project</h3>
+        <div class="proj-row">
+          <input type="text" id="proj-new-name" placeholder="Project name (e.g. client-name-2026)" maxlength="80"
+            onkeydown="if(event.key==='Enter') createNewProject()">
+          <button class="btn-sm" onclick="browseForSave()">&#128193; Browse…</button>
+          <button class="btn-sm" onclick="createNewProject()">Create</button>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-top:.2rem">Saves to ~/.mcpoke/projects/ unless you browse to a custom location</div>
+      </div>
+      <div class="proj-section">
+        <h3>Existing Projects</h3>
+        <div class="proj-list">${existingHtml}</div>
+      </div>
+      <div class="proj-section">
+        <h3>Open by Path</h3>
+        <div class="proj-row">
+          <input type="text" id="proj-open-path" placeholder="/path/to/engagement.mcpoke"
+            onkeydown="if(event.key==='Enter') openProjectByPath()">
+          <button class="btn-sm" onclick="browseForOpen()">&#128193; Browse…</button>
+          <button class="btn-sm" onclick="openProjectByPath()">Open</button>
+        </div>
+      </div>
+      <div class="proj-section" style="border-top:1px solid var(--border);display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">
+        <button class="btn-sm" onclick="useDefaultProject()" title="Creates a dated default project file in ~/.mcpoke/projects/">&#9196; Use Default Project</button>
+        <button class="btn-sm" style="color:var(--muted);border-color:var(--border)"
+          onclick="useTempSession()">Continue without saving</button>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  setTimeout(() => document.getElementById('proj-new-name')?.focus(), 50);
+}
+
+async function browseForSave() {
+  const path = await openFileBrowser('save');
+  if (!path) return;
+  // Populate name field and a hidden path field so createNewProject uses it
+  const namePart = path.split('/').pop().replace(/\.mcpoke$/, '');
+  const nameEl = document.getElementById('proj-new-name');
+  if (nameEl) nameEl.value = namePart;
+  // Store the chosen full path for createNewProject to use
+  let hiddenEl = document.getElementById('proj-new-path');
+  if (!hiddenEl) {
+    hiddenEl = document.createElement('input');
+    hiddenEl.type = 'hidden'; hiddenEl.id = 'proj-new-path';
+    document.getElementById('project-dialog')?.appendChild(hiddenEl);
+  }
+  hiddenEl.value = path;
+}
+
+async function browseForOpen() {
+  const path = await openFileBrowser('open');
+  if (!path) return;
+  const el = document.getElementById('proj-open-path');
+  if (el) el.value = path;
+  // Auto-open on select
+  await openProjectFile(path);
+}
+
+async function createNewProject() {
+  const name = document.getElementById('proj-new-name')?.value.trim();
+  if (!name) { showError('Enter a project name'); return; }
+  const customPath = document.getElementById('proj-new-path')?.value.trim() || null;
+  try {
+    const body = customPath ? {name, path: customPath} : {name};
+    const r = await fetch('/project/new', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const j = await r.json();
+    document.getElementById('project-overlay')?.remove();
+    _activateProject(j.name);
+    loadCache();
+    saveProject();
+  } catch (err) { showError('Create project failed: ' + err.message); }
+}
+
+async function openProjectFile(path) {
+  try {
+    const r = await fetch('/project/open', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path}),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const j = await r.json();
+    document.getElementById('project-overlay')?.remove();
+    if (j.data?.servers?.length || j.data?.history?.length) restoreSessionData(j.data);
+    else loadCache();
+    _activateProject(j.name);
+  } catch (err) { showError('Open project failed: ' + err.message); }
+}
+
+async function openProjectByPath() {
+  const path = document.getElementById('proj-open-path')?.value.trim();
+  if (!path) { showError('Enter a path'); return; }
+  await openProjectFile(path);
+}
+
+async function useDefaultProject() {
+  const date = new Date().toISOString().slice(0, 10);  // YYYY-MM-DD
+  try {
+    const r = await fetch('/project/new', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: `session-${date}`}),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const j = await r.json();
+    document.getElementById('project-overlay')?.remove();
+    _activateProject(j.name);
+    loadCache();
+    saveProject();
+  } catch (err) { showError('Could not create default project: ' + err.message); }
+}
+
+function useTempSession() {
+  document.getElementById('project-overlay')?.remove();
+  const el = document.getElementById('project-name');
+  if (el) { el.textContent = 'Temporary (unsaved)'; el.style.color = 'var(--muted)'; }
+  // _projectActive stays false — saveProject() is a no-op
+}
+
+// ── File browser ─────────────────────────────────────────────────────────────
+
+let _fbMode     = 'open';   // 'open' | 'save'
+let _fbResolve  = null;
+let _fbSelected = null;
+let _fbCurPath  = null;
+
+function openFileBrowser(mode) {
+  // Returns a Promise that resolves to a file path string or null if cancelled.
+  _fbMode = mode;
+  _fbSelected = null;
+  return new Promise(resolve => {
+    _fbResolve = resolve;
+    const startPath = mode === 'save'
+      ? (document.getElementById('proj-new-path')?.value.trim() || String.fromCharCode(126) + '/.mcpoke/projects')
+      : (document.getElementById('proj-open-path')?.value.trim() || '~');
+    _fbRender(startPath);
+  });
+}
+
+async function _fbRender(path) {
+  let data;
+  try {
+    const r = await fetch('/fs/list?path=' + encodeURIComponent(path));
+    if (!r.ok) { showError('Cannot read directory: ' + path); return; }
+    data = await r.json();
+  } catch { showError('File browser error'); return; }
+  _fbCurPath = data.path;
+
+  document.getElementById('fb-overlay')?.remove();
+  const ov = document.createElement('div');
+  ov.id = 'fb-overlay';
+
+  const entries = data.entries.filter(e =>
+    e.type === 'dir' ||
+    (_fbMode === 'open' && e.is_project)
+  );
+
+  const rows = entries.map(e => {
+    const icon = e.type === 'dir' ? '&#128193;' : '&#128196;';
+    const cls  = e.type === 'dir' ? 'fb-dir' : (e.is_project ? 'fb-proj' : 'fb-file');
+    const meta = e.type === 'file' ? `<span style="color:var(--muted);font-size:10px;margin-left:auto">${e.modified}</span>` : '';
+    return `<div class="fb-entry ${cls}" data-path="${esc(e.path)}" data-type="${e.type}">
+      ${icon} ${esc(e.name)}${meta}
+    </div>`;
+  }).join('') || `<div style="padding:.5rem .8rem;color:var(--muted);font-size:12px">${_fbMode === 'open' ? 'No .mcpoke or .json files here' : 'Empty folder'}</div>`;
+
+  const filenameRow = _fbMode === 'save'
+    ? `<input id="fb-filename" type="text" placeholder="project-name.mcpoke" value="project.mcpoke">`
+    : `<span id="fb-filename" style="font-size:12px;color:var(--muted);flex:1">Click a file to select</span>`;
+
+  const actionLabel = _fbMode === 'save' ? 'Save Here' : 'Open';
+
+  ov.innerHTML = `
+    <div id="fb-dialog">
+      <div id="fb-header">
+        ${data.parent ? `<button class="btn-sm" onclick="_fbRender('${esc(data.parent)}')">&#8593; Up</button>` : ''}
+        <span id="fb-path" title="${esc(data.path)}">${esc(data.path)}</span>
+      </div>
+      <div id="fb-list">${rows}</div>
+      <div id="fb-footer">
+        ${filenameRow}
+        <button class="btn-sm" onclick="_fbConfirm()"><b>${actionLabel}</b></button>
+        <button class="btn-sm" onclick="_fbCancel()">Cancel</button>
+      </div>
+    </div>`;
+
+  document.body.appendChild(ov);
+
+  ov.querySelector('#fb-list').addEventListener('click', e => {
+    const entry = e.target.closest('.fb-entry');
+    if (!entry) return;
+    const type = entry.dataset.type;
+    const path = entry.dataset.path;
+    if (type === 'dir') {
+      _fbRender(path);
+    } else {
+      // Select file
+      ov.querySelectorAll('.fb-entry').forEach(el => el.classList.remove('selected'));
+      entry.classList.add('selected');
+      _fbSelected = path;
+      const fn = document.getElementById('fb-filename');
+      if (fn) fn.textContent = entry.textContent.trim().split('\n')[0].trim();
+    }
+  });
+}
+
+function _fbConfirm() {
+  if (_fbMode === 'open') {
+    if (!_fbSelected) { showError('Select a file first'); return; }
+    document.getElementById('fb-overlay')?.remove();
+    if (_fbResolve) _fbResolve(_fbSelected);
+  } else {
+    const fnEl = document.getElementById('fb-filename');
+    let name = fnEl?.value?.trim() || '';
+    if (!name) { showError('Enter a filename'); return; }
+    if (!name.endsWith('.mcpoke')) name += '.mcpoke';
+    const fullPath = _fbCurPath.replace(/\/$/, '') + '/' + name;
+    document.getElementById('fb-overlay')?.remove();
+    if (_fbResolve) _fbResolve(fullPath);
+  }
+  _fbResolve = null;
+}
+
+function _fbCancel() {
+  document.getElementById('fb-overlay')?.remove();
+  if (_fbResolve) _fbResolve(null);
+  _fbResolve = null;
+}
+
+// ── Session export (manual, file download) ──────────────────────────────────
+
+function saveSession() {
+  const data = buildProjectData();
+  const ts   = data.saved.replace(/[:.]/g, '-').slice(0, 19);
+  const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
   const a    = document.createElement('a');
   a.href     = URL.createObjectURL(blob);
   a.download = `mcpoke-session-${ts}.json`;
   a.click();
+}
+
+function restoreSessionData(session) {
+  if (!session.version || session.version < 1) throw new Error('Unsupported session file version');
+
+  S.servers = {};
+  for (const s of (session.servers || [])) {
+    const srv        = mkServer(s.url, s.token, s.proxy, s.customHeaders || null);
+    srv.transport    = s.transport    || null;
+    srv.serverInfo   = s.serverInfo   || {};
+    srv.tools        = s.tools        || [];
+    srv.resources    = s.resources    || [];
+    srv.prompts      = s.prompts      || [];
+    srv.findings     = s.findings     || [];
+    srv.lastSeen     = s.lastSeen     || null;
+    srv.fromCache    = true;
+    S.servers[s.url] = srv;
+  }
+  S.history       = session.history       || [];
+  S.notifications = session.notifications || [];
+  if (session.findingStatus) {
+    S.findingStatus = session.findingStatus;
+    localStorage.setItem('mcpoke-finding-status', JSON.stringify(S.findingStatus));
+  }
+  if (session.findingNotes) {
+    S.findingNotes = session.findingNotes;
+    localStorage.setItem('mcpoke-finding-notes', JSON.stringify(S.findingNotes));
+  }
+  if (session.findingDismissed) {
+    S.findingDismissed = new Set(session.findingDismissed);
+    localStorage.setItem('mcpoke-finding-dismissed', JSON.stringify(session.findingDismissed));
+  }
+  for (const [k, v] of Object.entries(session.notes || {}))
+    if (k.startsWith('mcpoke-note-')) localStorage.setItem(k, v);
+
+  S.activeUrl = null; S.selectedIdx = -1;
+  renderServers();
+  renderHistory();
+  renderNotifications();
+  clearRequestPanel();
+  clearResponsePanel();
+  renderFindings();
+  loadCache();
 }
 
 function loadSessionFile(input) {
@@ -6067,51 +6584,8 @@ function loadSessionFile(input) {
   reader.onload = ev => {
     try {
       const session = JSON.parse(ev.target.result);
-      if (!session.version || session.version < 1)
-        throw new Error('Unsupported session file version');
-
-      // Restore servers
-      S.servers = {};
-      for (const s of (session.servers || [])) {
-        const srv        = mkServer(s.url, s.token, s.proxy, s.customHeaders || null);
-        srv.transport    = s.transport    || null;
-        srv.serverInfo   = s.serverInfo   || {};
-        srv.tools        = s.tools        || [];
-        srv.resources    = s.resources    || [];
-        srv.prompts      = s.prompts      || [];
-        srv.findings     = s.findings     || [];
-        srv.lastSeen     = s.lastSeen     || null;
-        srv.fromCache    = true;
-        S.servers[s.url] = srv;
-      }
-
-      // Restore history, notifications, finding triage status, notes
-      S.history       = session.history       || [];
-      S.notifications = session.notifications || [];
-      if (session.findingStatus) {
-        S.findingStatus = session.findingStatus;
-        localStorage.setItem('mcpoke-finding-status', JSON.stringify(S.findingStatus));
-      }
-      if (session.findingNotes) {
-        S.findingNotes = session.findingNotes;
-        localStorage.setItem('mcpoke-finding-notes', JSON.stringify(S.findingNotes));
-      }
-      if (session.findingDismissed) {
-        S.findingDismissed = new Set(session.findingDismissed);
-        localStorage.setItem('mcpoke-finding-dismissed', JSON.stringify(session.findingDismissed));
-      }
-      for (const [k, v] of Object.entries(session.notes || {}))
-        if (k.startsWith('mcpoke-note-')) localStorage.setItem(k, v);
-
-      // Re-render, then merge any backend-cached servers not already in the session
-      S.activeUrl = null; S.selectedIdx = -1;
-      renderServers();
-      renderHistory();
-      renderNotifications();
-      clearRequestPanel();
-      clearResponsePanel();
-      renderFindings();
-      loadCache(); // loadCache guards with !S.servers[url] so session servers take precedence
+      restoreSessionData(session);
+      saveProject();  // persist import into the active project file
     } catch (err) {
       showError('Load session failed: ' + err.message);
     }
@@ -8338,9 +8812,9 @@ window.addEventListener('DOMContentLoaded', () => {
     if (btn) btn.innerHTML = '&#9790; Dark';
   }
   initResizers();
-  loadCache();
   loadOobUrl();
   document.getElementById('raw-editor').addEventListener('input', updateFuzzBtn);
+  initProject();  // loads project / shows picker; calls loadCache() after session restore
 });
 </script>
 </body>
@@ -8358,7 +8832,14 @@ if __name__ == "__main__":
                         help="Port to listen on (default: 8000)")
     parser.add_argument("--host", type=str, default="127.0.0.1",
                         help="Host to bind to (default: 127.0.0.1)")
+    parser.add_argument("--project", "-P", type=str, default=None,
+                        help="Project file path (.mcpoke). If omitted, the UI will prompt you to select or create one.")
     args = parser.parse_args()
+
+    if args.project:
+        PROJECT_FILE = Path(args.project).expanduser().resolve()
+        PROJECT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Project: {PROJECT_FILE}")
 
     print(f"MCPoke running at http://{args.host}:{args.port}")
     uvicorn.run("mcpoke:app", host=args.host, port=args.port, reload=False)
