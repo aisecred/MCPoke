@@ -79,3 +79,6 @@ Priority order within each section. Tick items off as they land.
 
 - [x] **Timing anomaly detection in fuzzer**
   Flag fuzzer results where the response time is statistically slower than the baseline (e.g. ≥2× median). Surfaces blind time-based injection without operator intervention — SQL `SLEEP()`, shell `sleep`, etc.
+
+- [ ] **Autosave / crash recovery**
+  Periodically write the full session state (servers, history, notes, findings status) to `localStorage` so a page refresh or accidental close doesn't lose work. Restore automatically on next load with a dismissible "Session restored" banner. Complement the existing manual export. Interval: every 60 s or on any state-changing action.
