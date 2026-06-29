@@ -6,10 +6,12 @@ import atexit
 import json
 import os
 import re
+import secrets
 import shlex
 import socket
 import ssl
 import subprocess
+import sys
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +23,9 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, field_validator
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+
+_LOOPBACK_HOSTS = ('127.0.0.1', '::1', 'localhost')
+API_TOKEN = None  # str | None — set at startup when binding to non-loopback
 
 MCP_LATEST_VERSION = "2025-11-25"
 MAX_RESPONSE_BYTES = 256 * 1024
@@ -518,6 +523,18 @@ async def security_headers(request: Request, call_next):
     response.headers["Content-Security-Policy"] = _CSP
     return response
 
+@app.middleware("http")
+async def token_auth(request: Request, call_next):
+    if API_TOKEN is None:
+        return await call_next(request)
+    # GET / is handled by its own route (validates token query param)
+    if request.url.path == '/':
+        return await call_next(request)
+    tok = request.headers.get('X-MCPoke-Token', '')
+    if not secrets.compare_digest(tok, API_TOKEN):
+        return JSONResponse({'detail': 'Unauthorized'}, status_code=401)
+    return await call_next(request)
+
 # ── Request models ────────────────────────────────────────────────────────────
 
 def _validate_url(v: str) -> str:
@@ -572,9 +589,22 @@ class DeleteCacheEntry(BaseModel):
     url: str
 
 
+_AUTH_DENIED_HTML = """<!DOCTYPE html><html><head><title>MCPoke — Unauthorized</title>
+<style>body{font-family:monospace;background:#0d1117;color:#c9d1d9;display:flex;align-items:center;
+justify-content:center;height:100vh;margin:0}
+.box{border:1px solid #f85149;padding:2rem 3rem;border-radius:8px;text-align:center;max-width:480px}
+h2{color:#f85149;margin-top:0}p{color:#8b949e;font-size:13px;line-height:1.6}</style></head>
+<body><div class="box"><h2>&#x26A0; Unauthorized</h2>
+<p>MCPoke is running in network-exposed mode and requires a token.<br>
+Use the URL printed in the terminal to open MCPoke.</p></div></body></html>"""
+
 @app.get("/", response_class=HTMLResponse)
-async def root():
-    return HTMLResponse(HTML)
+async def root(token: str = ''):
+    if API_TOKEN is not None:
+        if not token or not secrets.compare_digest(token, API_TOKEN):
+            return HTMLResponse(_AUTH_DENIED_HTML, status_code=401)
+    page = HTML.replace('__MCPOKE_TOKEN__', API_TOKEN or '', 1)
+    return HTMLResponse(page)
 
 
 @app.post("/raw")
@@ -1149,15 +1179,13 @@ async def get_project():
         return JSONResponse({})
 
 
-_ALLOWED_PROJECT_ROOTS = (Path.home(), PROJECTS_DIR)
-
 def _assert_project_path(p: Path) -> None:
-    """Raise 403 if p is outside all allowed roots (user home + projects dir)."""
+    """Raise 403/400 if p is outside the home directory or lacks .mcpoke extension."""
     resolved = p.expanduser().resolve()
-    if not any(resolved.is_relative_to(r.resolve()) for r in _ALLOWED_PROJECT_ROOTS):
+    if not resolved.is_relative_to(Path.home().resolve()):
         raise HTTPException(403, 'Project path must be within your home directory')
-    if resolved.suffix not in ('.mcpoke', '.json'):
-        raise HTTPException(400, 'Project files must have a .mcpoke or .json extension')
+    if resolved.suffix != '.mcpoke':
+        raise HTTPException(400, 'Project files must have a .mcpoke extension')
 
 
 @app.post('/project')
@@ -1181,7 +1209,7 @@ async def new_project(request: Request):
     custom_path = body.get('path', '').strip()
     if custom_path:
         candidate = Path(custom_path).expanduser().resolve()
-        if not candidate.suffix:
+        if candidate.suffix != '.mcpoke':
             candidate = candidate.with_suffix('.mcpoke')
         _assert_project_path(candidate)
         PROJECT_FILE = candidate
@@ -1215,8 +1243,11 @@ async def open_project(request: Request):
 @app.get('/fs/list')
 async def fs_list(path: str = None):
     p = Path(path).expanduser().resolve() if path else Path.home()
+    home = Path.home().resolve()
+    if not p.is_relative_to(home):
+        raise HTTPException(403, 'Path must be within your home directory')
     if not p.is_dir():
-        raise HTTPException(400, f'Not a directory: {p}')
+        raise HTTPException(400, 'Path is not a directory')
     entries = []
     try:
         for item in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
@@ -1228,12 +1259,12 @@ async def fs_list(path: str = None):
                     'type': 'dir' if item.is_dir() else 'file',
                     'size': st.st_size if item.is_file() else None,
                     'modified': datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M'),
-                    'is_project': item.suffix in ('.mcpoke', '.json') and item.is_file(),
+                    'is_project': item.suffix == '.mcpoke' and item.is_file(),
                 })
             except (PermissionError, OSError):
                 pass
     except PermissionError:
-        raise HTTPException(403, f'Permission denied: {p}')
+        raise HTTPException(403, 'Permission denied')
     return {
         'path': str(p),
         'parent': str(p.parent) if str(p.parent) != str(p) else None,
@@ -1262,7 +1293,7 @@ HTML = r"""<!DOCTYPE html>
   --yellow:         #e3b341;
   --fg:             #c9d1d9;
   --error:          #f85149;
-  --surface-active: var(--surface-active);
+  --surface-active: #1c2d4a;
 }
 [data-theme="light"] {
   --bg:             #e8eaed;
@@ -1735,7 +1766,6 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,.6);
   display: flex; flex-direction: column; width: 500px; max-height: 320px; overflow: hidden;
 }
-#pp-main { display: flex; flex: 1; min-height: 0; }
 #pp-footer {
   border-top: 1px solid var(--border); padding: 4px 6px;
   display: flex; align-items: center; gap: 6px;
@@ -2316,6 +2346,17 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 </div>
 
 <script>
+// ── Auth token (set by server when binding to non-loopback) ────────────────
+const _mcpokeToken = '__MCPOKE_TOKEN__';
+if (_mcpokeToken) {
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = (url, opts = {}) => {
+    const h = opts.headers instanceof Headers ? opts.headers : new Headers(opts.headers || {});
+    h.set('X-MCPoke-Token', _mcpokeToken);
+    return _origFetch(url, {...opts, headers: h});
+  };
+}
+
 // ── State ──────────────────────────────────────────────────────────────────
 
 const S = {
@@ -2552,7 +2593,6 @@ async function connectStdioServer(command, env) {
       srv.fromCache  = false;
       const _preserved = (srv.findings || []).filter(f => ['auth-test','oauth-probe','cert'].includes(f.item));
       srv.findings   = [...scanServerFindings(srv), ..._preserved];
-      const connected = Object.values(S.servers).filter(s => s.status === 'connected');
       if (!S.activeUrl || !S.servers[S.activeUrl] ||
           S.servers[S.activeUrl].status !== 'connected') {
         setActiveServer(url);
@@ -2603,7 +2643,6 @@ async function connectServer(url, token, proxy, customHeaders) {
       // Fetch TLS cert info in the background (non-blocking)
       if (url.startsWith('https://')) fetchCertInfo(srv);
       // If this is the only/first connected server, activate it
-      const connected = Object.values(S.servers).filter(s => s.status==='connected');
       if (!S.activeUrl || !S.servers[S.activeUrl] ||
           S.servers[S.activeUrl].status !== 'connected') {
         setActiveServer(url);
@@ -5946,7 +5985,7 @@ function statusBadges(data, isErr) {
   if (rpcErr) {
     const code = rpcErr.code != null ? rpcErr.code : '?';
     const msg  = rpcErr.message ? rpcErr.message : '';
-    html += ` <span class="badge badge-error" style="font-family:monospace;font-size:9px" title="${esc(String(code) + (msg ? ' — ' + msg : ''))}">${code}</span>`;
+    html += ` <span class="badge badge-error" style="font-family:monospace;font-size:9px" title="${esc(String(code) + (msg ? ' — ' + msg : ''))}">${esc(String(code))}</span>`;
   }
   return html || `<span class="badge ${isErr ? 'badge-error' : 'badge-ok'}">${isErr ? 'err' : 'ok'}</span>`;
 }
@@ -6030,14 +6069,6 @@ function _syncHistSelButtons() {
     const el = document.getElementById(id);
     if (el) el.style.display = n > 0 ? '' : 'none';
   }
-}
-
-function deleteHistoryEntry(id) {
-  S.history = S.history.filter(e => e.id !== id);
-  S.histChecked = S.histChecked.filter(x => x !== id);
-  _syncHistSelButtons();
-  renderHistory();
-  debouncedSaveProject();
 }
 
 function deleteHistoryChecked() {
@@ -8875,8 +8906,21 @@ if __name__ == "__main__":
 
     if args.project:
         PROJECT_FILE = Path(args.project).expanduser().resolve()
+        if not PROJECT_FILE.is_relative_to(Path.home().resolve()):
+            print("Error: --project path must be within your home directory", file=sys.stderr)
+            sys.exit(1)
+        if PROJECT_FILE.suffix != '.mcpoke':
+            PROJECT_FILE = PROJECT_FILE.with_suffix('.mcpoke')
         PROJECT_FILE.parent.mkdir(parents=True, exist_ok=True)
         print(f"Project: {PROJECT_FILE}")
 
-    print(f"MCPoke running at http://{args.host}:{args.port}")
+    if args.host not in _LOOPBACK_HOSTS:
+        API_TOKEN = secrets.token_urlsafe(16)
+        print(
+            f"WARNING: MCPoke is binding to {args.host} — token auth is required.",
+            file=sys.stderr
+        )
+        print(f"MCPoke running at http://{args.host}:{args.port}/?token={API_TOKEN}")
+    else:
+        print(f"MCPoke running at http://{args.host}:{args.port}")
     uvicorn.run("mcpoke:app", host=args.host, port=args.port, reload=False)
