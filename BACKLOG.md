@@ -80,5 +80,5 @@ Priority order within each section. Tick items off as they land.
 - [x] **Timing anomaly detection in fuzzer**
   Flag fuzzer results where the response time is statistically slower than the baseline (e.g. ≥2× median). Surfaces blind time-based injection without operator intervention — SQL `SLEEP()`, shell `sleep`, etc.
 
-- [ ] **Autosave / crash recovery**
-  Periodically write the full session state (servers, history, notes, findings status) to `localStorage` so a page refresh or accidental close doesn't lose work. Restore automatically on next load with a dismissible "Session restored" banner. Complement the existing manual export. Interval: every 60 s or on any state-changing action.
+- [x] **Project file model / autosave**
+  Implemented as server-side `.mcpoke` project files (not localStorage). On first launch without `--project`, a picker prompts to create a new project, open an existing one (with a filesystem browser), use a dated default, or continue without saving. Project files auto-save every 60 s, on every tool call, connect, finding status change, note edit, and tab close (via `sendBeacon`). `--project PATH` CLI flag opens a project directly. "Export Session" / "Import Session" remain for portable copies. Project name and last-saved time shown in the toolbar. Paths restricted to user home directory with `.mcpoke`/`.json` extension enforcement.

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 import aiohttp
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, field_validator
 
@@ -1149,12 +1149,22 @@ async def get_project():
         return JSONResponse({})
 
 
+_ALLOWED_PROJECT_ROOTS = (Path.home(), PROJECTS_DIR)
+
+def _assert_project_path(p: Path) -> None:
+    """Raise 403 if p is outside all allowed roots (user home + projects dir)."""
+    resolved = p.expanduser().resolve()
+    if not any(resolved.is_relative_to(r.resolve()) for r in _ALLOWED_PROJECT_ROOTS):
+        raise HTTPException(403, 'Project path must be within your home directory')
+    if resolved.suffix not in ('.mcpoke', '.json'):
+        raise HTTPException(400, 'Project files must have a .mcpoke or .json extension')
+
+
 @app.post('/project')
 async def save_project(request: Request):
-    global PROJECT_FILE
     if not PROJECT_FILE:
-        from fastapi import HTTPException
         raise HTTPException(400, 'No project file set — select or create a project first')
+    _assert_project_path(PROJECT_FILE)
     data = await request.json()
     PROJECT_FILE.parent.mkdir(parents=True, exist_ok=True)
     PROJECT_FILE.write_text(json.dumps(data), encoding='utf-8')
@@ -1164,16 +1174,17 @@ async def save_project(request: Request):
 @app.post('/project/new')
 async def new_project(request: Request):
     global PROJECT_FILE
-    from fastapi import HTTPException
     body  = await request.json()
     name  = body.get('name', '').strip()
     if not name:
         raise HTTPException(400, 'Project name required')
     custom_path = body.get('path', '').strip()
     if custom_path:
-        PROJECT_FILE = Path(custom_path).expanduser().resolve()
-        if not PROJECT_FILE.suffix:
-            PROJECT_FILE = PROJECT_FILE.with_suffix('.mcpoke')
+        candidate = Path(custom_path).expanduser().resolve()
+        if not candidate.suffix:
+            candidate = candidate.with_suffix('.mcpoke')
+        _assert_project_path(candidate)
+        PROJECT_FILE = candidate
     else:
         safe = re.sub(r'[^\w\-\. ]', '_', name).strip().replace(' ', '_')
         PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1188,15 +1199,14 @@ async def open_project(request: Request):
     body = await request.json()
     path = body.get('path', '').strip()
     if not path:
-        from fastapi import HTTPException
         raise HTTPException(400, 'Path required')
-    p = Path(path)
-    if not p.exists():
-        from fastapi import HTTPException
+    candidate = Path(path).expanduser().resolve()
+    _assert_project_path(candidate)
+    if not candidate.exists():
         raise HTTPException(404, 'Project file not found')
-    PROJECT_FILE = p
+    PROJECT_FILE = candidate
     try:
-        data = json.loads(p.read_text(encoding='utf-8'))
+        data = json.loads(candidate.read_text(encoding='utf-8'))
     except Exception:
         data = {}
     return JSONResponse({'ok': True, 'name': PROJECT_FILE.stem, 'path': str(PROJECT_FILE), 'data': data})
@@ -1204,7 +1214,6 @@ async def open_project(request: Request):
 
 @app.get('/fs/list')
 async def fs_list(path: str = None):
-    from fastapi import HTTPException
     p = Path(path).expanduser().resolve() if path else Path.home()
     if not p.is_dir():
         raise HTTPException(400, f'Not a directory: {p}')
@@ -2237,6 +2246,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
     </div>
     <div style="display:flex;gap:0.4rem;align-items:center">
       <button class="btn-sm" id="hist-diff-btn" style="display:none;color:#58a6ff;border-color:#1a3a5c" onclick="openDiffModal()">&#8942; Diff (2)</button>
+      <button class="btn-sm" id="hist-del-sel-btn" style="display:none;color:#f85149;border-color:#5a1a1a" onclick="deleteHistoryChecked()">&#x2715; Delete Selected</button>
       <button class="btn-sm" id="hist-export-json" onclick="exportHistory()">Export JSON</button>
       <button class="btn-sm" id="hist-export-md"   onclick="exportMarkdown()">Export MD</button>
       <button class="btn-sm" id="hist-export-html"  onclick="exportHTML()">Export HTML</button>
@@ -6002,8 +6012,7 @@ document.addEventListener('change', e => {
   } else {
     S.histChecked = S.histChecked.filter(x => x !== id);
   }
-  const diffBtn = document.getElementById('hist-diff-btn');
-  if (diffBtn) diffBtn.style.display = S.histChecked.length === 2 ? '' : 'none';
+  _syncHistSelButtons();
 });
 
 document.getElementById('hist-body').addEventListener('click', e => {
@@ -6012,6 +6021,33 @@ document.getElementById('hist-body').addEventListener('click', e => {
   const ib = e.target.closest('[data-hfuzz]');
   if (ib) openHistFuzzModal(parseInt(ib.dataset.hfuzz));
 });
+
+function _syncHistSelButtons() {
+  const n = S.histChecked.length;
+  const diffBtn = document.getElementById('hist-diff-btn');
+  if (diffBtn) diffBtn.style.display = n === 2 ? '' : 'none';
+  for (const id of ['hist-del-sel-btn', 'hist-modal-del-sel-btn']) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = n > 0 ? '' : 'none';
+  }
+}
+
+function deleteHistoryEntry(id) {
+  S.history = S.history.filter(e => e.id !== id);
+  S.histChecked = S.histChecked.filter(x => x !== id);
+  _syncHistSelButtons();
+  renderHistory();
+  debouncedSaveProject();
+}
+
+function deleteHistoryChecked() {
+  const ids = new Set(S.histChecked);
+  S.history = S.history.filter(e => !ids.has(e.id));
+  S.histChecked = [];
+  _syncHistSelButtons();
+  renderHistory();
+  debouncedSaveProject();
+}
 
 document.getElementById('hist-body').addEventListener('dblclick', e => {
   const chk = e.target.closest('.hist-chk');
@@ -6118,6 +6154,7 @@ function openHistoryModal() {
       <div class="panel-modal-hdr">
         <span style="color:var(--accent);font-weight:700;font-family:monospace;font-size:13px">&#9654; History</span>
         <span id="hist-modal-count" style="color:var(--muted);font-size:11px;flex:1"></span>
+        <button class="btn-sm" id="hist-modal-del-sel-btn" style="display:none;color:#f85149;border-color:#5a1a1a" onclick="deleteHistoryChecked()">&#x2715; Delete Selected</button>
         <button class="btn-sm" onclick="exportHistory()">Export JSON</button>
         <button class="btn-sm" onclick="exportMarkdown()">Export MD</button>
         <button class="btn-sm" onclick="exportHTML()">Export HTML</button>
@@ -6144,7 +6181,7 @@ function openHistoryModal() {
     const btn = e.target.closest('[data-replay]');
     if (btn) { closeHistoryModal(); replayEntry(parseInt(btn.dataset.replay)); return; }
     const ib  = e.target.closest('[data-hfuzz]');
-    if (ib)  { closeHistoryModal(); openHistFuzzModal(parseInt(ib.dataset.hfuzz)); }
+    if (ib)  { closeHistoryModal(); openHistFuzzModal(parseInt(ib.dataset.hfuzz)); return; }
   });
   ov.addEventListener('dblclick', e => {
     const chk = e.target.closest('.hist-chk');

@@ -1,10 +1,10 @@
 # MCPoke
 
-A Repeater-style exploration and security testing tool for [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers. Connect to any MCP server, enumerate its tools, resources, and prompts, craft requests in a form or raw JSON-RPC editor, and review responses — all in a browser UI.
+A Burp Repeater-style exploration and security testing tool for [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers. Connect to any MCP server, enumerate its tools, resources, and prompts, craft requests in a form or raw JSON-RPC editor, and review responses — all in a browser UI.
 
 Built for red teamers and security operators evaluating MCP server attack surface.
 
-![MCPoke screenshot](assets/screenshot.png)
+![MCPoke screenshot](assets/mcpoke.png)
 
 ---
 
@@ -62,7 +62,7 @@ The MCP spec is young and implementations vary widely. Auth handling, input vali
 - **Remediation guidance** — all auto-generated findings include actionable remediation text in a dedicated column
 - **Response sensitive data detection** — scans every response for AWS/GCP/Azure credential formats, JWTs, private key headers, internal file paths, RFC 1918 IPs, stack traces, Slack/GitHub tokens
 - **Notes per tool** — inline text field per tool for operator annotations during a session; included in JSON export
-- **Session save / load** — export the full session (servers, schemas, history, findings, notes, triage status) to JSON and reload it later; use **Save Session** / **Load Session** in the top toolbar
+- **Session export / import** — export the full session (servers, schemas, history, findings, notes, triage status) to JSON and reload it later; use **Export Session** / **Import Session** in the top toolbar
 - **Request history** — every call is logged with method, args, status, and elapsed time; filter by tool name, server, or args; replay any entry, export as JSON or Markdown
 - **Custom request headers** — set arbitrary headers per server (e.g. `X-API-Key`, `X-Tenant-ID`) sent on every request alongside the Bearer token; shown as a green **hdrs** badge in the sidebar
 - **HTTP/SOCKS proxy support** — route traffic per-server through Burp Suite or any HTTP/SOCKS proxy
@@ -296,9 +296,9 @@ Every request is logged in the history panel at the bottom. Use the **filter bar
 
 Double-click the **History** panel header to expand it full-screen for easier review.
 
-### Session save / load
+### Session export / import
 
-Use **Save Session** in the top toolbar to export the full session — connected servers, tool/resource/prompt schemas, request history, findings, triage status, and notes — to a JSON file. Use **Load Session** to restore it later.
+Use **Export Session** in the top toolbar to export the full session — connected servers, tool/resource/prompt schemas, request history, findings, triage status, and notes — to a JSON file. Use **Import Session** to restore it later.
 
 Session files are versioned and restore all state including finding status badges and per-finding notes, so you can resume a multi-day engagement or share session state with a team.
 
