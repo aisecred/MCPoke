@@ -1,6 +1,6 @@
 # MCPoke
 
-A Burp Repeater-style exploration and security testing tool for [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers. Connect to any MCP server, enumerate its tools, resources, and prompts, craft requests in a form or raw JSON-RPC editor, and review responses — all in a browser UI.
+A repeater-style exploration and security testing tool for [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers. Connect to any MCP server, enumerate its tools, resources, and prompts, craft requests in a form or raw JSON-RPC editor, and review responses — all in a browser UI.
 
 Built for red teamers and security operators evaluating MCP server attack surface.
 
@@ -40,7 +40,7 @@ The MCP spec is young and implementations vary widely. Auth handling, input vali
 - **Schema-aware type confusion payloads** — payload picker adds a "Type confusion" category based on each parameter's declared JSON schema type (e.g. integer fields get `"1"`, `null`, `[]`, `{}`, `true`)
 - **Protocol edge case presets** — dropdown in the raw editor injects MCP-specific malformed payloads (wrong `protocolVersion`, missing `jsonrpc`, `id: null`, batch requests, unknown methods) plus underexplored MCP methods (`ping`, `completion/complete`, `resources/subscribe`, `logging/setLevel`)
 - **Copy as cURL / Python** — one-click export of the current request as a `curl` command or Python `requests` snippet, including all auth and custom headers; copies to clipboard
-- **OOB callback URL** — set a Burp Collaborator or interactsh URL once in the header; payloads with placeholder domains are auto-substituted before sending
+- **OOB callback URL** — set an OOB callback URL (e.g. interactsh) once in the header; payloads with placeholder domains are auto-substituted before sending
 
 ### Active testing
 - **Fuzzer** — mark a value in the raw editor with `§§`, open the Fuzzer, select payloads from presets / paste / file upload, fire sequentially with configurable delay; size anomaly detection flags responses deviating ≥20% from baseline; timing anomaly detection flags responses taking ≥2× the median elapsed time (surfaces blind time-based injection)
@@ -65,7 +65,7 @@ The MCP spec is young and implementations vary widely. Auth handling, input vali
 - **Session export / import** — export the full session (servers, schemas, history, findings, notes, triage status) to JSON and reload it later; use **Export Session** / **Import Session** in the top toolbar
 - **Request history** — every call is logged with method, args, status, and elapsed time; filter by tool name, server, or args; replay any entry, export as JSON or Markdown
 - **Custom request headers** — set arbitrary headers per server (e.g. `X-API-Key`, `X-Tenant-ID`) sent on every request alongside the Bearer token; shown as a green **hdrs** badge in the sidebar
-- **HTTP/SOCKS proxy support** — route traffic per-server through Burp Suite or any HTTP/SOCKS proxy
+- **HTTP/SOCKS proxy support** — route traffic per-server through any HTTP/SOCKS proxy (e.g. for traffic inspection)
 
 ### UI
 - **Resizable panes** — all four column panels and the history row are drag-resizable; layout persists in localStorage
@@ -90,18 +90,33 @@ Then open [http://localhost:8000](http://localhost:8000) in your browser.
 ### Options
 
 ```
-python3 mcpoke.py [--port PORT] [--host HOST]
+python3 mcpoke.py [--port PORT] [--host HOST] [--project PATH]
 
-  -p, --port PORT   Port to listen on (default: 8000)
-      --host HOST   Host to bind to (default: 127.0.0.1)
+  -p, --port PORT     Port to listen on (default: 8000)
+      --host HOST     Host to bind to (default: 127.0.0.1)
+  -P, --project PATH  Project file to open on startup (.mcpoke)
 ```
 
 Examples:
 
 ```bash
 python3 mcpoke.py -p 9090                     # custom port
-python3 mcpoke.py --host 0.0.0.0 --port 8080  # listen on all interfaces
+python3 mcpoke.py --host 0.0.0.0 --port 8080  # listen on all interfaces (see below)
+python3 mcpoke.py --project ~/engagements/client.mcpoke  # open existing project
 ```
+
+#### Network exposure and token auth
+
+By default MCPoke binds to `127.0.0.1` — only your local machine can reach it and no authentication is required.
+
+When you bind to a non-loopback address (e.g. `--host 0.0.0.0`), MCPoke automatically generates a random session token and prints the full URL to the terminal:
+
+```
+WARNING: MCPoke is binding to 0.0.0.0 — token auth is required.
+MCPoke running at http://0.0.0.0:8000/?token=<generated-token>
+```
+
+Open that URL in your browser. All API calls are authenticated automatically — the token is embedded in the page and sent with every request via a JS fetch interceptor. Requests without a valid token receive a `401` response. A new token is generated on every startup.
 
 SOCKS proxy support (`aiohttp-socks`) is included in `requirements.txt` and installed automatically.
 
@@ -109,7 +124,7 @@ SOCKS proxy support (`aiohttp-socks`) is included in `requirements.txt` and inst
 
 ## Typical testing flow
 
-1. **Connect** — enter the server URL (or command for stdio), optional Bearer token, optional Burp proxy. MCPoke auto-detects HTTP vs SSE.
+1. **Connect** — enter the server URL (or command for stdio), optional Bearer token, optional proxy. MCPoke auto-detects HTTP vs SSE.
 
 2. **Review the Overview tab** — passive scanning runs immediately on connect. Check for injection risks in tool descriptions, dangerous capability flags, and transport issues before touching anything.
 
@@ -267,9 +282,9 @@ X-Tenant: myorg
 
 Headers are sent on every request to that server — connect, send, fuzz, auth test, race, and history fuzzer. If you also set a Bearer token, the `Authorization` header always takes priority. A green **hdrs** badge appears in the sidebar when headers are configured; hovering shows the header names. Custom headers are restored into the form when you click a cached server entry to reconnect.
 
-### Proxy (Burp Suite)
+### Proxy
 
-Set the proxy field per-server to `http://127.0.0.1:8080` to route all traffic for that server through Burp. The proxy badge appears in the sidebar.
+Set the proxy field per-server to route all traffic for that server through an HTTP proxy (e.g. `http://127.0.0.1:8080` for a local intercepting proxy) The proxy badge appears in the sidebar.
 
 ### OAuth 2.0 / PKCE probe
 
