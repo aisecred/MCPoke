@@ -8918,9 +8918,10 @@ if __name__ == "__main__":
         API_TOKEN = secrets.token_urlsafe(16)
         print(
             f"WARNING: MCPoke is binding to {args.host} — token auth is required.",
-            file=sys.stderr
+            file=sys.stderr, flush=True
         )
-        print(f"MCPoke running at http://{args.host}:{args.port}/?token={API_TOKEN}")
+        print(f"MCPoke running at http://{args.host}:{args.port}/?token={API_TOKEN}", flush=True)
     else:
-        print(f"MCPoke running at http://{args.host}:{args.port}")
-    uvicorn.run("mcpoke:app", host=args.host, port=args.port, reload=False)
+        print(f"MCPoke running at http://{args.host}:{args.port}", flush=True)
+    # Pass app object directly so uvicorn uses this process's globals (including API_TOKEN)
+    uvicorn.run(app, host=args.host, port=args.port, reload=False)
