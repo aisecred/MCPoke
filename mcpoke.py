@@ -380,7 +380,8 @@ async def _probe_http(session: aiohttp.ClientSession, url: str,
                         "server_info": _extract_server_info(init_body),
                         "tools":     tools,
                         "resources": _extract_resources(res_body) or [],
-                        "prompts":   _extract_prompts(pmt_body)   or []}
+                        "prompts":   _extract_prompts(pmt_body)   or [],
+                        "no_init_probe": True}
 
     init_body, status = await _post_json(session, url, make_initialize(),
                                          extra_headers=extra_headers, proxy=proxy)
@@ -2371,6 +2372,7 @@ const S = {
   findingNotes:     JSON.parse(localStorage.getItem('mcpoke-finding-notes')     || '{}'),
   findingDismissed: new Set(JSON.parse(localStorage.getItem('mcpoke-finding-dismissed') || '[]')),
   histChecked: [],  // up to 2 history entry IDs selected for diff
+  pendingNoInitProbe: false,  // true when last injected preset was a no-init probe
 };
 
 let _projectActive = false;  // true once a project is selected/created
@@ -2636,6 +2638,7 @@ async function connectServer(url, token, proxy, customHeaders) {
       srv.resources       = data.resources || [];
       srv.prompts         = data.prompts   || [];
       srv.responseHeaders = data.response_headers || null;
+      srv.noInitProbe     = data.no_init_probe || false;
       srv.fromCache       = false;
       srv.certInfo        = null;
       const _preserved = (srv.findings || []).filter(f => ['auth-test','oauth-probe','cert'].includes(f.item));
@@ -4475,6 +4478,24 @@ function submitCustomFinding() {
   renderFindings();
 }
 
+function _addNoInitFinding(srv) {
+  if ((srv.findings || []).some(f => f.item === 'no-init-probe')) return;
+  const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  srv.findings = srv.findings || [];
+  srv.findings.push({
+    severity: 'medium',
+    category: 'Protocol',
+    server: srvShort,
+    item: 'no-init-probe',
+    detail: 'MCP-003: Server responded to tools/list without a prior initialize handshake — stateless session enforcement is missing',
+    remediation: 'Require clients to complete the initialize/initialized handshake before accepting any other method calls. Reject requests from sessions that have not completed initialization with JSON-RPC error -32600 (Invalid Request).',
+    source: 'auto',
+  });
+  srv.noInitProbe = true;
+  renderFindings();
+  debouncedSaveProject();
+}
+
 function deleteManualFinding(id) {
   if (!confirm('Delete this finding?')) return;
   for (const srv of Object.values(S.servers)) {
@@ -4569,6 +4590,18 @@ function scanServerFindings(srv) {
   // findings (auth-test, oauth-probe, cert) so a reconnect doesn't wipe them.
   const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
   const rows = [];
+
+  // MCP-003: responds to tool calls without initialize handshake
+  if (srv.noInitProbe) {
+    rows.push({
+      severity: 'medium',
+      category: 'Protocol',
+      server: srvShort,
+      item: 'no-init-probe',
+      detail: 'MCP-003: Server responded to tools/list without a prior initialize handshake — stateless session enforcement is missing',
+      remediation: 'Require clients to complete the initialize/initialized handshake before accepting any other method calls. Reject requests from sessions that have not completed initialization with JSON-RPC error -32600 (Invalid Request).',
+    });
+  }
 
   // Plaintext transport
   if (/^http:\/\//i.test(srv.url)) {
@@ -5353,7 +5386,13 @@ function selectResource(idx) {
   document.getElementById('raw-editor').value = JSON.stringify(payload, null, 2);
   attachNotes('resource', res.uri || res.name);
   updateFuzzBtn();
-  setMode('raw');
+  // Set raw mode without calling setMode() — that triggers syncFormToRaw() which
+  // overwrites the editor with a tools/call skeleton.
+  S.rawMode = true;
+  document.getElementById('mode-form').classList.remove('active');
+  document.getElementById('mode-raw').classList.add('active');
+  document.getElementById('form-pane').style.display = 'none';
+  document.getElementById('raw-pane').style.display  = 'block';
 }
 
 function selectPrompt(idx) {
@@ -5453,7 +5492,14 @@ function syncRawToForm() {
 function formatRawEditor() {
   const el = document.getElementById('raw-editor');
   try { el.value = JSON.stringify(JSON.parse(el.value), null, 2); }
-  catch { showError('Cannot format — invalid JSON'); }
+  catch (e) {
+    const pos = parseInt((e.message.match(/position (\d+)/) || [])[1]);
+    if (!isNaN(pos)) {
+      el.focus();
+      el.setSelectionRange(pos, pos + 1);
+    }
+    showError('JSON error: ' + e.message);
+  }
 }
 
 // ── OOB callback URL ───────────────────────────────────────────────────────
@@ -5513,6 +5559,29 @@ function substituteOobInEditor() {
 // ── Protocol edge-case presets ─────────────────────────────────────────────
 
 const PROTOCOL_PRESETS = [
+  // ── Enumeration ──────────────────────────────────────────────────────────
+  {
+    label: 'Enumerate: tools/list',
+    hint:  'list all tools exposed by the server',
+    payload: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
+  },
+  {
+    label: 'Enumerate: resources/list',
+    hint:  'list all resources exposed by the server',
+    payload: {"jsonrpc":"2.0","id":1,"method":"resources/list","params":{}},
+  },
+  {
+    label: 'Enumerate: prompts/list',
+    hint:  'list all prompts exposed by the server',
+    payload: {"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{}},
+  },
+  {
+    label: 'MCP-003: No-init probe (tools/list)',
+    hint:  'send tools/list in a fresh session without initialize — if the server responds with a result (not an error), MCP-003 is confirmed and added to findings',
+    payload: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
+    noInitProbe: true,
+  },
+  // ── Protocol edge cases ──────────────────────────────────────────────────
   {
     label: 'Wrong protocolVersion',
     hint:  'initialize with an unknown future version — server should reject',
@@ -5657,6 +5726,7 @@ function injectProtocolPreset(idx) {
   if (!preset) return;
   setMode('raw');
   document.getElementById('raw-editor').value = applyOobUrl(JSON.stringify(preset.payload, null, 2));
+  S.pendingNoInitProbe = preset.noInitProbe || false;
 }
 
 // ── Form generation ────────────────────────────────────────────────────────
@@ -5909,6 +5979,11 @@ async function doSend() {
     const sensitiveHits = showResponse(body, elapsed, args);
     addHistory(srv.url, toolName, args, body, isErr, elapsed, sensitiveHits, S.rawMode ? fetchBody.payload : null);
     addNotifications(srv.url, body?.notifications);
+    // MCP-003: if this was a manual no-init probe and got a valid result, add finding
+    if (S.pendingNoInitProbe) {
+      S.pendingNoInitProbe = false;
+      if (!isErr && body?.result && !body.result?.error) _addNoInitFinding(srv);
+    }
   } catch (e) {
     showError(`Send failed: ${e.message}`);
   } finally {
@@ -6278,6 +6353,7 @@ function buildProjectData() {
     transport: srv.transport, serverInfo: srv.serverInfo,
     tools: srv.tools, resources: srv.resources, prompts: srv.prompts,
     findings: srv.findings || [], lastSeen: srv.lastSeen,
+    noInitProbe: srv.noInitProbe || false,
   }));
   return {
     version: 2,
@@ -6615,6 +6691,7 @@ function restoreSessionData(session) {
     srv.prompts      = s.prompts      || [];
     srv.findings     = s.findings     || [];
     srv.lastSeen     = s.lastSeen     || null;
+    srv.noInitProbe  = s.noInitProbe  || false;
     srv.fromCache    = true;
     S.servers[s.url] = srv;
   }
@@ -7374,6 +7451,7 @@ function openFuzzModal(preselectedCat) {
             <button class="tab-btn active" id="fsrc-presets" onclick="switchFuzzSrc('presets')">Presets</button>
             <button class="tab-btn"        id="fsrc-paste"   onclick="switchFuzzSrc('paste')">Paste</button>
             <button class="tab-btn"        id="fsrc-file"    onclick="switchFuzzSrc('file')">File</button>
+            <button class="tab-btn"        id="fsrc-numbers" onclick="switchFuzzSrc('numbers')">Numbers</button>
           </div>
           <div class="fuzz-payload-area">
             <div id="fuzz-presets-pane" style="display:none">
@@ -7392,6 +7470,21 @@ function openFuzzModal(preselectedCat) {
                 <input type="file" id="fuzz-file-inp" accept=".txt" style="display:none">
                 <div id="fuzz-file-info" class="empty">No file loaded</div>
               </div>
+            </div>
+            <div id="fuzz-numbers-pane" style="display:none;flex-direction:column;gap:.4rem;padding:.4rem">
+              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.4rem;align-items:center">
+                <label style="font-size:11px;color:var(--muted)">From</label>
+                <label style="font-size:11px;color:var(--muted)">To</label>
+                <label style="font-size:11px;color:var(--muted)">Step</label>
+                <input type="number" id="fuzz-num-from" value="0" style="font-family:monospace;font-size:11px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:3px;padding:.2rem .3rem">
+                <input type="number" id="fuzz-num-to"   value="100" style="font-family:monospace;font-size:11px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:3px;padding:.2rem .3rem">
+                <input type="number" id="fuzz-num-step" value="1" min="1" style="font-family:monospace;font-size:11px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:3px;padding:.2rem .3rem">
+              </div>
+              <div style="display:flex;align-items:center;gap:.5rem">
+                <label style="font-size:11px;color:var(--muted)">Min width (zero-pad)</label>
+                <input type="number" id="fuzz-num-pad" value="0" min="0" max="20" style="width:50px;font-family:monospace;font-size:11px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:3px;padding:.2rem .3rem">
+              </div>
+              <div id="fuzz-num-preview" style="font-size:11px;color:var(--muted);font-family:monospace"></div>
             </div>
           </div>
           <div class="fuzz-settings">
@@ -7841,12 +7934,43 @@ function initAuthResizer() {
 
 function switchFuzzSrc(src) {
   _fuzzSrc = src;
-  ['presets','paste','file'].forEach(s => {
+  ['presets','paste','file','numbers'].forEach(s => {
     document.getElementById('fsrc-' + s)?.classList.toggle('active', s === src);
     const pane = document.getElementById('fuzz-' + s + '-pane');
     if (pane) pane.style.display = s === src ? 'flex' : 'none';
   });
+  if (src === 'numbers') _updateNumPreview();
 }
+
+function _genNumberPayloads() {
+  const from = parseFloat(document.getElementById('fuzz-num-from')?.value ?? 0);
+  const to   = parseFloat(document.getElementById('fuzz-num-to')?.value   ?? 100);
+  const step = parseFloat(document.getElementById('fuzz-num-step')?.value ?? 1);
+  const pad  = parseInt(document.getElementById('fuzz-num-pad')?.value    ?? 0);
+  if (isNaN(from) || isNaN(to) || isNaN(step) || step <= 0) return [];
+  const out = [];
+  const limit = 100000;
+  for (let v = from; (step > 0 ? v <= to : v >= to) && out.length < limit; v = Math.round((v + step) * 1e10) / 1e10) {
+    const s = String(v);
+    out.push(pad > 0 ? s.replace(/^(-?)/, (_, sign) => sign + s.replace(/^-?/, '').padStart(pad, '0')) : s);
+  }
+  return out;
+}
+
+function _updateNumPreview() {
+  const pls = _genNumberPayloads();
+  const el = document.getElementById('fuzz-num-preview');
+  if (!el) return;
+  if (!pls.length) { el.textContent = 'No payloads — check step > 0 and valid range'; return; }
+  const preview = pls.slice(0, 5).join(', ') + (pls.length > 5 ? ` … ${pls[pls.length-1]}` : '');
+  el.textContent = `${pls.length} payloads: ${preview}`;
+}
+
+// Live preview updates for number inputs
+document.addEventListener('input', e => {
+  if (['fuzz-num-from','fuzz-num-to','fuzz-num-step','fuzz-num-pad'].includes(e.target.id))
+    _updateNumPreview();
+});
 
 function loadFuzzPreset(cat) {
   const ta = document.getElementById('fuzz-payload-ta');
@@ -7854,7 +7978,8 @@ function loadFuzzPreset(cat) {
 }
 
 function getFuzzPayloads() {
-  if (_fuzzSrc === 'file')   return _fuzzFilePls;
+  if (_fuzzSrc === 'file')    return _fuzzFilePls;
+  if (_fuzzSrc === 'numbers') return _genNumberPayloads();
   if (_fuzzSrc === 'paste') {
     const ta = document.getElementById('fuzz-paste-ta');
     return ta ? ta.value.split('\n').map(l => l.trim()).filter(l => l.length > 0) : [];
@@ -8406,6 +8531,8 @@ function openHistFuzzModal(histId) {
               onclick="switchHistFuzzSrc('presets')">Presets</button>
             <button class="hfuzz-src-tab" id="intr-tab-paste"
               onclick="switchHistFuzzSrc('paste')">Paste list</button>
+            <button class="hfuzz-src-tab" id="intr-tab-numbers"
+              onclick="switchHistFuzzSrc('numbers')">Numbers</button>
           </div>
           <div class="hfuzz-source-pane" id="intr-src-pane"></div>
           <div style="border-top:1px solid var(--border);overflow-y:auto;flex:1">
@@ -8527,6 +8654,26 @@ function renderHistFuzzSrc() {
         placeholder="payload1&#10;payload2&#10;..."></textarea>`;
     return;
   }
+  if (_hfuzzState.srcTab === 'numbers') {
+    const inp = s => `style="font-family:monospace;font-size:11px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:3px;padding:.2rem .3rem;${s||''}"`;
+    pane.innerHTML = `
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.4rem;align-items:center;margin-bottom:.4rem">
+        <label style="font-size:11px;color:var(--muted)">From</label>
+        <label style="font-size:11px;color:var(--muted)">To</label>
+        <label style="font-size:11px;color:var(--muted)">Step</label>
+        <input type="number" id="intr-num-from" value="0" ${inp()}>
+        <input type="number" id="intr-num-to"   value="100" ${inp()}>
+        <input type="number" id="intr-num-step" value="1" min="1" ${inp()}>
+      </div>
+      <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.4rem">
+        <label style="font-size:11px;color:var(--muted)">Min width (zero-pad)</label>
+        <input type="number" id="intr-num-pad" value="0" min="0" max="20" ${inp('width:50px')}>
+      </div>
+      <div id="intr-num-preview" style="font-size:11px;color:var(--muted);font-family:monospace"></div>`;
+    pane.querySelectorAll('input').forEach(el => el.addEventListener('input', _updateIntrNumPreview));
+    _updateIntrNumPreview();
+    return;
+  }
   // Presets tab
   const cats = Object.keys(PAYLOAD_PRESETS);
   pane.innerHTML = `
@@ -8573,11 +8720,36 @@ function selectHistFuzzPayload(pl) {
   showHistFuzzCatPreview(_hfuzzState.selectedCat);
 }
 
+function _genIntrNumberPayloads() {
+  const from = parseFloat(document.getElementById('intr-num-from')?.value ?? 0);
+  const to   = parseFloat(document.getElementById('intr-num-to')?.value   ?? 100);
+  const step = parseFloat(document.getElementById('intr-num-step')?.value ?? 1);
+  const pad  = parseInt(document.getElementById('intr-num-pad')?.value    ?? 0);
+  if (isNaN(from) || isNaN(to) || isNaN(step) || step <= 0) return [];
+  const out = [];
+  const limit = 100000;
+  for (let v = from; (step > 0 ? v <= to : v >= to) && out.length < limit; v = Math.round((v + step) * 1e10) / 1e10) {
+    const s = String(v);
+    out.push(pad > 0 ? s.replace(/^(-?)/, (_, sign) => sign + s.replace(/^-?/, '').padStart(pad, '0')) : s);
+  }
+  return out;
+}
+
+function _updateIntrNumPreview() {
+  const pls = _genIntrNumberPayloads();
+  const el = document.getElementById('intr-num-preview');
+  if (!el) return;
+  if (!pls.length) { el.textContent = 'No payloads — check step > 0 and valid range'; return; }
+  const preview = pls.slice(0, 5).join(', ') + (pls.length > 5 ? ` … ${pls[pls.length-1]}` : '');
+  el.textContent = `${pls.length} payloads: ${preview}`;
+}
+
 function getHistFuzzPayloads() {
   if (_hfuzzState.srcTab === 'paste') {
     const txt = document.getElementById('intr-paste')?.value || '';
     return txt.split('\n').map(l=>l.trim()).filter(Boolean);
   }
+  if (_hfuzzState.srcTab === 'numbers') return _genIntrNumberPayloads();
   if (_hfuzzState.selectedPayload !== null) return [_hfuzzState.selectedPayload];
   return PAYLOAD_PRESETS[_hfuzzState.selectedCat] || [];
 }
