@@ -1658,8 +1658,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   color:var(--muted); padding:.1rem 0; border-top:1px solid var(--border); margin-top:.15rem; }
 .ov-cat-name { flex:1; }
 .ov-cat-count { font-weight:700; color:var(--fg); }
-.ov-cap-row { display:flex; align-items:flex-start; gap:.4rem; font-size:10px; margin:.2rem 0; }
-.ov-cap-tip { flex:1; color:var(--muted); font-size:10px; line-height:1.3; }
+.ov-cap-row { display:flex; flex-direction:column; gap:.15rem; margin:.3rem 0; }
+.ov-cap-tip { color:var(--muted); font-size:10px; line-height:1.4; white-space:normal; word-break:break-word; }
 /* Add finding modal */
 #af-overlay { position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.65); }
 #af-modal {
@@ -1953,6 +1953,10 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 }
 .fuzz-pl  { font-family: monospace; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fuzz-pre { color: var(--muted); font-family: monospace; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 600px; }
+.fuzz-sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+.fuzz-sortable:hover { color: var(--accent); }
+.fuzz-sortable.sort-asc::after  { content: ' ▲'; font-size: 9px; }
+.fuzz-sortable.sort-desc::after { content: ' ▼'; font-size: 9px; }
 
 /* ── Race modal ── */
 #race-overlay { position:fixed;inset:0;z-index:2000;background:rgba(0,0,0,.65); }
@@ -5227,7 +5231,7 @@ function renderOverview(srv) {
   // Capabilities card
   const capBody = capKeys.length ? capKeys.map(k => {
     const risk = CAP_RISKS[k] || {level:'info', label:k, tip:`Undocumented: ${k}`};
-    return `<div class="ov-cap-row"><span class="cap-${risk.level}">${esc(risk.label)}</span><span class="ov-cap-tip">${esc(risk.tip)}</span></div>`;
+    return `<div class="ov-cap-row" title="${esc(risk.tip)}"><span class="cap-${risk.level}">${esc(risk.label)}</span><span class="ov-cap-tip">${esc(risk.tip)}</span></div>`;
   }).join('') : '<div style="color:var(--muted);font-size:11px;padding:.25rem 0">No capabilities declared</div>';
 
   list.innerHTML = `<div class="ov-grid">
@@ -7189,6 +7193,7 @@ function showPayloadPicker(btn) {
     <div id="pp-main">
       <div class="pp-cats">
         ${confusionBtn}
+        <button class="pp-cat-btn" data-cat="__numbers__">Numbers</button>
         ${cats.map(c => `<button class="pp-cat-btn" data-cat="${esc(c)}">${esc(c)}</button>`).join('')}
         <button class="pp-cat-btn pp-file-btn" data-cat="__file__">Load file…</button>
       </div>
@@ -7234,6 +7239,25 @@ function showPayloadPicker(btn) {
 function showPickerCat(cat) {
   const pane = document.getElementById('pp-items');
   if (!pane) return;
+  if (cat === '__numbers__') {
+    const s = 'font-family:monospace;font-size:11px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:3px;padding:.2rem .3rem;width:100%';
+    pane.innerHTML = `
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.3rem;align-items:center;padding:.3rem">
+        <label style="font-size:10px;color:var(--muted)">From</label>
+        <label style="font-size:10px;color:var(--muted)">To</label>
+        <label style="font-size:10px;color:var(--muted)">Step</label>
+        <input type="text"   id="pp-num-from" value="0" placeholder="0000" style="${s}" oninput="_ppNumFromInput(this)">
+        <input type="number" id="pp-num-to"   value="100" style="${s}">
+        <input type="number" id="pp-num-step" value="1" min="1" style="${s}">
+      </div>
+      <div id="pp-num-hint" style="font-size:10px;color:var(--muted);padding:0 .3rem .2rem">
+        Tip: type <b>0000</b> to auto-generate all 4-digit codes (0000–9999).
+      </div>
+      <div style="padding:0 .3rem .4rem">
+        <button class="btn-sm btn-green" style="width:100%" onclick="runNumbersFromPicker()">&#9654; Execute</button>
+      </div>`;
+    return;
+  }
   let pls;
   if (cat === '__type_confusion__') {
     const ft = document.getElementById('payload-picker')?.dataset.fieldType || 'string';
@@ -7323,6 +7347,58 @@ function fuzzAllFromPicker() {
   if (!srv || srv.status !== 'connected') {
     showError('No active connected server'); return;
   }
+
+  // Numbers: open fuzzer modal and switch to Numbers tab with picker values pre-filled
+  if (cat === '__numbers__') {
+    const fromRaw = (document.getElementById('pp-num-from')?.value ?? '0').trim();
+    const fromNum = parseFloat(fromRaw);
+    const from    = String(isNaN(fromNum) ? 0 : fromNum);
+    const to      = document.getElementById('pp-num-to')?.value   ?? '100';
+    const step    = document.getElementById('pp-num-step')?.value ?? '1';
+    // Auto-detect zero-pad from leading zeros in the From field (e.g. "0000" → pad=4)
+    const pad     = /^-?0\d/.test(fromRaw) ? String(fromRaw.replace(/^-/, '').length) : '0';
+    const paramName = target.id?.replace(/^p-/, '') || null;
+    const payload = buildRawPayload();
+    if (!payload) { showError('No tool selected'); return; }
+    if (target.id === 'raw-args') {
+      let curArgs; try { curArgs = JSON.parse(target.value || '{}'); } catch { curArgs = {}; }
+      const firstStrKey = Object.keys(curArgs).find(k => typeof curArgs[k] === 'string');
+      payload.params.arguments = firstStrKey ? {...curArgs, [firstStrKey]: '§§'} : {value: '§§'};
+    } else if (paramName && payload.params?.arguments !== undefined) {
+      payload.params.arguments[paramName] = '§§';
+    }
+    closePayloadPicker();
+    setMode('raw');
+    document.getElementById('raw-editor').value = JSON.stringify(payload, null, 2);
+    openFuzzModal('__numbers__');
+    // Pre-fill numbers inputs after modal is in the DOM
+    const pf = v => { const el = document.getElementById(v[0]); if (el) el.value = v[1]; };
+    [['fuzz-num-from', from], ['fuzz-num-to', to], ['fuzz-num-step', step], ['fuzz-num-pad', pad]]
+      .forEach(pf);
+    switchFuzzSrc('numbers');
+    return;
+  }
+
+  // Type confusion: resolve payloads from the field's declared type
+  if (cat === '__type_confusion__') {
+    const ft = document.getElementById('payload-picker')?.dataset.fieldType || 'string';
+    const pls = TYPE_CONFUSION_PAYLOADS[ft] || [];
+    if (!pls.length) { showError('No type confusion payloads for type: ' + ft); return; }
+    const paramName2 = target.id?.replace(/^p-/, '') || null;
+    const payload2 = buildRawPayload();
+    if (!payload2) { showError('No tool selected'); return; }
+    if (paramName2 && payload2.params?.arguments !== undefined)
+      payload2.params.arguments[paramName2] = '§§';
+    closePayloadPicker();
+    setMode('raw');
+    document.getElementById('raw-editor').value = JSON.stringify(payload2, null, 2);
+    openFuzzModal();
+    switchFuzzSrc('paste');
+    const ta = document.getElementById('fuzz-paste-ta');
+    if (ta) ta.value = pls.map(p => JSON.stringify(p)).join('\n');
+    return;
+  }
+
   if (!PAYLOAD_PRESETS[cat]?.length) {
     showError('No payloads in category: ' + cat); return;
   }
@@ -7371,6 +7447,60 @@ function fuzzAllFromPicker() {
   openFuzzModal(cat);
 }
 
+function _ppNumFromInput(el) {
+  const v = el.value.trim();
+  const toEl   = document.getElementById('pp-num-to');
+  const hint   = document.getElementById('pp-num-hint');
+  if (/^-?0\d+$/.test(v)) {
+    // Leading zeros detected — auto-fill To with max for this digit width
+    const digits = v.replace(/^-/, '').length;
+    const max    = Math.pow(10, digits) - 1;
+    if (toEl) toEl.value = max;
+    if (hint) hint.innerHTML = `<b>${v}</b> → <b>${String(max).padStart(digits, '0')}</b> &nbsp;(${max + 1} values, zero-padded to ${digits} digits)`;
+  } else {
+    if (hint) hint.innerHTML = 'Tip: type <b>0000</b> to auto-generate all 4-digit codes (0000–9999).';
+  }
+}
+
+function runNumbersFromPicker() {
+  const target = _pickerTarget;
+  if (!target) return;
+  const srv = S.servers[S.activeUrl];
+  if (!srv || srv.status !== 'connected') { showError('No active connected server'); return; }
+
+  const fromRaw = (document.getElementById('pp-num-from')?.value ?? '0').trim();
+  const fromNum = parseFloat(fromRaw);
+  const from    = String(isNaN(fromNum) ? 0 : fromNum);
+  const to      = document.getElementById('pp-num-to')?.value   ?? '100';
+  const step    = document.getElementById('pp-num-step')?.value ?? '1';
+  const pad     = /^-?0\d/.test(fromRaw) ? String(fromRaw.replace(/^-/, '').length) : '0';
+
+  const paramName = target.id?.replace(/^p-/, '') || null;
+  const payload = buildRawPayload();
+  if (!payload) { showError('No tool selected'); return; }
+
+  if (target.id === 'raw-args') {
+    let curArgs; try { curArgs = JSON.parse(target.value || '{}'); } catch { curArgs = {}; }
+    const firstStrKey = Object.keys(curArgs).find(k => typeof curArgs[k] === 'string');
+    payload.params.arguments = firstStrKey ? {...curArgs, [firstStrKey]: '§§'} : {value: '§§'};
+  } else if (paramName && payload.params?.arguments !== undefined) {
+    payload.params.arguments[paramName] = '§§';
+  } else {
+    showError('Could not locate parameter — switch to Raw mode, mark with §§, then use Fuzzer');
+    return;
+  }
+
+  closePayloadPicker();
+  setMode('raw');
+  document.getElementById('raw-editor').value = JSON.stringify(payload, null, 2);
+  openFuzzModal('__numbers__');
+  // Fill number inputs and switch to Numbers tab
+  [['fuzz-num-from', from], ['fuzz-num-to', to], ['fuzz-num-step', step], ['fuzz-num-pad', pad]]
+    .forEach(([id, v]) => { const el = document.getElementById(id); if (el) el.value = v; });
+  switchFuzzSrc('numbers');
+  startFuzz();
+}
+
 document.addEventListener('click', e => {
   if (!document.getElementById('payload-picker')?.contains(e.target))
     closePayloadPicker();
@@ -7402,14 +7532,12 @@ function updateFuzzBtn() {
 let _fuzzStop    = false;
 let _fuzzSrc     = 'presets';
 let _fuzzFilePls = [];
-let _fuzzRows    = [];   // {n, pl, requestPayload, fullData, elapsed} per result row
+let _fuzzRows    = [];   // {n, pl, requestPayload, fullData, elapsed, size, isErr, preview, sizeAnomaly}
+let _fuzzSortCol = null;
+let _fuzzSortDir = 1;   // 1 = asc, -1 = desc
 
 function openFuzzModal(preselectedCat) {
   const raw = document.getElementById('raw-editor').value;
-  if (!raw.includes('§')) {
-    showError('No §§ markers — select a value and click § Mark');
-    return;
-  }
   const srv = S.servers[S.activeUrl];
   if (!srv || srv.status !== 'connected') { showError('No active connected server'); return; }
 
@@ -7423,14 +7551,14 @@ function openFuzzModal(preselectedCat) {
     }
     // Update marker preview
     const m = raw.match(/§([^§]*)§/);
-    const preview = m ? '§' + (m[1]||'').slice(0, 35) + '§' : '§§';
+    const preview = m ? '§' + (m[1]||'').slice(0, 35) + '§' : '(no §§ — use HTTP header mode)';
     const mi = document.querySelector('.fuzz-marker-info');
     if (mi) mi.textContent = preview;
     return;
   }
 
   const m = raw.match(/§([^§]*)§/);
-  const preview = m ? '§' + (m[1]||'').slice(0, 35) + '§' : '§§';
+  const preview = m ? '§' + (m[1]||'').slice(0, 35) + '§' : '(no §§ — use HTTP header mode)';
   const catOpts = Object.keys(PAYLOAD_PRESETS)
     .map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
 
@@ -7487,11 +7615,18 @@ function openFuzzModal(preselectedCat) {
               <div id="fuzz-num-preview" style="font-size:11px;color:var(--muted);font-family:monospace"></div>
             </div>
           </div>
-          <div class="fuzz-settings">
+          <div class="fuzz-settings" style="flex-wrap:wrap;gap:.4rem">
+            <label style="font-size:11px;color:var(--muted)">Inject into:</label>
+            <select id="fuzz-inject-target" style="font-size:11px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:3px;padding:.1rem .3rem" onchange="toggleFuzzHeaderRow(this.value)">
+              <option value="body">Body (§§ markers)</option>
+              <option value="header">HTTP header</option>
+            </select>
+            <input type="text" id="fuzz-header-name" placeholder="Header name, e.g. X-Forwarded-For"
+              style="display:none;font-size:11px;font-family:monospace;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:3px;padding:.1rem .4rem;min-width:200px">
+            <span style="flex:1"></span>
             <label>Delay:</label>
             <input type="number" id="fuzz-delay" value="0" min="0" max="60000">
             <span style="color:var(--muted);font-size:11px">ms</span>
-            <span style="flex:1"></span>
             <button class="btn-sm btn-green" id="fuzz-start-btn" onclick="startFuzz()">&#9654; Start</button>
             <button class="btn-sm" id="fuzz-stop-btn" disabled onclick="stopFuzz()">&#9632; Stop</button>
           </div>
@@ -7507,8 +7642,13 @@ function openFuzzModal(preselectedCat) {
           </div>
           <div style="overflow-y:auto;flex:1" id="fuzz-results-scroll">
             <table id="fuzz-tbl">
-              <thead><tr>
-                <th>#</th><th>Payload</th><th>Status</th><th>Time</th><th>Size</th><th>Response preview</th>
+              <thead><tr id="fuzz-thead-row">
+                <th class="fuzz-sortable" data-col="n">#</th>
+                <th class="fuzz-sortable" data-col="pl">Payload</th>
+                <th class="fuzz-sortable" data-col="status">Status</th>
+                <th class="fuzz-sortable" data-col="elapsed">Time</th>
+                <th class="fuzz-sortable" data-col="size">Size</th>
+                <th>Response preview</th>
               </tr></thead>
               <tbody id="fuzz-tbody"></tbody>
             </table>
@@ -7529,8 +7669,11 @@ function openFuzzModal(preselectedCat) {
       </div>
     </div>`;
 
+  _fuzzSortCol = null;
+  _fuzzSortDir = 1;
   document.body.appendChild(ov);
   ov.addEventListener('click', e => { if (e.target === ov) hideFuzzModal(); });
+  initFuzzSort();
 
   document.getElementById('fuzz-file-inp').addEventListener('change', function() {
     const file = this.files[0];
@@ -7932,6 +8075,11 @@ function initAuthResizer() {
   }
 }
 
+function toggleFuzzHeaderRow(val) {
+  const inp = document.getElementById('fuzz-header-name');
+  if (inp) inp.style.display = val === 'header' ? '' : 'none';
+}
+
 function switchFuzzSrc(src) {
   _fuzzSrc = src;
   ['presets','paste','file','numbers'].forEach(s => {
@@ -7952,7 +8100,8 @@ function _genNumberPayloads() {
   const limit = 100000;
   for (let v = from; (step > 0 ? v <= to : v >= to) && out.length < limit; v = Math.round((v + step) * 1e10) / 1e10) {
     const s = String(v);
-    out.push(pad > 0 ? s.replace(/^(-?)/, (_, sign) => sign + s.replace(/^-?/, '').padStart(pad, '0')) : s);
+    const neg = s.startsWith('-');
+    out.push(pad > 0 ? (neg ? '-' : '') + (neg ? s.slice(1) : s).padStart(pad, '0') : s);
   }
   return out;
 }
@@ -7994,15 +8143,13 @@ function fmtBytes(n) {
   return (n / 1024).toFixed(1) + ' KB';
 }
 
-function addFuzzRow(n, pl, isErr, elapsed, preview, fullData, size, sizeAnomaly, requestPayload) {
-  const tbody = document.getElementById('fuzz-tbody');
-  if (!tbody) return;
-  const idx = n - 1;
-  _fuzzRows[idx] = {n, pl, requestPayload, fullData, elapsed};
-  const tr = document.createElement('tr');
-  if (fullData) tr.className = 'clickable';
+function _buildFuzzTr(row) {
+  const {n, pl, fullData, isErr, elapsed, size, sizeAnomaly, preview} = row;
+  const idx       = n - 1;
   const sizeStyle = sizeAnomaly ? 'color:#ffa657;font-weight:600' : 'color:var(--muted)';
   const sizeTip   = sizeAnomaly ? ` title="Size differs from baseline (${sizeAnomaly})"` : '';
+  const tr = document.createElement('tr');
+  if (fullData) tr.className = 'clickable';
   tr.dataset.fuzzIdx = idx;
   tr.innerHTML = `
     <td style="color:var(--muted);white-space:nowrap">${n}</td>
@@ -8015,8 +8162,65 @@ function addFuzzRow(n, pl, isErr, elapsed, preview, fullData, size, sizeAnomaly,
     tr.addEventListener('click', () => showFuzzDetail(idx));
     tr.addEventListener('dblclick', () => openFuzzDetailPopup(idx));
   }
-  tbody.appendChild(tr);
-  tr.scrollIntoView({block: 'nearest'});
+  return tr;
+}
+
+function addFuzzRow(n, pl, isErr, elapsed, preview, fullData, size, sizeAnomaly, requestPayload) {
+  const tbody = document.getElementById('fuzz-tbody');
+  if (!tbody) return;
+  const idx = n - 1;
+  _fuzzRows[idx] = {n, pl, requestPayload, fullData, elapsed, size, isErr, preview, sizeAnomaly};
+  if (_fuzzSortCol) {
+    // Re-render entire table in current sort order when sorting is active
+    renderFuzzTable();
+  } else {
+    const tr = _buildFuzzTr(_fuzzRows[idx]);
+    tbody.appendChild(tr);
+    tr.scrollIntoView({block: 'nearest'});
+  }
+}
+
+function renderFuzzTable() {
+  const tbody = document.getElementById('fuzz-tbody');
+  if (!tbody) return;
+  const rows = [..._fuzzRows].filter(Boolean);
+  if (_fuzzSortCol) {
+    rows.sort((a, b) => {
+      let av, bv;
+      if (_fuzzSortCol === 'n')       { av = a.n;       bv = b.n; }
+      else if (_fuzzSortCol === 'pl') { av = a.pl;      bv = b.pl; }
+      else if (_fuzzSortCol === 'elapsed') { av = a.elapsed; bv = b.elapsed; }
+      else if (_fuzzSortCol === 'size')    { av = a.size;    bv = b.size; }
+      else if (_fuzzSortCol === 'status')  {
+        av = a.fullData?.status ?? (a.isErr ? -1 : 0);
+        bv = b.fullData?.status ?? (b.isErr ? -1 : 0);
+      }
+      if (av < bv) return -_fuzzSortDir;
+      if (av > bv) return  _fuzzSortDir;
+      return 0;
+    });
+  }
+  tbody.innerHTML = '';
+  rows.forEach(row => tbody.appendChild(_buildFuzzTr(row)));
+}
+
+function initFuzzSort() {
+  document.querySelectorAll('#fuzz-thead-row .fuzz-sortable').forEach(th => {
+    th.addEventListener('click', () => {
+      const col = th.dataset.col;
+      if (_fuzzSortCol === col) {
+        _fuzzSortDir *= -1;
+      } else {
+        _fuzzSortCol = col;
+        _fuzzSortDir = 1;
+      }
+      document.querySelectorAll('#fuzz-thead-row .fuzz-sortable').forEach(h => {
+        h.classList.remove('sort-asc', 'sort-desc');
+      });
+      th.classList.add(_fuzzSortDir === 1 ? 'sort-asc' : 'sort-desc');
+      renderFuzzTable();
+    });
+  });
 }
 
 function showFuzzDetail(idx) {
@@ -8111,14 +8315,24 @@ async function startFuzz() {
   const srv = S.servers[S.activeUrl];
   if (!srv) return;
   const rawTemplate = document.getElementById('raw-editor').value;
-  if (!rawTemplate.includes('§')) {
+  const injectTarget = document.getElementById('fuzz-inject-target')?.value || 'body';
+  const headerName   = (document.getElementById('fuzz-header-name')?.value || '').trim();
+
+  if (injectTarget === 'body' && !rawTemplate.includes('§')) {
     showError('No §§ markers in raw editor'); return;
   }
+  if (injectTarget === 'header' && !headerName) {
+    showError('Enter a header name to inject into (e.g. X-Forwarded-For)'); return;
+  }
+
   const payloads = getFuzzPayloads();
   if (!payloads.length) { showError('No payloads to fuzz with'); return; }
 
   _fuzzStop = false;
   _fuzzRows = [];
+  _fuzzSortCol = null;
+  _fuzzSortDir = 1;
+  document.querySelectorAll('#fuzz-thead-row .fuzz-sortable').forEach(h => h.classList.remove('sort-asc','sort-desc'));
   document.getElementById('fuzz-start-btn').disabled = true;
   document.getElementById('fuzz-stop-btn').disabled  = false;
   document.getElementById('fuzz-tbody').innerHTML    = '';
@@ -8130,30 +8344,46 @@ async function startFuzz() {
   const delay = parseInt(document.getElementById('fuzz-delay').value) || 0;
   let baselineSize = null;   // first successful response size
 
+  // Parse base body once for header-injection mode (body never changes)
+  let headerModeBody = null;
+  if (injectTarget === 'header') {
+    try { headerModeBody = JSON.parse(rawTemplate); }
+    catch { showError('Raw editor must contain valid JSON for header injection mode'); return; }
+  }
+
   for (let i = 0; i < payloads.length; i++) {
     if (_fuzzStop) break;
     const n  = i + 1;
     const pl = payloads[i];
     document.getElementById('fuzz-prog-txt').textContent = `${n} / ${payloads.length}`;
 
-    // Escape payload as a JSON string value, then substitute
-    const escaped = pl.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
-                      .replace(/\n/g, '\\n').replace(/\r/g, '\\r')
-                      .replace(/\t/g, '\\t')
-                      .replace(/[\x00-\x1f\x7f]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4,'0')}`);
-    const filled = rawTemplate.replace(/§[^§]*§/g, escaped);
+    let parsed, requestOverride = null;
 
-    let parsed;
-    try { parsed = JSON.parse(filled); }
-    catch {
-      addFuzzRow(n, pl, true, 0,
-        'Template produced invalid JSON — ensure §§ is inside a string value', null, null, null, null);
-      continue;
+    if (injectTarget === 'header') {
+      parsed = headerModeBody;
+      // Merge payload into custom headers; preserve any existing server headers
+      requestOverride = {custom_headers: {...(srv.customHeaders || {}), [headerName]: pl}};
+    } else {
+      // Escape payload as a JSON string value, then substitute
+      const escaped = pl.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+                        .replace(/\n/g, '\\n').replace(/\r/g, '\\r')
+                        .replace(/\t/g, '\\t')
+                        .replace(/[\x00-\x1f\x7f]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4,'0')}`);
+      const filled = rawTemplate.replace(/§[^§]*§/g, escaped);
+      try { parsed = JSON.parse(filled); }
+      catch {
+        addFuzzRow(n, pl, true, 0,
+          'Template produced invalid JSON — ensure §§ is inside a string value', null, null, null, null);
+        continue;
+      }
     }
 
     const t0 = Date.now();
     try {
-      const res  = await rawFetch(srv, parsed);
+      const fetchOpts = requestOverride
+        ? {...srv, customHeaders: requestOverride.custom_headers}
+        : srv;
+      const res  = await rawFetch(fetchOpts, parsed);
       const raw     = await res.text();
       const data    = JSON.parse(raw);
       const elapsed = Date.now() - t0;
@@ -8169,8 +8399,11 @@ async function startFuzz() {
         if (pct >= 20) sizeAnomaly = `baseline ${fmtBytes(baselineSize)}, delta ${delta > 0 ? '+' : ''}${delta} B (${delta > 0 ? '+' : ''}${pct}%)`;
       }
 
-      addFuzzRow(n, pl, isErr, elapsed, preview, data, size, sizeAnomaly, parsed);
-      addHistory(srv.url, `fuzz:${parsed?.method || '?'}`, {payload: pl}, data, isErr, elapsed);
+      const reqLabel = injectTarget === 'header'
+        ? {...parsed, _fuzzHeader: {[headerName]: pl}}
+        : parsed;
+      addFuzzRow(n, pl, isErr, elapsed, preview, data, size, sizeAnomaly, reqLabel);
+      addHistory(srv.url, `fuzz:${parsed?.method || '?'}`, {payload: pl, ...(injectTarget === 'header' ? {header: headerName} : {})}, data, isErr, elapsed);
     } catch(e) {
       addFuzzRow(n, pl, true, Date.now() - t0, e.message, null, null, null, null);
     }
@@ -8730,7 +8963,8 @@ function _genIntrNumberPayloads() {
   const limit = 100000;
   for (let v = from; (step > 0 ? v <= to : v >= to) && out.length < limit; v = Math.round((v + step) * 1e10) / 1e10) {
     const s = String(v);
-    out.push(pad > 0 ? s.replace(/^(-?)/, (_, sign) => sign + s.replace(/^-?/, '').padStart(pad, '0')) : s);
+    const neg = s.startsWith('-');
+    out.push(pad > 0 ? (neg ? '-' : '') + (neg ? s.slice(1) : s).padStart(pad, '0') : s);
   }
   return out;
 }
