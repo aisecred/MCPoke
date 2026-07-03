@@ -115,6 +115,31 @@ def _http_proxy(proxy: Optional[str]) -> Optional[str]:
     return None
 
 
+async def _get_request(
+    session:       aiohttp.ClientSession,
+    url:           str,
+    timeout_sec:   float          = READ_TIMEOUT,
+    extra_headers: Optional[dict] = None,
+    proxy:         Optional[str]  = None,
+) -> tuple[Optional[str], int]:
+    """GET request returning raw response text (not JSON-decoded)."""
+    headers = {"Accept": "*/*"}
+    if extra_headers:
+        headers.update(extra_headers)
+    try:
+        to = aiohttp.ClientTimeout(connect=CONNECT_TIMEOUT, sock_read=timeout_sec)
+        kw: dict = dict(headers=headers, timeout=to, allow_redirects=True)
+        if _http_proxy(proxy):
+            kw["proxy"] = _http_proxy(proxy)
+        async with session.get(url, **kw) as resp:
+            text = await _read_bounded(resp)
+            return text, resp.status
+    except aiohttp.ClientConnectorSSLError:
+        return None, -1
+    except Exception:
+        return None, 0
+
+
 async def _post_json(
     session:       aiohttp.ClientSession,
     url:           str,
@@ -575,9 +600,10 @@ class RawRequest(BaseModel):
     url:            str
     token:          Optional[str]  = None
     auth_header:    Optional[str]  = None  # verbatim Authorization value; "" = no auth
+    method:         str            = "POST"
     transport:      Literal["http", "sse"] = "http"
     proxy:          Optional[str]  = None
-    payload:        dict
+    payload:        Optional[dict] = None
     custom_headers: Optional[dict] = None
 
     @field_validator("url")
@@ -625,7 +651,19 @@ async def raw_call(req: RawRequest):
     except RuntimeError as e:
         return {"error": str(e)}
     async with session_ctx as session:
-        if req.transport == "sse":
+        method = req.method.upper()
+        if method == "GET":
+            raw_text, status = await _get_request(session, req.url,
+                                                  extra_headers=extra_headers,
+                                                  proxy=req.proxy)
+            if raw_text is None:
+                return {"error": f"HTTP {status} — no response", "status": status}
+            try:
+                parsed = json.loads(raw_text)
+            except json.JSONDecodeError:
+                parsed = raw_text
+            return {"status": status, "result": parsed, "raw": raw_text}
+        elif req.transport == "sse":
             async with SSESession(session, req.url,
                                   extra_headers=extra_headers,
                                   proxy=req.proxy) as sse:
@@ -2213,7 +2251,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
         </div>
         <div class="mode-bar">
           <button class="mode-btn active" id="mode-form" onclick="setMode('form')">Form</button>
-          <button class="mode-btn"        id="mode-raw"  onclick="setMode('raw')">Raw</button>
+          <button class="mode-btn"        id="mode-raw"  onclick="setMode('raw')">Raw JSON</button>
+          <button class="mode-btn"        id="mode-http" onclick="setMode('http')">Raw HTTP</button>
         </div>
         <!-- Form mode -->
         <div id="form-pane">
@@ -2231,6 +2270,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
             <button class="btn-sm" id="fuzz-btn" style="display:none" onclick="toggleFuzzer()" title="Show / hide Fuzzer">&#9889; Fuzz</button>
             <button class="btn-sm" id="auth-test-btn" onclick="openAuthTestModal()" title="Test auth bypass variations">&#9919; Auth</button>
             <button class="btn-sm" id="race-btn" onclick="openRaceModal()" title="Fire concurrent requests to test for race conditions">&#9651; Race</button>
+            <button class="btn-sm" id="probe-btn" onclick="openProbeModal()" title="Probe common info-disclosure paths via GET">&#128269; Probe</button>
             <button class="btn-sm" id="oauth-btn" onclick="openOAuthModal()" title="Probe OAuth 2.0 / PKCE implementation">OAuth</button>
             <button class="btn-sm" onclick="substituteOobInEditor()" title="Replace placeholder domains with your OOB URL">Sub OOB</button>
             <div style="position:relative">
@@ -2373,6 +2413,7 @@ const S = {
   history: [],
   notifications: [],
   rawMode: false,
+  httpMode: false,
   findingStatus:    JSON.parse(localStorage.getItem('mcpoke-finding-status')    || '{}'),
   findingNotes:     JSON.parse(localStorage.getItem('mcpoke-finding-notes')     || '{}'),
   findingDismissed: new Set(JSON.parse(localStorage.getItem('mcpoke-finding-dismissed') || '[]')),
@@ -5509,11 +5550,13 @@ function selectResource(idx) {
   updateFuzzBtn();
   // Set raw mode without calling setMode() — that triggers syncFormToRaw() which
   // overwrites the editor with a tools/call skeleton.
-  S.rawMode = true;
+  S.rawMode  = true;
+  S.httpMode = false;
   document.getElementById('mode-form').classList.remove('active');
-  document.getElementById('mode-raw').classList.add('active');
+  document.getElementById('mode-raw') .classList.add('active');
+  document.getElementById('mode-http').classList.remove('active');
   document.getElementById('form-pane').style.display = 'none';
-  document.getElementById('raw-pane').style.display  = 'block';
+  document.getElementById('raw-pane') .style.display = 'block';
 }
 
 function selectPrompt(idx) {
@@ -5573,12 +5616,15 @@ function toggleSchema() {
 // ── Form / Raw mode toggle ─────────────────────────────────────────────────
 
 function setMode(mode) {
-  S.rawMode = mode === 'raw';
-  document.getElementById('mode-form').classList.toggle('active', !S.rawMode);
-  document.getElementById('mode-raw').classList.toggle('active',  S.rawMode);
-  document.getElementById('form-pane').style.display = S.rawMode ? 'none' : 'block';
-  document.getElementById('raw-pane').style.display  = S.rawMode ? 'block' : 'none';
-  if (S.rawMode) syncFormToRaw();
+  S.rawMode  = mode !== 'form';
+  S.httpMode = mode === 'http';
+  document.getElementById('mode-form').classList.toggle('active', mode === 'form');
+  document.getElementById('mode-raw') .classList.toggle('active', mode === 'raw');
+  document.getElementById('mode-http').classList.toggle('active', mode === 'http');
+  document.getElementById('form-pane').style.display = S.rawMode ? 'none'  : 'block';
+  document.getElementById('raw-pane') .style.display = S.rawMode ? 'block' : 'none';
+  if (mode === 'raw')  syncFormToRaw();
+  if (mode === 'http') syncFormToHttp();
 }
 
 function buildRawPayload() {
@@ -5602,6 +5648,17 @@ function syncFormToRaw() {
 }
 
 function syncRawToForm() {
+  if (S.httpMode) {
+    const parsed = parseHttpText(document.getElementById('raw-editor').value);
+    if (!parsed) { showError('Cannot sync — invalid HTTP request format'); return; }
+    try {
+      const payload = JSON.parse(parsed.body);
+      const args = payload?.params?.arguments || {};
+      setMode('form');
+      setTimeout(() => fillArgs(args), 20);
+    } catch { showError('Cannot sync — HTTP body is not valid JSON'); }
+    return;
+  }
   try {
     const payload = JSON.parse(document.getElementById('raw-editor').value);
     const args = payload?.params?.arguments || {};
@@ -5610,8 +5667,77 @@ function syncRawToForm() {
   } catch { showError('Cannot sync — raw editor contains invalid JSON'); }
 }
 
+// ── HTTP text helpers ──────────────────────────────────────────────────────
+
+function buildHttpText(srv, payload) {
+  if (!srv) return '';
+  let urlObj;
+  try { urlObj = new URL(srv.url); } catch { urlObj = {pathname: '/', host: srv.url}; }
+  const path = (urlObj.pathname || '/') + (urlObj.search || '');
+  const host = urlObj.host;
+  const bodyStr = JSON.stringify(payload, null, 2);
+  const lines = [
+    `POST ${path} HTTP/1.1`,
+    `Host: ${host}`,
+    `Content-Type: application/json`,
+  ];
+  if (srv.token) lines.push(`Authorization: Bearer ${srv.token}`);
+  if (srv.customHeaders) {
+    for (const [k, v] of Object.entries(srv.customHeaders)) {
+      if (!['host','content-type','authorization'].includes(k.toLowerCase()))
+        lines.push(`${k}: ${v}`);
+    }
+  }
+  lines.push('', bodyStr);
+  return lines.join('\n');
+}
+
+function parseHttpText(text) {
+  // Find first blank line (header/body separator)
+  const m = text.match(/\n\r?\n/);
+  if (!m) return null;
+  const splitIdx = text.indexOf(m[0]);
+  const headerSection = text.slice(0, splitIdx);
+  const body = text.slice(splitIdx + m[0].length).trimStart();
+  const headerLines = headerSection.split(/\r?\n/);
+  const requestLine = headerLines[0] || '';
+  const headers = {};
+  for (let i = 1; i < headerLines.length; i++) {
+    const line = headerLines[i];
+    const ci = line.indexOf(':');
+    if (ci < 0) continue;
+    const name  = line.slice(0, ci).trim();
+    const value = line.slice(ci + 1).trim();
+    if (name) headers[name] = value;
+  }
+  return {requestLine, headers, body};
+}
+
+function syncFormToHttp() {
+  const srv = S.servers[S.activeUrl];
+  if (!srv || S.selectedIdx < 0) return;
+  const tool = srv.tools[S.selectedIdx];
+  // Collect args from form directly (S.rawMode is already true, bypassing buildRawPayload's guard)
+  const args = collectArgs() || {};
+  const payload = {jsonrpc:'2.0', id:10, method:'tools/call', params:{name:tool.name, arguments:args}};
+  document.getElementById('raw-editor').value = buildHttpText(srv, payload);
+  updateFuzzBtn();
+}
+
 function formatRawEditor() {
   const el = document.getElementById('raw-editor');
+  if (S.httpMode) {
+    const parsed = parseHttpText(el.value);
+    if (!parsed) { showError('Invalid HTTP format — missing blank line between headers and body'); return; }
+    try {
+      const formatted = JSON.stringify(JSON.parse(parsed.body), null, 2);
+      // Rebuild: headers unchanged, body replaced
+      const blankLine = el.value.match(/\n\r?\n/);
+      const splitIdx = el.value.indexOf(blankLine[0]);
+      el.value = el.value.slice(0, splitIdx + blankLine[0].length) + formatted;
+    } catch (e) { showError('JSON body error: ' + e.message); }
+    return;
+  }
   try { el.value = JSON.stringify(JSON.parse(el.value), null, 2); }
   catch (e) {
     const pos = parseInt((e.message.match(/position (\d+)/) || [])[1]);
@@ -6019,20 +6145,23 @@ function fillArgs(args) {
 // ── Send ───────────────────────────────────────────────────────────────────
 
 // rawFetch: route raw JSON-RPC calls through the correct backend endpoint
-async function rawFetch(srv, payload) {
+// opts: { authHeader: string|null } — pass verbatim Authorization value ('' = no auth)
+async function rawFetch(srv, payload, opts = {}) {
   if (srv.transport === 'stdio') {
     return fetch('/stdio/raw', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({command: srv.command, payload}),
     });
   }
+  const body = {
+    url: srv.url, token: srv.token, proxy: srv.proxy,
+    transport: srv.transport || 'http', payload,
+    custom_headers: srv.customHeaders || null,
+  };
+  if (opts.authHeader !== undefined) body.auth_header = opts.authHeader;
   return fetch('/raw', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      url: srv.url, token: srv.token, proxy: srv.proxy,
-      transport: srv.transport || 'http', payload,
-      custom_headers: srv.customHeaders || null,
-    }),
+    body: JSON.stringify(body),
   });
 }
 
@@ -6052,11 +6181,60 @@ async function doSend() {
     const isStdio = srv.transport === 'stdio';
 
     if (S.rawMode || isStdio) {
-      // Raw mode OR stdio (form mode not supported on stdio — serialize to tools/call)
+      // Raw / HTTP / stdio mode
       let payload;
-      if (S.rawMode) {
+      if (S.httpMode) {
+        // HTTP mode: parse full HTTP request text
+        const parsedHttp = parseHttpText(document.getElementById('raw-editor').value);
+        if (!parsedHttp) { showError('Invalid HTTP request — missing blank line between headers and body'); return; }
+        // Extract method + path from request line: "GET /foo HTTP/1.1"
+        const [httpMethod, httpPath] = parsedHttp.requestLine.split(/\s+/);
+        const method = (httpMethod || 'POST').toUpperCase();
+        const isGet  = method === 'GET' || method === 'HEAD';
+        // Build target URL: use origin from srv.url + path from request line
+        let targetUrl = srv.url;
+        if (httpPath && httpPath !== '*') {
+          try {
+            const o = new URL(srv.url);
+            targetUrl = httpPath.startsWith('/')
+              ? `${o.protocol}//${o.host}${httpPath}`
+              : `${o.protocol}//${o.host}/${httpPath}`;
+          } catch {}
+        }
+        if (!isGet) {
+          try { payload = JSON.parse(parsedHttp.body); }
+          catch { showError('HTTP request body is not valid JSON'); return; }
+        }
+        // Extract headers: Authorization → auth_header; rest → custom_headers
+        let authHdr = null;
+        const customHdrs = {};
+        for (const [k, v] of Object.entries(parsedHttp.headers)) {
+          const kl = k.toLowerCase();
+          if (kl === 'authorization') authHdr = v;
+          else if (!['content-type','host','content-length'].includes(kl)) customHdrs[k] = v;
+        }
+        toolName  = isGet ? `${method} ${httpPath}` : (payload?.params?.name || payload?.method || '(http)');
+        args      = isGet ? {path: httpPath} : (payload?.params?.arguments || payload?.params || {});
+        fetchUrl  = '/raw';
+        fetchBody = {url: targetUrl, token: null, proxy: srv.proxy,
+                     method, transport: srv.transport || 'http',
+                     payload: isGet ? null : payload,
+                     custom_headers: Object.keys(customHdrs).length ? customHdrs : null,
+                     auth_header: authHdr !== null ? authHdr : ''};
+      } else if (S.rawMode) {
         try { payload = JSON.parse(document.getElementById('raw-editor').value); }
         catch { showError('Raw editor contains invalid JSON'); return; }
+        toolName  = payload?.params?.name || payload?.method || '(raw)';
+        args      = payload?.params?.arguments || payload?.params || {};
+        if (isStdio) {
+          fetchUrl  = '/stdio/raw';
+          fetchBody = {command: srv.command, payload};
+        } else {
+          fetchUrl  = '/raw';
+          fetchBody = {url:srv.url, token:srv.token, proxy:srv.proxy,
+                       transport:srv.transport, payload,
+                       custom_headers: srv.customHeaders || null};
+        }
       } else {
         // Form mode on stdio: build tools/call payload
         if (S.selectedIdx < 0) return;
@@ -6065,17 +6243,9 @@ async function doSend() {
         if (args === null) return;
         payload = {jsonrpc:'2.0', id:10, method:'tools/call',
                    params:{name:tool.name, arguments:args}};
-      }
-      toolName  = payload?.params?.name || payload?.method || '(raw)';
-      args      = args || payload?.params?.arguments || payload?.params || {};
-      if (isStdio) {
+        toolName = tool.name;
         fetchUrl  = '/stdio/raw';
         fetchBody = {command: srv.command, payload};
-      } else {
-        fetchUrl  = '/raw';
-        fetchBody = {url:srv.url, token:srv.token, proxy:srv.proxy,
-                     transport:srv.transport, payload,
-                     custom_headers: srv.customHeaders || null};
       }
     } else {
       // Form mode on HTTP/SSE: normal tool call
@@ -8712,8 +8882,11 @@ async function startFuzz() {
   const injectTarget = document.getElementById('fuzz-inject-target')?.value || 'body';
   const headerName   = (document.getElementById('fuzz-header-name')?.value || '').trim();
 
-  if (injectTarget === 'body' && !rawTemplate.includes('§')) {
+  if (!S.httpMode && injectTarget === 'body' && !rawTemplate.includes('§')) {
     showError('No §§ markers in raw editor'); return;
+  }
+  if (S.httpMode && !rawTemplate.includes('§')) {
+    showError('No §§ markers in HTTP request text'); return;
   }
   if (injectTarget === 'header' && !headerName) {
     showError('Enter a header name to inject into (e.g. X-Forwarded-For)'); return;
@@ -8740,7 +8913,7 @@ async function startFuzz() {
 
   // Parse base body once for header-injection mode (body never changes)
   let headerModeBody = null;
-  if (injectTarget === 'header') {
+  if (!S.httpMode && injectTarget === 'header') {
     try { headerModeBody = JSON.parse(rawTemplate); }
     catch { showError('Raw editor must contain valid JSON for header injection mode'); return; }
   }
@@ -8753,7 +8926,43 @@ async function startFuzz() {
 
     let parsed, requestOverride = null;
 
-    if (injectTarget === 'header') {
+    if (S.httpMode) {
+      // HTTP mode: substitute §§ anywhere in the full HTTP text (headers or body), then parse
+      // Use plain substitution — payload goes in literally (not JSON-escaped) for header values;
+      // for body injection the marker must be inside a JSON string so we JSON-escape it
+      const filled = rawTemplate.replace(/§[^§]*§/g, pl);
+      const parsedHttp = parseHttpText(filled);
+      if (!parsedHttp) {
+        addFuzzRow(n, pl, true, 0, 'HTTP text parse failed — missing blank line', null, null, null, null);
+        continue;
+      }
+      try { parsed = JSON.parse(parsedHttp.body); }
+      catch {
+        // body substitution may have broken JSON — try JSON-escaped version
+        const escaped = pl.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+                          .replace(/\n/g, '\\n').replace(/\r/g, '\\r')
+                          .replace(/\t/g, '\\t')
+                          .replace(/[\x00-\x1f\x7f]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4,'0')}`);
+        const filled2 = rawTemplate.replace(/§[^§]*§/g, escaped);
+        const ph2 = parseHttpText(filled2);
+        if (!ph2) { addFuzzRow(n, pl, true, 0, 'HTTP body produced invalid JSON', null, null, null, null); continue; }
+        try { parsed = JSON.parse(ph2.body); }
+        catch { addFuzzRow(n, pl, true, 0, 'HTTP body produced invalid JSON — use §§ inside a JSON string value', null, null, null, null); continue; }
+      }
+      // Extract headers for HTTP mode
+      let authHdr = null;
+      const customHdrs = {};
+      for (const [k, v] of Object.entries(parsedHttp.headers)) {
+        const kl = k.toLowerCase();
+        if (kl === 'authorization') authHdr = v;
+        else if (!['content-type','host','content-length'].includes(kl)) customHdrs[k] = v;
+      }
+      requestOverride = {
+        httpMode: true,
+        custom_headers: Object.keys(customHdrs).length ? customHdrs : null,
+        auth_header: authHdr !== null ? authHdr : '',
+      };
+    } else if (injectTarget === 'header') {
       parsed = headerModeBody;
       // Merge payload into custom headers; preserve any existing server headers
       requestOverride = {custom_headers: {...(srv.customHeaders || {}), [headerName]: pl}};
@@ -8774,10 +8983,24 @@ async function startFuzz() {
 
     const t0 = Date.now();
     try {
-      const fetchOpts = requestOverride
-        ? {...srv, customHeaders: requestOverride.custom_headers}
-        : srv;
-      const res  = await rawFetch(fetchOpts, parsed);
+      let res;
+      if (requestOverride?.httpMode) {
+        // HTTP mode: call /raw directly with custom headers and auth_header
+        res = await fetch('/raw', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            url: srv.url, token: null, proxy: srv.proxy,
+            transport: srv.transport || 'http', payload: parsed,
+            custom_headers: requestOverride.custom_headers,
+            auth_header: requestOverride.auth_header,
+          }),
+        });
+      } else {
+        const fetchOpts = requestOverride
+          ? {...srv, customHeaders: requestOverride.custom_headers}
+          : srv;
+        res = await rawFetch(fetchOpts, parsed);
+      }
       const raw     = await res.text();
       const data    = JSON.parse(raw);
       const elapsed = Date.now() - t0;
@@ -8793,11 +9016,11 @@ async function startFuzz() {
         if (pct >= 20) sizeAnomaly = `baseline ${fmtBytes(baselineSize)}, delta ${delta > 0 ? '+' : ''}${delta} B (${delta > 0 ? '+' : ''}${pct}%)`;
       }
 
-      const reqLabel = injectTarget === 'header'
+      const reqLabel = (injectTarget === 'header' && !S.httpMode)
         ? {...parsed, _fuzzHeader: {[headerName]: pl}}
         : parsed;
       addFuzzRow(n, pl, isErr, elapsed, preview, data, size, sizeAnomaly, reqLabel);
-      addHistory(srv.url, `fuzz:${parsed?.method || '?'}`, {payload: pl, ...(injectTarget === 'header' ? {header: headerName} : {})}, data, isErr, elapsed);
+      addHistory(srv.url, `fuzz:${parsed?.method || '?'}`, {payload: pl, ...(injectTarget === 'header' && !S.httpMode ? {header: headerName} : {})}, data, isErr, elapsed);
     } catch(e) {
       addFuzzRow(n, pl, true, Date.now() - t0, e.message, null, null, null, null);
     }
@@ -9684,6 +9907,251 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('raw-editor').addEventListener('input', updateFuzzBtn);
   initProject();  // loads project / shows picker; calls loadCache() after session restore
 });
+
+// ── Path Probe ─────────────────────────────────────────────────────────────
+
+const PROBE_PATHS = [
+  // MCP / API spec
+  {path:'/.well-known/mcp.json',             cat:'MCP',       desc:'MCP server capability manifest'},
+  {path:'/openapi.json',                     cat:'API Spec',  desc:'OpenAPI spec (JSON)'},
+  {path:'/openapi.yaml',                     cat:'API Spec',  desc:'OpenAPI spec (YAML)'},
+  {path:'/docs',                             cat:'API Spec',  desc:'Swagger UI (FastAPI default)'},
+  {path:'/redoc',                            cat:'API Spec',  desc:'ReDoc UI'},
+  {path:'/swagger.json',                     cat:'API Spec',  desc:'Swagger 2.0 spec'},
+  {path:'/swagger-ui.html',                  cat:'API Spec',  desc:'Swagger UI (Spring)'},
+  {path:'/api-docs',                         cat:'API Spec',  desc:'API docs'},
+  {path:'/v1/api-docs',                      cat:'API Spec',  desc:'API docs v1'},
+  {path:'/v2/api-docs',                      cat:'API Spec',  desc:'API docs v2'},
+  // Debug / profiling
+  {path:'/debug',                            cat:'Debug',     desc:'Generic debug handler'},
+  {path:'/debug/vars',                       cat:'Debug',     desc:'Go expvar — env + metrics'},
+  {path:'/debug/pprof/',                     cat:'Debug',     desc:'Go pprof profiling index'},
+  {path:'/debug/pprof/heap',                 cat:'Debug',     desc:'Go heap dump'},
+  {path:'/debug/pprof/goroutine',            cat:'Debug',     desc:'Go goroutine stacks'},
+  {path:'/__debug__/',                       cat:'Debug',     desc:'Django debug toolbar'},
+  // Health / status
+  {path:'/health',                           cat:'Health',    desc:'Health check'},
+  {path:'/healthz',                          cat:'Health',    desc:'Health check (k8s style)'},
+  {path:'/readyz',                           cat:'Health',    desc:'Readiness probe'},
+  {path:'/livez',                            cat:'Health',    desc:'Liveness probe'},
+  {path:'/ping',                             cat:'Health',    desc:'Ping endpoint'},
+  {path:'/status',                           cat:'Health',    desc:'Status endpoint'},
+  // Metrics / telemetry
+  {path:'/metrics',                          cat:'Metrics',   desc:'Prometheus scrape — counters + labels'},
+  {path:'/info',                             cat:'Info',      desc:'App info'},
+  {path:'/version',                          cat:'Info',      desc:'Version string'},
+  // Spring Boot Actuator
+  {path:'/actuator',                         cat:'Actuator',  desc:'Actuator root — lists endpoints'},
+  {path:'/actuator/env',                     cat:'Actuator',  desc:'Environment variables (incl. secrets)'},
+  {path:'/actuator/configprops',             cat:'Actuator',  desc:'Config properties'},
+  {path:'/actuator/mappings',                cat:'Actuator',  desc:'Route mappings'},
+  {path:'/actuator/health',                  cat:'Actuator',  desc:'Health detail'},
+  {path:'/actuator/info',                    cat:'Actuator',  desc:'App info'},
+  {path:'/actuator/loggers',                 cat:'Actuator',  desc:'Logger levels'},
+  {path:'/actuator/heapdump',                cat:'Actuator',  desc:'JVM heap dump'},
+  {path:'/actuator/threaddump',              cat:'Actuator',  desc:'Thread dump'},
+  {path:'/actuator/httptrace',               cat:'Actuator',  desc:'Recent HTTP traces'},
+  // Admin
+  {path:'/admin',                            cat:'Admin',     desc:'Admin panel'},
+  {path:'/_admin',                           cat:'Admin',     desc:'Admin panel (alt)'},
+  {path:'/admin/debug',                      cat:'Admin',     desc:'Admin debug page'},
+  // Config / secrets
+  {path:'/.env',                             cat:'Config',    desc:'.env file exposure'},
+  {path:'/config',                           cat:'Config',    desc:'Config endpoint'},
+  {path:'/settings',                         cat:'Config',    desc:'Settings endpoint'},
+  // Web server status
+  {path:'/server-status',                    cat:'Server',    desc:'Apache mod_status'},
+  {path:'/server-info',                      cat:'Server',    desc:'Apache server info'},
+  {path:'/nginx_status',                     cat:'Server',    desc:'Nginx stub status'},
+  // Auth / OIDC
+  {path:'/.well-known/openid-configuration', cat:'Auth',      desc:'OIDC discovery document'},
+  {path:'/.well-known/jwks.json',            cat:'Auth',      desc:'JWKS public signing keys'},
+  {path:'/.well-known/oauth-authorization-server', cat:'Auth', desc:'OAuth 2.0 server metadata'},
+];
+
+let _probeRunning = false;
+
+function openProbeModal() {
+  const srv = S.servers[S.activeUrl];
+  if (!srv || srv.status !== 'connected') { showError('No active connected server'); return; }
+
+  document.getElementById('probe-overlay')?.remove();
+  const origin = (() => { try { return new URL(srv.url).origin; } catch { return srv.url; } })();
+  const cats = [...new Set(PROBE_PATHS.map(p => p.cat))];
+
+  const ov = document.createElement('div');
+  ov.id = 'probe-overlay';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:3000;display:flex;align-items:stretch;justify-content:center;padding:24px;box-sizing:border-box';
+
+  ov.innerHTML = `
+<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;display:flex;flex-direction:column;width:100%;max-width:900px;overflow:hidden">
+  <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);flex-shrink:0">
+    <span style="font-weight:600;font-size:14px">&#128269; Path Probe</span>
+    <span style="color:var(--muted);font-size:12px;font-family:monospace">${esc(origin)}</span>
+    <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
+      <button class="btn-sm btn-green" id="probe-run-all" onclick="runAllProbes()">&#9654; Run All</button>
+      <button class="btn-sm" id="probe-stop-btn" onclick="_probeRunning=false" disabled style="display:none">&#9632; Stop</button>
+      <span id="probe-prog" style="font-size:11px;color:var(--muted)"></span>
+      <button class="btn-sm" onclick="document.getElementById('probe-overlay').remove();_probeRunning=false">&#10005; Close</button>
+    </div>
+  </div>
+  <div style="padding:8px 16px;border-bottom:1px solid var(--border);display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0">
+    <button class="btn-sm probe-cat-btn active" data-cat="all" onclick="filterProbeCat(this,'all')">All</button>
+    ${cats.map(c => `<button class="btn-sm probe-cat-btn" data-cat="${esc(c)}" onclick="filterProbeCat(this,'${esc(c)}')">${esc(c)}</button>`).join('')}
+  </div>
+  <div style="overflow-y:auto;flex:1">
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead>
+        <tr style="background:var(--bg);position:sticky;top:0">
+          <th style="padding:6px 8px;text-align:left;color:var(--muted);font-weight:500;width:28px"></th>
+          <th style="padding:6px 8px;text-align:left;color:var(--muted);font-weight:500">Path</th>
+          <th style="padding:6px 8px;text-align:left;color:var(--muted);font-weight:500;width:80px">Cat</th>
+          <th style="padding:6px 8px;text-align:left;color:var(--muted);font-weight:500">Description</th>
+          <th style="padding:6px 8px;text-align:center;color:var(--muted);font-weight:500;width:60px">Status</th>
+          <th style="padding:6px 8px;text-align:right;color:var(--muted);font-weight:500;width:60px">Size</th>
+          <th style="padding:6px 8px;width:50px"></th>
+        </tr>
+      </thead>
+      <tbody id="probe-tbody">
+        ${PROBE_PATHS.map((p,i) => `
+        <tr class="probe-row" data-cat="${esc(p.cat)}" data-idx="${i}" style="border-bottom:1px solid var(--border)">
+          <td style="padding:4px 8px;text-align:center"><span id="probe-icon-${i}" style="font-size:14px">&#9711;</span></td>
+          <td style="padding:4px 8px;font-family:monospace;color:var(--accent)">${esc(p.path)}</td>
+          <td style="padding:4px 8px;color:var(--muted)">${esc(p.cat)}</td>
+          <td style="padding:4px 8px;color:var(--fg)">${esc(p.desc)}</td>
+          <td id="probe-status-${i}" style="padding:4px 8px;text-align:center">—</td>
+          <td id="probe-size-${i}" style="padding:4px 8px;text-align:right;color:var(--muted)">—</td>
+          <td style="padding:4px 8px">
+            <button class="btn-sm" onclick="runOneProbe(${i})" id="probe-run-${i}" style="padding:1px 6px;font-size:10px">Run</button>
+          </td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+  </div>
+  <div id="probe-detail" style="display:none;border-top:1px solid var(--border);padding:10px 16px;max-height:200px;overflow:auto">
+    <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+      <span id="probe-detail-title" style="font-size:11px;color:var(--muted);font-family:monospace"></span>
+      <button class="btn-sm" onclick="document.getElementById('probe-detail').style.display='none'" style="font-size:10px;padding:1px 5px">&#10005;</button>
+    </div>
+    <pre id="probe-detail-body" style="margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all;color:var(--fg)"></pre>
+  </div>
+</div>`;
+
+  document.body.appendChild(ov);
+  ov.addEventListener('click', e => { if (e.target === ov) { ov.remove(); _probeRunning = false; } });
+}
+
+function filterProbeCat(btn, cat) {
+  document.querySelectorAll('.probe-cat-btn').forEach(b => b.classList.toggle('active', b === btn));
+  document.querySelectorAll('.probe-row').forEach(row => {
+    row.style.display = (cat === 'all' || row.dataset.cat === cat) ? '' : 'none';
+  });
+}
+
+async function runOneProbe(idx) {
+  const srv = S.servers[S.activeUrl];
+  if (!srv) return;
+  const p = PROBE_PATHS[idx];
+  const origin = (() => { try { return new URL(srv.url).origin; } catch { return srv.url; } })();
+  const url = origin + p.path;
+
+  const iconEl   = document.getElementById(`probe-icon-${idx}`);
+  const statusEl = document.getElementById(`probe-status-${idx}`);
+  const sizeEl   = document.getElementById(`probe-size-${idx}`);
+  if (iconEl) iconEl.textContent = '⏳';
+
+  let authHdr = srv.token ? `Bearer ${srv.token}` : null;
+  const body = {url, token: null, method: 'GET', proxy: srv.proxy,
+                transport: 'http', payload: null,
+                custom_headers: srv.customHeaders || null,
+                auth_header: authHdr || ''};
+  try {
+    const t0 = Date.now();
+    const res  = await fetch('/raw', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const data = await res.json();
+    const elapsed = Date.now() - t0;
+    const status = data.status || 0;
+    const rawText = data.raw || JSON.stringify(data.result ?? data, null, 2) || '';
+    const size = new TextEncoder().encode(rawText).length;
+
+    // Status badge
+    const isOk = status >= 200 && status < 300;
+    const isRedir = status >= 300 && status < 400;
+    const col = isOk ? '#3fb950' : isRedir ? '#e3b341' : status === 404 ? 'var(--muted)' : '#f85149';
+    if (statusEl) statusEl.innerHTML = `<span style="color:${col};font-weight:600">${status}</span>`;
+    if (sizeEl)   sizeEl.textContent = isOk ? fmtBytes(size) : '—';
+    if (iconEl)   iconEl.textContent = isOk ? '✓' : status === 404 ? '○' : '✗';
+
+    // Wire up the row click to show response detail
+    const row = document.querySelector(`.probe-row[data-idx="${idx}"]`);
+    if (row && isOk) {
+      row.style.cursor = 'pointer';
+      row.title = 'Click to view response';
+      row.onclick = () => _showProbeDetail(p.path, rawText);
+    }
+
+    // Auto-finding for non-404 2xx responses
+    if (isOk) {
+      const activeSrv = S.servers[S.activeUrl];
+      if (activeSrv) {
+        const srvShort = (S.activeUrl || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+        activeSrv.findings = activeSrv.findings || [];
+        // Deduplicate by path
+        if (!activeSrv.findings.some(f => f.item === p.path && f.category === 'Info Disclosure')) {
+          activeSrv.findings.push({
+            severity: 'medium', category: 'Info Disclosure',
+            server: srvShort, item: p.path,
+            detail: `${p.cat}: ${p.desc} returned HTTP ${status} (${fmtBytes(size)}) — review response for sensitive data`,
+            source: 'auto',
+            id: Date.now().toString(36) + Math.random().toString(36).slice(2),
+          });
+          renderFindings();
+        }
+      }
+    }
+  } catch(e) {
+    if (statusEl) statusEl.textContent = 'err';
+    if (iconEl)   iconEl.textContent = '✗';
+  }
+}
+
+function _showProbeDetail(path, text) {
+  const d = document.getElementById('probe-detail');
+  const t = document.getElementById('probe-detail-title');
+  const b = document.getElementById('probe-detail-body');
+  if (!d || !t || !b) return;
+  t.textContent = path;
+  // Try pretty-print JSON
+  let display = text;
+  try { display = JSON.stringify(JSON.parse(text), null, 2); } catch {}
+  b.textContent = display.slice(0, 8000);
+  d.style.display = 'block';
+}
+
+async function runAllProbes() {
+  _probeRunning = true;
+  const stopBtn = document.getElementById('probe-stop-btn');
+  const runBtn  = document.getElementById('probe-run-all');
+  const prog    = document.getElementById('probe-prog');
+  if (stopBtn) { stopBtn.disabled = false; stopBtn.style.display = ''; }
+  if (runBtn)  runBtn.disabled = true;
+
+  // Only run visible rows
+  const visible = [...document.querySelectorAll('.probe-row')]
+    .filter(r => r.style.display !== 'none')
+    .map(r => parseInt(r.dataset.idx));
+
+  for (let i = 0; i < visible.length; i++) {
+    if (!_probeRunning) break;
+    if (prog) prog.textContent = `${i + 1} / ${visible.length}`;
+    await runOneProbe(visible[i]);
+  }
+
+  if (prog) prog.textContent = _probeRunning ? 'Done' : 'Stopped';
+  if (stopBtn) { stopBtn.disabled = true; stopBtn.style.display = 'none'; }
+  if (runBtn)  runBtn.disabled = false;
+  _probeRunning = false;
+}
 </script>
 </body>
 </html>"""
