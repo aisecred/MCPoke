@@ -1544,8 +1544,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 .cap-panel-caps-title { font-size: 10px; color: var(--muted); margin-bottom: 5px;
   text-transform: uppercase; letter-spacing: .04em; }
 .cap-panel-cap-row { display: flex; align-items: flex-start; margin-bottom: 6px; gap: 0.5rem; }
-.cap-panel-cap-row span { flex-shrink: 0; }
-.cap-panel-cap-desc { font-size: 11px; color: var(--muted); line-height: 1.4; }
+.cap-panel-cap-row span:first-child { flex-shrink: 0; }
+.cap-panel-cap-desc { font-size: 11px; color: var(--muted); line-height: 1.4; word-break: break-word; }
 .cap-panel-vulns { margin-top: 0.6rem; border-top: 1px solid var(--border); padding-top: 0.6rem; }
 .cap-panel-cve-row { display: flex; align-items: flex-start; margin-bottom: 6px; gap: 0.5rem; }
 .cap-panel-cve-desc { font-size: 11px; color: var(--muted); line-height: 1.4; }
@@ -1685,17 +1685,17 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 .findings-detail { color: var(--muted); font-size: 10px; word-break: break-all; }
 .findings-remediation { color: #b3c2d1; font-size: 10px; word-break: break-all; }
 /* Overview dashboard */
-.ov-grid { display:grid; grid-template-columns:1fr 1fr; gap:.5rem; padding:.4rem; }
-.ov-card { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:.5rem .65rem; }
+.ov-grid { display:grid; grid-template-columns:1fr; gap:.5rem; padding:.4rem; }
+.ov-card { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:.5rem .65rem; min-width:0; overflow:hidden; word-break:break-word; }
 .ov-card-title { font-size:10px; font-weight:700; color:var(--muted); text-transform:uppercase;
   letter-spacing:.05em; margin-bottom:.4rem; }
-.ov-stat-row { display:flex; align-items:center; gap:.4rem; margin:.15rem 0; }
+.ov-stat-row { display:flex; align-items:center; gap:.4rem; margin:.15rem 0; min-width:0; }
 .ov-stat-num { font-size:16px; font-weight:700; color:var(--fg); min-width:2rem; text-align:right; }
-.ov-stat-lbl { font-size:11px; color:var(--muted); }
-.ov-cat-row { display:flex; justify-content:space-between; font-size:10px;
+.ov-stat-lbl { font-size:11px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ov-cat-row { display:flex; justify-content:space-between; font-size:10px; min-width:0;
   color:var(--muted); padding:.1rem 0; border-top:1px solid var(--border); margin-top:.15rem; }
-.ov-cat-name { flex:1; }
-.ov-cat-count { font-weight:700; color:var(--fg); }
+.ov-cat-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ov-cat-count { font-weight:700; color:var(--fg); margin-left:.4rem; }
 .ov-cap-row { display:flex; flex-direction:column; gap:.15rem; margin:.3rem 0; }
 .ov-cap-tip { color:var(--muted); font-size:10px; line-height:1.4; white-space:normal; word-break:break-word; }
 /* Add finding modal */
@@ -2641,7 +2641,7 @@ async function connectStdioServer(command, env) {
       srv.fromCache  = false;
       const _preserved = (srv.findings || []).filter(f => ['auth-test','oauth-probe','cert'].includes(f.item));
       srv.findings   = [...scanServerFindings(srv), ..._preserved];
-      if (!S.activeUrl || !S.servers[S.activeUrl] ||
+      if (srv.url === S.activeUrl || !S.activeUrl || !S.servers[S.activeUrl] ||
           S.servers[S.activeUrl].status !== 'connected') {
         setActiveServer(url);
       }
@@ -2692,7 +2692,7 @@ async function connectServer(url, token, proxy, customHeaders) {
       // Fetch TLS cert info in the background (non-blocking)
       if (url.startsWith('https://')) fetchCertInfo(srv);
       // If this is the only/first connected server, activate it
-      if (!S.activeUrl || !S.servers[S.activeUrl] ||
+      if (srv.url === S.activeUrl || !S.activeUrl || !S.servers[S.activeUrl] ||
           S.servers[S.activeUrl].status !== 'connected') {
         setActiveServer(url);
       }
@@ -2899,7 +2899,7 @@ function renderServers() {
     const hBadge   = srv.customHeaders
       ? `<span class="badge" style="background:#1a2a1a;color:#7ee787" title="${esc(Object.keys(srv.customHeaders).join(', '))}">hdrs</span>` : '';
     const errText  = srv.error
-      ? `<span class="srv-err">${esc(srv.error.slice(0,44))}</span>` : '';
+      ? `<span class="srv-err" title="${esc(srv.error)}">${esc(srv.error.slice(0,60))}</span>` : '';
     const lsText   = (!srv.error && srv.lastSeen && srv.fromCache)
       ? `<span style="color:var(--muted);font-size:9px">${new Date(srv.lastSeen).toLocaleDateString()}</span>` : '';
     const injCount = (srv.status === 'connected' || srv.fromCache)
@@ -4335,6 +4335,9 @@ const CAP_RISKS = {
   elicitation:  {level: 'high',     label: 'elicitation',
                  tip: 'Server declared the "elicitation" capability, meaning it can pause a tool call and push a structured input request (form, confirmation dialog, free text) to the user through the MCP client. This is a built-in social engineering channel: a malicious server can request credentials, approvals, or sensitive data under the guise of a legitimate workflow step.',
                  remediation: 'Verify that elicitation prompts are genuinely required by the workflow and cannot be pre-supplied. Audit all elicitation requests for phishing patterns — requests for passwords, API keys, or approval of undisclosed actions. Restrict this capability to explicitly trusted servers only.'},
+  tasks:        {level: 'medium',   label: 'tasks',
+                 tip: 'Server declared the "tasks" capability (2025-11-25), meaning requests can be run as durable, long-running tasks whose results are retrieved later by a receiver-generated task ID. If task IDs are guessable or not bound to the caller\'s identity, another party can read task results across sessions; if tasks.list is also declared on a server that cannot identify requestors, any caller can enumerate every task and its ID.',
+                 remediation: 'Bind every task to the requestor\'s authorization context and reject tasks/get, tasks/result, and tasks/cancel for tasks outside it. Generate cryptographically secure task IDs (UUIDv4). Do not declare tasks.list unless requestors can be identified. Expire task results with a short TTL.'},
   resources:    {level: 'info',     label: 'resources',    tip: 'Server supports the resources/list endpoint — enumerate with the Resources tab.', remediation: undefined},
   prompts:      {level: 'info',     label: 'prompts',      tip: 'Server supports the prompts/list endpoint — enumerate with the Prompts tab.', remediation: undefined},
   tools:        {level: 'info',     label: 'tools',        tip: 'Server supports the tools/list endpoint.', remediation: undefined},
@@ -4746,6 +4749,35 @@ function normalizeHomoglyphs(s) {
   return s.split('').map(c => _CONFUSABLE_MAP[c] || c).join('');
 }
 
+// Classify an icon URL as a client-side SSRF risk (MCP-056). Returns
+// 'internal' | 'offhost' | 'plaintext' | null. serverHost is host[:port] of
+// the connected MCP server (used to detect off-host/beacon fetches).
+function iconHostRisk(src, serverHost) {
+  let u;
+  try { u = new URL(src, 'http://placeholder.invalid'); } catch (e) { return null; }
+  const scheme = (u.protocol || '').replace(':', '').toLowerCase();
+  if (scheme !== 'http' && scheme !== 'https') return null;
+  const host = (u.hostname || '').toLowerCase();
+  if (!host || host === 'placeholder.invalid') return null;
+  // Internal / loopback / link-local / private / .internal / localhost
+  const internal =
+    host === 'localhost' || host.endsWith('.localhost') ||
+    host.endsWith('.internal') || host.endsWith('.local') ||
+    host === '169.254.169.254' || host.startsWith('169.254.') ||
+    host === '127.0.0.1' || host.startsWith('127.') ||
+    host === '::1' || host === '0.0.0.0' ||
+    /^10\./.test(host) || /^192\.168\./.test(host) ||
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host) ||
+    /^metadata\./.test(host);
+  if (internal) return 'internal';
+  // Off-host remote fetch (host differs from the MCP server's own host)
+  const srvHost = (serverHost || '').split(':')[0].toLowerCase();
+  if (srvHost && host !== srvHost) return 'offhost';
+  // Same-host but plaintext
+  if (scheme === 'http') return 'plaintext';
+  return null;
+}
+
 function scanServerFindings(srv) {
   // Compute all findings for one server and return as a flat array.
   // Called on connect/reconnect. Replaces passive findings but preserves active-test
@@ -4825,6 +4857,8 @@ function scanServerFindings(srv) {
   // Capability risks (skip plain info caps)
   const caps = srv.serverInfo?.capabilities || {};
   for (const k of Object.keys(caps)) {
+    // tasks is handled by its own sub-structure-aware block below
+    if (k === 'tasks') continue;
     const risk = CAP_RISKS[k] || {level: 'high', label: k, tip: `Undocumented capability: ${k}`,
       remediation: 'Audit this undocumented capability. Unknown capabilities have no formal spec — restrict server access until the feature is understood and reviewed.'};
     if (risk.level === 'info') continue;
@@ -4832,6 +4866,23 @@ function scanServerFindings(srv) {
       server: srvShort, item: 'server',
       detail: `${k}: ${risk.tip}`,
       remediation: risk.remediation});
+  }
+
+  // tasks capability — severity depends on sub-structure (2025-11-25 tasks utility).
+  // tasks.list on a server that cannot identify requestors lets any caller enumerate
+  // every task and its ID; without an auth context, results are readable by anyone
+  // who obtains/guesses a task ID.
+  if (caps.tasks && typeof caps.tasks === 'object') {
+    const hasList = 'list' in caps.tasks;
+    rows.push({
+      severity: hasList ? 'high' : 'medium',
+      category: 'Capability Risk',
+      server: srvShort, item: 'server',
+      detail: 'tasks: ' + (hasList
+        ? 'Server declares the tasks capability with tasks.list. Any caller can enumerate every task and its ID via tasks/list, then retrieve results with tasks/result. Without per-requestor identity binding this exposes other sessions\' long-running operation results.'
+        : 'Server declares the tasks capability. Long-running operation results are stored server-side and addressed by a task ID retrievable via tasks/result. If task IDs are guessable or not bound to the creating identity, results are readable across sessions.'),
+      remediation: 'Bind every task to the requestor\'s authorization context and reject tasks/get, tasks/result, and tasks/cancel for tasks outside it. Generate cryptographically secure task IDs (UUIDv4). Do not declare tasks.list unless requestors can be identified. Expire task results with a short TTL.',
+    });
   }
 
   // resources.subscribe — server-push injection surface, distinct from passive resources/list
@@ -4943,6 +4994,43 @@ function scanServerFindings(srv) {
       detail: `Tool names "${names.join('" and "')}" are visually identical — both normalize to "${norm}". An LLM cannot distinguish between them; calling either may invoke the other.`,
       remediation: 'Remove or rename the tool using confusable Unicode characters. Tool identifiers must be ASCII-only. This pattern is used in active tool-poisoning attacks — treat as intentional until proven otherwise.',
     });
+  }
+
+  // Icon URL SSRF / phone-home (2025-11-25 icons[]). Tools, resources, and prompts
+  // can declare icons[].src; the MCP CLIENT fetches src to render it — a
+  // server-controlled URL executed from the operator's context.
+  const ICON_REMEDIATION = 'Serve icons from the MCP server\'s own origin or embed them as data: URIs rather than referencing third-party or internal URLs. If remote icon URLs are unavoidable, restrict them to an HTTPS allowlist of trusted hosts and never permit internal, loopback, or link-local targets. On the client side, validate the icon scheme and resolved address before fetching.';
+  const _iconGroups = [
+    ['tool',     srv.tools],
+    ['resource', srv.resources],
+    ['prompt',   srv.prompts],
+  ];
+  for (const [kind, items] of _iconGroups) {
+    for (const it of (items || [])) {
+      const icons = it && Array.isArray(it.icons) ? it.icons : [];
+      const itemName = it.name || it.uri || '(unnamed)';
+      for (const ic of icons) {
+        const src = ic && typeof ic.src === 'string' ? ic.src
+                  : (ic && typeof ic.url === 'string' ? ic.url : '');
+        if (!src || /^data:/i.test(src)) continue;
+        const risk = iconHostRisk(src, srvShort);
+        if (!risk) continue;
+        const sev    = risk === 'internal' ? 'high' : (risk === 'offhost' ? 'medium' : 'low');
+        const reason = risk === 'internal'
+          ? 'points at an internal/loopback/link-local address — the client is coerced into a request an external attacker cannot make (client-side SSRF), including cloud metadata endpoints'
+          : (risk === 'offhost'
+              ? 'is a remote URL on a host different from the MCP server — a tracking beacon that leaks the operator\'s IP and activity timing on every render'
+              : 'is served over plaintext HTTP — the rendered icon can be substituted in transit (MITM)');
+        rows.push({
+          severity: sev,
+          category: 'Client-Side SSRF',
+          server: srvShort,
+          item: `${kind}:${itemName}`,
+          detail: `Icon src ${reason}: ${src}`,
+          remediation: ICON_REMEDIATION,
+        });
+      }
+    }
   }
 
   return rows;
@@ -5900,6 +5988,22 @@ const PROTOCOL_PRESETS = [
     hint:  'control server log verbosity — check if unprivileged callers can set DEBUG and extract sensitive log data',
     payload: {"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"debug"}},
   },
+  // ── MCP 2025-11-25 tasks (IDOR / cross-session disclosure surface) ─────────
+  {
+    label: 'MCP: tasks/list',
+    hint:  'enumerate tasks — if the server declares tasks.list without identifying requestors, this returns every task ID including ones you never created (IDOR enumeration)',
+    payload: {"jsonrpc":"2.0","id":1,"method":"tasks/list","params":{}},
+  },
+  {
+    label: 'MCP: tasks/get',
+    hint:  'poll a task status by ID — try an ID you did not create to check for missing ownership binding',
+    payload: {"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"taskId":"EDIT_ME"}},
+  },
+  {
+    label: 'MCP: tasks/result',
+    hint:  'retrieve a task result by ID — if results are returned without an ownership check, another session\'s long-running operation output is disclosed (task IDOR)',
+    payload: {"jsonrpc":"2.0","id":1,"method":"tasks/result","params":{"taskId":"EDIT_ME"}},
+  },
 ];
 
 function toggleCopyMenu() {
@@ -6722,6 +6826,41 @@ async function _applyEncoderOp(op) {
                + (parts[2] ? '\n\nSignature (raw):\n' + parts[2] : '\n\n(no signature)');
         break;
       }
+      case 'jwt-enc-none': {
+        let pay;
+        try { pay = JSON.parse(src); } catch { result = 'Input must be valid JSON payload'; break; }
+        if (!pay.iat) pay.iat = Math.floor(Date.now()/1000);
+        if (!pay.exp) pay.exp = Math.floor(Date.now()/1000) + 3600;
+        const b64u = s => btoa(unescape(encodeURIComponent(s))).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+        const hdr = b64u(JSON.stringify({alg:'none',typ:'JWT'}));
+        const pld = b64u(JSON.stringify(pay));
+        result = `${hdr}.${pld}.`;
+        break;
+      }
+      case 'jwt-enc-hs256': {
+        // Input: first line = secret, remaining lines = payload JSON
+        const nl = src.indexOf('\n');
+        if (nl < 0) { result = 'Format: first line = secret, remaining lines = payload JSON'; break; }
+        const secret = src.slice(0, nl).trim();
+        const payStr = src.slice(nl + 1).trim();
+        let pay;
+        try { pay = JSON.parse(payStr); } catch { result = 'Payload (lines 2+) must be valid JSON'; break; }
+        if (!pay.iat) pay.iat = Math.floor(Date.now()/1000);
+        if (!pay.exp) pay.exp = Math.floor(Date.now()/1000) + 3600;
+        const b64u = s => btoa(unescape(encodeURIComponent(s))).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+        const hdr = b64u(JSON.stringify({alg:'HS256',typ:'JWT'}));
+        const pld = b64u(JSON.stringify(pay));
+        const sigInput = `${hdr}.${pld}`;
+        const keyBytes = new TextEncoder().encode(secret);
+        const msgBytes = new TextEncoder().encode(sigInput);
+        try {
+          const key = await crypto.subtle.importKey('raw', keyBytes, {name:'HMAC',hash:'SHA-256'}, false, ['sign']);
+          const sig = await crypto.subtle.sign('HMAC', key, msgBytes);
+          const sigB64u = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+          result = `${sigInput}.${sigB64u}`;
+        } catch(e) { result = 'HMAC signing failed: ' + e.message; }
+        break;
+      }
       case 'saml-dec': {
         let xml = src.trim();
         try { xml = decodeURIComponent(escape(atob(xml.replace(/-/g,'+').replace(/_/g,'/')))); } catch {}
@@ -6752,6 +6891,7 @@ function openEncoderModal() {
   ov.innerHTML = `
     <div class="panel-modal-hdr">
       <span style="color:#c792ea;font-weight:700;font-family:monospace;font-size:13px">&#128273; Encoder / Decoder</span>
+      <span style="flex:1"></span>
       <button class="btn-sm" onclick="document.getElementById('enc-overlay').remove()">&#x2715; Close</button>
     </div>
     <div style="display:flex;flex-direction:column;flex:1;padding:.6rem;gap:.4rem;overflow:hidden">
@@ -6806,6 +6946,8 @@ function openEncoderModal() {
         )}
         ${row('Special',
           btn('JWT decode','jwt-dec','Split and pretty-print header + payload') +
+          btn('JWT (alg:none)','jwt-enc-none','Input: payload JSON → outputs unsigned alg:none JWT') +
+          btn('JWT (HS256)','jwt-enc-hs256','Input: line 1 = secret, line 2+ = payload JSON → outputs HS256-signed JWT') +
           btn('SAML decode','saml-dec','Base64 decode + pretty-print XML') +
           btn('JSON format','json-fmt') +
           btn('JSON minify','json-min')
@@ -10028,10 +10170,11 @@ function openProbeModal() {
       </tbody>
     </table>
   </div>
-  <div id="probe-detail" style="display:none;border-top:1px solid var(--border);padding:10px 16px;max-height:200px;overflow:auto">
+  <div id="probe-detail-resizer" style="display:none;height:5px;background:var(--border);cursor:ns-resize;flex-shrink:0" title="Drag to resize"></div>
+  <div id="probe-detail" style="display:none;border-top:1px solid var(--border);padding:10px 16px;height:200px;overflow:auto;flex-shrink:0">
     <div style="display:flex;justify-content:space-between;margin-bottom:4px">
       <span id="probe-detail-title" style="font-size:11px;color:var(--muted);font-family:monospace"></span>
-      <button class="btn-sm" onclick="document.getElementById('probe-detail').style.display='none'" style="font-size:10px;padding:1px 5px">&#10005;</button>
+      <button class="btn-sm" onclick="document.getElementById('probe-detail').style.display='none';document.getElementById('probe-detail-resizer').style.display='none'" style="font-size:10px;padding:1px 5px">&#10005;</button>
     </div>
     <pre id="probe-detail-body" style="margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all;color:var(--fg)"></pre>
   </div>
@@ -10039,6 +10182,7 @@ function openProbeModal() {
 
   document.body.appendChild(ov);
   ov.addEventListener('click', e => { if (e.target === ov) { ov.remove(); _probeRunning = false; } });
+  _initProbeDetailResizer();
 }
 
 function filterProbeCat(btn, cat) {
@@ -10117,15 +10261,37 @@ async function runOneProbe(idx) {
 
 function _showProbeDetail(path, text) {
   const d = document.getElementById('probe-detail');
+  const r = document.getElementById('probe-detail-resizer');
   const t = document.getElementById('probe-detail-title');
   const b = document.getElementById('probe-detail-body');
   if (!d || !t || !b) return;
   t.textContent = path;
-  // Try pretty-print JSON
   let display = text;
   try { display = JSON.stringify(JSON.parse(text), null, 2); } catch {}
   b.textContent = display.slice(0, 8000);
   d.style.display = 'block';
+  if (r) r.style.display = 'block';
+}
+
+function _initProbeDetailResizer() {
+  const resizer = document.getElementById('probe-detail-resizer');
+  const pane    = document.getElementById('probe-detail');
+  if (!resizer || !pane) return;
+  resizer.addEventListener('mousedown', e => {
+    e.preventDefault();
+    const startY = e.clientY, startH = pane.offsetHeight;
+    document.body.style.userSelect = 'none';
+    resizer.style.background = 'var(--accent)';
+    const onMove = e => pane.style.height = Math.max(60, startH + (startY - e.clientY)) + 'px';
+    const onUp   = () => {
+      resizer.style.background = 'var(--border)';
+      document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
 }
 
 async function runAllProbes() {
