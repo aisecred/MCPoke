@@ -382,11 +382,24 @@ class SSESession:
 
 # ── Probing ───────────────────────────────────────────────────────────────────
 
+def _build_connect_probe(url: str, payload: dict, extra_headers: dict,
+                         status: int, resp_headers: dict, resp_body: Any) -> dict:
+    """Package the raw initialize request/response so the UI can show exactly
+    what was sent/received when a connection-time finding (TLS, CORS, missing
+    security headers, etc.) was inferred — instead of discarding the exchange."""
+    req_headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    req_headers.update(extra_headers or {})
+    return {
+        "request":  {"method": "POST", "url": url, "headers": req_headers, "body": payload},
+        "response": {"status": status, "headers": resp_headers, "body": resp_body},
+    }
+
+
 async def _probe_http(session: aiohttp.ClientSession, url: str,
                       extra_headers: dict,
                       proxy: Optional[str] = None) -> Optional[dict]:
     for payload in (TOOLS_LIST, TOOLS_LIST_NULL, TOOLS_LIST_NOID):
-        body, status = await _post_json(session, url, payload,
+        body, status, hdrs = await _post_json_headers(session, url, payload,
                                         extra_headers=extra_headers, proxy=proxy)
         if status == -1:
             return {"error": "SSL error — try https://"}
@@ -395,8 +408,11 @@ async def _probe_http(session: aiohttp.ClientSession, url: str,
         if body and _is_jsonrpc(body):
             tools = _extract_tools(body)
             if tools is not None:
-                init_body, _ = await _post_json(session, url, make_initialize(),
-                                                extra_headers=extra_headers, proxy=proxy)
+                no_init_probe_evidence = _build_connect_probe(
+                    url, payload, extra_headers, status, hdrs, body)
+                init_payload = make_initialize()
+                init_body, init_status, init_hdrs = await _post_json_headers(
+                    session, url, init_payload, extra_headers=extra_headers, proxy=proxy)
                 res_body,  _ = await _post_json(session, url, RESOURCES_LIST,
                                                 extra_headers=extra_headers, proxy=proxy)
                 pmt_body,  _ = await _post_json(session, url, PROMPTS_LIST,
@@ -406,10 +422,15 @@ async def _probe_http(session: aiohttp.ClientSession, url: str,
                         "tools":     tools,
                         "resources": _extract_resources(res_body) or [],
                         "prompts":   _extract_prompts(pmt_body)   or [],
-                        "no_init_probe": True}
+                        "no_init_probe": True,
+                        "no_init_probe_evidence": no_init_probe_evidence,
+                        "response_headers": init_hdrs,
+                        "connect_probe": _build_connect_probe(
+                            url, init_payload, extra_headers, init_status, init_hdrs, init_body)}
 
-    init_body, status = await _post_json(session, url, make_initialize(),
-                                         extra_headers=extra_headers, proxy=proxy)
+    init_payload = make_initialize()
+    init_body, status, init_hdrs = await _post_json_headers(
+        session, url, init_payload, extra_headers=extra_headers, proxy=proxy)
     if status == -1:
         return {"error": "SSL error — try https://"}
     if status in (401, 403):
@@ -429,7 +450,10 @@ async def _probe_http(session: aiohttp.ClientSession, url: str,
     return {"transport": "http", "server_info": server_info,
             "tools":     _extract_tools(tools_body)     or [],
             "resources": _extract_resources(res_body)   or [],
-            "prompts":   _extract_prompts(pmt_body)     or []}
+            "prompts":   _extract_prompts(pmt_body)     or [],
+            "response_headers": init_hdrs,
+            "connect_probe": _build_connect_probe(
+                url, init_payload, extra_headers, status, init_hdrs, init_body)}
 
 
 async def _probe_sse(session: aiohttp.ClientSession, url: str,
@@ -468,14 +492,6 @@ async def probe_target(url: str, auth_token: Optional[str] = None,
     async with session_ctx as session:
         result = await _probe_http(session, url, extra_headers, proxy)
         if result is not None:
-            if not result.get("error"):
-                try:
-                    _, _, resp_hdrs = await _post_json_headers(
-                        session, url, make_initialize(),
-                        extra_headers=extra_headers, proxy=proxy)
-                    result["response_headers"] = resp_hdrs
-                except Exception:
-                    pass
             return result
         result = await _probe_sse(session, url, extra_headers, proxy)
         if result is not None:
@@ -1827,6 +1843,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 }
 .pp-cat-btn:hover  { background: #0d1f3a; color: var(--text); }
 .pp-cat-btn.active { background: var(--surface-active); color: var(--accent); font-weight: 600; }
+.probe-cat-btn.active, .protocol-cat-btn.active { background: var(--surface-active); color: var(--accent); font-weight: 600; }
+.findings-show-suppressed-btn.active { background: var(--surface-active); color: var(--accent); font-weight: 600; }
 .pp-items { flex: 1; overflow-y: auto; padding: 3px; }
 .pp-item {
   display: block; width: 100%; text-align: left; padding: 3px 7px;
@@ -2282,12 +2300,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
                 <div class="pp-item" onclick="copyAsFormat('python')">Copy as Python</div>
               </div>
             </div>
-            <div style="position:relative">
-              <button class="btn-sm" onclick="toggleProtocolMenu()" title="Inject MCP protocol edge-case payload">Protocol &#9662;</button>
-              <div id="protocol-preset-menu" style="display:none;position:absolute;left:0;top:100%;margin-top:2px;
-                   background:var(--surface);border:1px solid var(--border);border-radius:4px;
-                   z-index:100;min-width:210px;box-shadow:0 4px 12px rgba(0,0,0,.4)"></div>
-            </div>
+            <button class="btn-sm" id="protocol-btn" onclick="openProtocolModal()" title="Inject MCP protocol edge-case payload">&#128268; Protocol</button>
           </div>
           <div class="raw-hint">Edit any field freely — payload is sent verbatim. Change <code>method</code> to call resources/list, prompts/list, or anything else.</div>
         </div>
@@ -2327,6 +2340,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
       <button class="btn-sm" id="hist-export-md"   onclick="exportMarkdown()">Export MD</button>
       <button class="btn-sm" id="hist-export-html"  onclick="exportHTML()">Export HTML</button>
       <button class="btn-sm" id="hist-clear"        onclick="clearHistory()">Clear History</button>
+      <button class="btn-sm findings-show-suppressed-btn" id="findings-show-suppressed" style="display:none" onclick="toggleShowSuppressed()">Show Suppressed Finds (0)</button>
       <button class="btn-sm" id="findings-clear" style="display:none" onclick="clearFindings()">Clear Findings</button>
       <button class="btn-sm" id="findings-add" style="display:none" onclick="openAddFindingModal()">&#x2b; Add Finding</button>
       <div id="findings-export-wrap" style="display:none;position:relative">
@@ -2417,6 +2431,7 @@ const S = {
   findingStatus:    JSON.parse(localStorage.getItem('mcpoke-finding-status')    || '{}'),
   findingNotes:     JSON.parse(localStorage.getItem('mcpoke-finding-notes')     || '{}'),
   findingDismissed: new Set(JSON.parse(localStorage.getItem('mcpoke-finding-dismissed') || '[]')),
+  showSuppressed: false,  // when true, dismissed findings render greyed-out with an Undismiss button
   histChecked: [],  // up to 2 history entry IDs selected for diff
   pendingNoInitProbe: false,  // true when last injected preset was a no-init probe
 };
@@ -2684,7 +2699,9 @@ async function connectServer(url, token, proxy, customHeaders) {
       srv.resources       = data.resources || [];
       srv.prompts         = data.prompts   || [];
       srv.responseHeaders = data.response_headers || null;
+      srv.connectProbe    = data.connect_probe || null;
       srv.noInitProbe     = data.no_init_probe || false;
+      srv.noInitProbeEvidence = data.no_init_probe_evidence || null;
       srv.fromCache       = false;
       srv.certInfo        = null;
       const _preserved = (srv.findings || []).filter(f => ['auth-test','oauth-probe','cert'].includes(f.item));
@@ -4525,6 +4542,7 @@ function switchHistTab(name) {
   document.getElementById('hist-export-json').style.display     = name === 'history'  ? '' : 'none';
   document.getElementById('hist-export-md').style.display       = name === 'history'  ? '' : 'none';
   document.getElementById('hist-clear').style.display           = name === 'history'  ? '' : 'none';
+  document.getElementById('findings-show-suppressed').style.display = name === 'findings' ? '' : 'none';
   document.getElementById('findings-clear').style.display       = name === 'findings' ? '' : 'none';
   document.getElementById('findings-add').style.display         = name === 'findings' ? '' : 'none';
   document.getElementById('findings-export-wrap').style.display = name === 'findings' ? '' : 'none';
@@ -4643,20 +4661,61 @@ function submitCustomFinding() {
   renderFindings();
 }
 
-function _addNoInitFinding(srv) {
-  if ((srv.findings || []).some(f => f.item === 'no-init-probe')) return;
-  const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+function _addNoInitFinding(srv, historyId) {
   srv.findings = srv.findings || [];
-  srv.findings.push({
+  const existing = srv.findings.find(f => f.item === 'no-init-probe');
+  if (existing) { existing.historyId = historyId; }
+  else srv.findings.push({
     severity: 'medium',
     category: 'Protocol',
-    server: srvShort,
+    server: srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, ''),
     item: 'no-init-probe',
     detail: 'MCP-003: Server responded to tools/list without a prior initialize handshake — stateless session enforcement is missing',
     remediation: 'Require clients to complete the initialize/initialized handshake before accepting any other method calls. Reject requests from sessions that have not completed initialization with JSON-RPC error -32600 (Invalid Request).',
     source: 'auto',
+    historyId,
   });
   srv.noInitProbe = true;
+  srv.noInitProbeHistId = historyId;
+  renderFindings();
+  debouncedSaveProject();
+}
+
+const META_TRUST_FINDINGS = {
+  'forged-version': {
+    severity: 'high',
+    item: 'meta-forged-version',
+    detail: 'Server accepted a forged/unsupported protocol version (1900-01-01) declared in caller _meta and returned a normal result instead of rejecting it with -32022 (UnsupportedProtocolVersion) — the caller-declared version is not validated, so an attacker can force weaker/legacy semantics or skip version-gated checks on any request.',
+    remediation: 'Validate io.modelcontextprotocol/protocolVersion in caller-supplied _meta against the versions this server actually supports, and reject unsupported values with -32022 (UnsupportedProtocolVersion) instead of proceeding.',
+  },
+  'meta-omitted': {
+    severity: 'medium',
+    item: 'meta-omitted',
+    detail: 'Server accepted a modern-mode request that omitted the required io.modelcontextprotocol/protocolVersion _meta field and returned a normal result instead of rejecting it with -32602 (Invalid params) — it infers protocol context it was never given, which suggests other caller-supplied _meta (identity, capabilities, tenant/trace) is trusted just as loosely.',
+    remediation: 'Reject requests missing required _meta fields (e.g. protocolVersion) with -32602 (Invalid params) rather than inferring a default. Every per-request _meta field used in a security decision must be validated, not assumed.',
+  },
+};
+
+function _addMetaTrustFinding(srv, kind, historyId) {
+  const spec = META_TRUST_FINDINGS[kind];
+  if (!spec) return;
+  srv.findings = srv.findings || [];
+  const existing = srv.findings.find(f => f.item === spec.item);
+  if (existing) { existing.historyId = historyId; }
+  else srv.findings.push({
+    severity: spec.severity,
+    category: 'Protocol',
+    server: srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, ''),
+    item: spec.item,
+    detail: spec.detail,
+    remediation: spec.remediation,
+    source: 'auto',
+    historyId,
+  });
+  srv.metaTrustFindings = srv.metaTrustFindings || {};
+  srv.metaTrustFindings[kind] = true;
+  srv.metaTrustHistIds = srv.metaTrustHistIds || {};
+  srv.metaTrustHistIds[kind] = historyId;
   renderFindings();
   debouncedSaveProject();
 }
@@ -4786,6 +4845,8 @@ function scanServerFindings(srv) {
   const rows = [];
 
   // MCP-003: responds to tool calls without initialize handshake
+  // Auto-detected at connect time (srv.noInitProbeEvidence) — a manual re-fire of the
+  // "No-init probe" preset (srv.noInitProbeHistId) takes precedence if one was done.
   if (srv.noInitProbe) {
     rows.push({
       severity: 'medium',
@@ -4794,6 +4855,24 @@ function scanServerFindings(srv) {
       item: 'no-init-probe',
       detail: 'MCP-003: Server responded to tools/list without a prior initialize handshake — stateless session enforcement is missing',
       remediation: 'Require clients to complete the initialize/initialized handshake before accepting any other method calls. Reject requests from sessions that have not completed initialization with JSON-RPC error -32600 (Invalid Request).',
+      historyId: srv.noInitProbeHistId,
+      serverUrl: srv.url,
+      probeField: 'noInitProbeEvidence',
+    });
+  }
+
+  // Modern/_meta trust: forged or malformed caller _meta accepted instead of rejected
+  for (const kind of Object.keys(srv.metaTrustFindings || {})) {
+    const spec = META_TRUST_FINDINGS[kind];
+    if (!spec) continue;
+    rows.push({
+      severity: spec.severity,
+      category: 'Protocol',
+      server: srvShort,
+      item: spec.item,
+      detail: spec.detail,
+      remediation: spec.remediation,
+      historyId: srv.metaTrustHistIds?.[kind],
     });
   }
 
@@ -4811,6 +4890,7 @@ function scanServerFindings(srv) {
       remediation: hasToken
         ? 'Migrate to HTTPS immediately. Bearer tokens transmitted over HTTP are exposed to passive network interception. Obtain a TLS certificate and redirect all HTTP traffic to HTTPS.'
         : 'Migrate to HTTPS to prevent passive eavesdropping and traffic manipulation. Obtain a TLS certificate and configure the server to accept encrypted connections only.',
+      serverUrl: srv.url,
     });
   }
 
@@ -4822,27 +4902,32 @@ function scanServerFindings(srv) {
     if (origin === '*' && creds === 'true') {
       rows.push({severity: 'critical', category: 'CORS Misconfiguration', server: srvShort, item: 'server',
         detail: 'Access-Control-Allow-Origin: * combined with Access-Control-Allow-Credentials: true allows any origin to make credentialed cross-origin requests',
-        remediation: 'Never combine a wildcard CORS origin with Allow-Credentials: true. Restrict Access-Control-Allow-Origin to an explicit allowlist of trusted origins and reflect only trusted values.'});
+        remediation: 'Never combine a wildcard CORS origin with Allow-Credentials: true. Restrict Access-Control-Allow-Origin to an explicit allowlist of trusted origins and reflect only trusted values.',
+        serverUrl: srv.url});
     } else if (origin === '*') {
       rows.push({severity: 'high', category: 'CORS Misconfiguration', server: srvShort, item: 'server',
         detail: 'Access-Control-Allow-Origin: * — any web page can make cross-origin requests to this MCP server',
-        remediation: 'Restrict Access-Control-Allow-Origin to explicit trusted origins. Avoid wildcard unless the server is intentionally public and unauthenticated.'});
+        remediation: 'Restrict Access-Control-Allow-Origin to explicit trusted origins. Avoid wildcard unless the server is intentionally public and unauthenticated.',
+        serverUrl: srv.url});
     }
     if (/^https:/i.test(srv.url) && !h['strict-transport-security']) {
       rows.push({severity: 'medium', category: 'Missing Security Header', server: srvShort, item: 'server',
         detail: 'HTTPS server does not return Strict-Transport-Security (HSTS) — clients may downgrade to HTTP on future connections',
-        remediation: 'Add "Strict-Transport-Security: max-age=31536000; includeSubDomains" to all HTTPS responses to prevent protocol downgrade attacks.'});
+        remediation: 'Add "Strict-Transport-Security: max-age=31536000; includeSubDomains" to all HTTPS responses to prevent protocol downgrade attacks.',
+        serverUrl: srv.url});
     }
     const serverVer = h['server'] || h['x-powered-by'];
     if (serverVer && /[\d.]/.test(serverVer)) {
       rows.push({severity: 'low', category: 'Version Disclosure', server: srvShort, item: 'server',
         detail: `Server version exposed in response header: ${serverVer}`,
-        remediation: 'Remove or genericise the Server / X-Powered-By header to avoid disclosing implementation details that assist fingerprinting and targeted exploits.'});
+        remediation: 'Remove or genericise the Server / X-Powered-By header to avoid disclosing implementation details that assist fingerprinting and targeted exploits.',
+        serverUrl: srv.url});
     }
     if (!h['x-content-type-options']) {
       rows.push({severity: 'low', category: 'Missing Security Header', server: srvShort, item: 'server',
         detail: 'X-Content-Type-Options header absent — clients may MIME-sniff responses',
-        remediation: 'Add "X-Content-Type-Options: nosniff" to all responses.'});
+        remediation: 'Add "X-Content-Type-Options: nosniff" to all responses.',
+        serverUrl: srv.url});
     }
   }
 
@@ -4851,7 +4936,8 @@ function scanServerFindings(srv) {
     rows.push({severity: v.severity, category: 'Vulnerability',
       server: srvShort, item: 'server',
       detail: `[${v.id}] ${v.title} — ${v.desc}`,
-      remediation: 'Apply the vendor patch or workaround for this vulnerability. Update the MCP server to the latest patched release and review the advisory for additional mitigations.'});
+      remediation: 'Apply the vendor patch or workaround for this vulnerability. Update the MCP server to the latest patched release and review the advisory for additional mitigations.',
+      serverUrl: srv.url});
   }
 
   // Capability risks (skip plain info caps)
@@ -5033,6 +5119,41 @@ function scanServerFindings(srv) {
     }
   }
 
+  // MCP Apps host-rendered HTML UI (2026-07-28 io.modelcontextprotocol/ui).
+  // A tool declares _meta.ui.resourceUri -> the host fetches that ui:// resource
+  // (bundled HTML/JS) and renders it in a sandboxed iframe with a JSON-RPC bridge
+  // back to the host. Server-controlled UI = phishing/clickjacking + confused-
+  // deputy tool invocation; a non-ui:// resourceUri is an external HTML fetch.
+  const APPS_REMEDIATION = 'Treat server-supplied UI as untrusted code. Only load UI resources over the ui:// scheme served by the same server — never external http(s)/data/file URLs. Enforce a strict iframe sandbox (never combine allow-scripts with allow-same-origin) and a restrictive Content-Security-Policy. Require explicit user consent for every tool invocation initiated from a UI bridge; do not let the app auto-invoke tools. Review each declared UI resource and the tools it can reach.';
+  for (const t of (srv.tools || [])) {
+    const ui = t && t._meta && t._meta.ui;
+    const uri = ui && typeof ui.resourceUri === 'string' ? ui.resourceUri
+              : (ui && typeof ui.uri === 'string' ? ui.uri : '');
+    if (!uri) continue;
+    const scheme = uri.includes(':') ? uri.split(':', 1)[0].toLowerCase() : '';
+    if (scheme === 'ui') {
+      rows.push({
+        severity: 'medium',
+        category: 'MCP Apps UI',
+        server: srvShort, item: t.name,
+        detail: `Tool declares _meta.ui.resourceUri=${uri}. The host fetches this ui:// resource (bundled HTML/JS) and renders it in a sandboxed iframe with a JSON-RPC-over-postMessage bridge back to the host. Server-controlled HTML can present phishing/clickjacking surfaces and invoke tools through the bridge (confused deputy).`,
+        remediation: APPS_REMEDIATION,
+      });
+    } else {
+      const risk = (scheme === 'http' || scheme === 'https') ? iconHostRisk(uri, srvShort) : null;
+      const extra = risk === 'internal'
+        ? ' The target is an internal/loopback/metadata address — the host is coerced into a client-side SSRF request.'
+        : (scheme === 'data' ? ' The UI is an inline data: URI — arbitrary HTML/JS embedded directly in tool metadata.' : '');
+      rows.push({
+        severity: 'high',
+        category: 'MCP Apps UI',
+        server: srvShort, item: t.name,
+        detail: `Tool declares _meta.ui.resourceUri=${uri}, which is not the expected ui:// scheme. The host fetches this URL and renders the returned content as HTML in the app iframe, so a server can serve arbitrary external or inline HTML/JS to your client and reach it over the tool bridge.${extra}`,
+        remediation: APPS_REMEDIATION,
+      });
+    }
+  }
+
   return rows;
 }
 
@@ -5090,7 +5211,7 @@ function buildFindings() {
   }
 
   rows.sort((a, b) => (SEV_ORD[a.severity] ?? 4) - (SEV_ORD[b.severity] ?? 4));
-  return rows.filter(f => !S.findingDismissed.has(findingFp(f)));
+  return rows.filter(f => S.showSuppressed || !S.findingDismissed.has(findingFp(f)));
 }
 
 const FINDING_STATUS_CYCLE = ['open', 'confirmed', 'false_positive', 'accepted_risk'];
@@ -5118,9 +5239,30 @@ function saveFindingNote(fp, value) {
 }
 
 function dismissFinding(fp) {
+  if (!confirm('Dismiss this finding? It will be hidden from the Findings list — use "Show Suppressed Finds" to bring it back.')) return;
   S.findingDismissed.add(fp);
   localStorage.setItem('mcpoke-finding-dismissed', JSON.stringify([...S.findingDismissed]));
   renderFindings();
+}
+
+function undismissFinding(fp) {
+  S.findingDismissed.delete(fp);
+  localStorage.setItem('mcpoke-finding-dismissed', JSON.stringify([...S.findingDismissed]));
+  renderFindings();
+}
+
+function toggleShowSuppressed() {
+  S.showSuppressed = !S.showSuppressed;
+  renderFindings();
+}
+
+function _updateSuppressedBtns() {
+  document.querySelectorAll('.findings-show-suppressed-btn').forEach(b => {
+    b.classList.toggle('active', S.showSuppressed);
+    b.textContent = S.showSuppressed
+      ? `Hide Suppressed Finds (${S.findingDismissed.size})`
+      : `Show Suppressed Finds (${S.findingDismissed.size})`;
+  });
 }
 
 function buildFindingRows(findings, filterQ) {
@@ -5142,21 +5284,30 @@ function buildFindingRows(findings, filterQ) {
     const remCell = f.remediation
       ? `<td class="findings-remediation">${esc(f.remediation)}</td>`
       : `<td style="color:var(--border);font-size:10px">—</td>`;
+    const isSuppressed = S.findingDismissed.has(fp);
     const delBtn = f.source === 'manual'
       ? `<button class="btn-sm" title="Delete finding" onclick="deleteManualFinding('${esc(f.id)}')">&#x2715;</button>`
+      : isSuppressed
+      ? `<button class="btn-sm" title="Undismiss — restore this finding" style="color:var(--accent)" onclick="undismissFinding('${safeFp}')">&#8635; Undismiss</button>`
       : `<button class="btn-sm" title="Dismiss finding (hides it — use status for false positive tracking)" style="color:var(--muted)" onclick="dismissFinding('${safeFp}')">&#x2715;</button>`;
-    const histBtn = f.historyId !== undefined
-      ? `<button class="btn-sm" title="Show the request/response that triggered this finding" style="color:var(--accent);font-weight:700" onclick="openHistEntryPopup(${f.historyId})">&#8594; request</button>`
+    const probeField = f.probeField || 'connectProbe';
+    const hasConnectProbe = f.serverUrl !== undefined && !!S.servers[f.serverUrl]?.[probeField];
+    const reqOnclick = f.historyId !== undefined ? `openHistEntryPopup(${f.historyId})`
+      : hasConnectProbe ? `openConnectProbePopup('${esc(f.serverUrl).replace(/'/g,"\\'")}','${probeField}')`
+      : null;
+    const histBtn = reqOnclick
+      ? `<button class="btn-sm" title="Show the request/response that triggered this finding" style="color:var(--accent);font-weight:700" onclick="${reqOnclick}">&#8594; request</button>`
       : '';
-    const rowStyle = status === 'false_positive' ? ' style="opacity:.45;text-decoration:line-through"' : '';
-    const detailClick = f.historyId !== undefined
-      ? ` style="cursor:pointer;color:var(--text)" title="Click to view request/response" onclick="openHistEntryPopup(${f.historyId})"`
+    const rowStyle = isSuppressed ? ' style="opacity:.45"'
+      : status === 'false_positive' ? ' style="opacity:.45;text-decoration:line-through"' : '';
+    const detailClick = reqOnclick
+      ? ` style="cursor:pointer;color:var(--text)" title="Click to view request/response" onclick="${reqOnclick}"`
       : '';
     return `<tr${rowStyle}>
       <td><span class="cap-${esc(f.severity)}">${esc(f.severity)}</span></td>
       <td><button class="btn-sm" style="font-size:9px;color:${FINDING_STATUS_COLOR[status]};white-space:nowrap"
           title="Click to cycle status" onclick="cycleFindingStatus('${safeFp}')">${FINDING_STATUS_LABEL[status]}</button></td>
-      <td>${esc(f.category)}</td>
+      <td>${esc(f.category)}${isSuppressed ? ' <span style="font-size:9px;color:var(--muted);border:1px solid var(--border);border-radius:3px;padding:0 3px">SUPPRESSED</span>' : ''}</td>
       <td style="color:var(--muted)">${esc(f.server)}</td>
       <td style="color:var(--accent)">${esc(f.item)}</td>
       <td class="findings-detail"${detailClick}>${esc(f.detail)}</td>
@@ -5173,8 +5324,10 @@ function buildFindingRows(findings, filterQ) {
 
 function renderFindings() {
   const findings = buildFindings();
+  const activeCount = findings.filter(f => !S.findingDismissed.has(findingFp(f))).length;
+  _updateSuppressedBtns();
   const tab = document.getElementById('htab-findings');
-  tab.textContent = findings.length ? `Findings (${findings.length})` : 'Findings';
+  tab.textContent = activeCount ? `Findings (${activeCount})` : 'Findings';
   const inlineQ = document.getElementById('findings-filter')?.value || '';
   document.getElementById('findings-body').innerHTML = buildFindingRows(findings, inlineQ);
   // Keep modal in sync if open
@@ -5183,8 +5336,8 @@ function renderFindings() {
     const modalQ = document.getElementById('findings-modal-filter')?.value || '';
     modalBody.innerHTML = buildFindingRows(findings, modalQ);
     const cnt = document.getElementById('findings-modal-count');
-    if (cnt) cnt.textContent = findings.length
-      ? `${findings.length} finding${findings.length === 1 ? '' : 's'}`
+    if (cnt) cnt.textContent = activeCount
+      ? `${activeCount} finding${activeCount === 1 ? '' : 's'}`
       : 'No findings';
   }
 }
@@ -5210,6 +5363,7 @@ function openFindingsModal() {
       <div class="panel-modal-hdr">
         <span style="color:#e3b341;font-weight:700;font-family:monospace;font-size:13px">&#9873; Findings</span>
         <span id="findings-modal-count" style="color:var(--muted);font-size:11px;flex:1"></span>
+        <button class="btn-sm findings-show-suppressed-btn" onclick="toggleShowSuppressed()">Show Suppressed Finds (0)</button>
         <button class="btn-sm" onclick="clearFindings()">Clear Findings</button>
         <button class="btn-sm" onclick="openAddFindingModal()">&#x2b; Add Finding</button>
         ${exportMenu}
@@ -5897,21 +6051,25 @@ const PROTOCOL_PRESETS = [
   // ── Enumeration ──────────────────────────────────────────────────────────
   {
     label: 'Enumerate: tools/list',
+    cat:   'Enumeration',
     hint:  'list all tools exposed by the server',
     payload: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
   },
   {
     label: 'Enumerate: resources/list',
+    cat:   'Enumeration',
     hint:  'list all resources exposed by the server',
     payload: {"jsonrpc":"2.0","id":1,"method":"resources/list","params":{}},
   },
   {
     label: 'Enumerate: prompts/list',
+    cat:   'Enumeration',
     hint:  'list all prompts exposed by the server',
     payload: {"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{}},
   },
   {
     label: 'MCP-003: No-init probe (tools/list)',
+    cat:   'Enumeration',
     hint:  'send tools/list in a fresh session without initialize — if the server responds with a result (not an error), MCP-003 is confirmed and added to findings',
     payload: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
     noInitProbe: true,
@@ -5919,90 +6077,141 @@ const PROTOCOL_PRESETS = [
   // ── Protocol edge cases ──────────────────────────────────────────────────
   {
     label: 'Wrong protocolVersion',
+    cat:   'Edge cases',
     hint:  'initialize with an unknown future version — server should reject',
     payload: {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2099-01-01","capabilities":{},"clientInfo":{"name":"mcpoke","version":"1.0"}}},
   },
   {
     label: 'Missing jsonrpc field',
+    cat:   'Edge cases',
     hint:  'omit the jsonrpc key entirely — strict servers must reject',
     payload: {"id":1,"method":"tools/list","params":{}},
   },
   {
     label: 'id: null',
+    cat:   'Edge cases',
     hint:  'null id is technically valid JSON-RPC but some servers choke',
     payload: {"jsonrpc":"2.0","id":null,"method":"tools/list","params":{}},
   },
   {
     label: 'id omitted',
+    cat:   'Edge cases',
     hint:  'no id field — looks like a notification, not a request',
     payload: {"jsonrpc":"2.0","method":"tools/list","params":{}},
   },
   {
     label: 'Notification as request',
+    cat:   'Edge cases',
     hint:  'send notifications/initialized with an id — should be a no-op',
     payload: {"jsonrpc":"2.0","id":1,"method":"notifications/initialized","params":{}},
   },
   {
     label: 'Unknown method',
+    cat:   'Edge cases',
     hint:  'method that does not exist — server should return error -32601',
     payload: {"jsonrpc":"2.0","id":1,"method":"mcpoke/doesNotExist","params":{}},
   },
   {
     label: 'Batch request',
+    cat:   'Edge cases',
     hint:  'array of two requests — most MCP servers do not support batching',
     payload: [{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},{"jsonrpc":"2.0","id":2,"method":"resources/list","params":{}}],
   },
   {
     label: 'Oversized id (integer overflow)',
+    cat:   'Edge cases',
     hint:  'very large id integer — tests id round-tripping',
     payload: {"jsonrpc":"2.0","id":9007199254740993,"method":"tools/list","params":{}},
   },
   {
     label: 'String id',
+    cat:   'Edge cases',
     hint:  'string id instead of integer — JSON-RPC allows it, some MCP servers reject',
     payload: {"jsonrpc":"2.0","id":"mcpoke-test","method":"tools/list","params":{}},
   },
   {
     label: 'Extra unknown params field',
+    cat:   'Edge cases',
     hint:  'add an unrecognised top-level field — servers should ignore it',
     payload: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{},"mcpokeTest":true},
   },
   // ── MCP spec coverage ────────────────────────────────────────────────────
   {
     label: 'MCP: ping',
+    cat:   'Spec coverage',
     hint:  'health-check endpoint — often unauthenticated; check if auth is enforced',
     payload: {"jsonrpc":"2.0","id":1,"method":"ping","params":{}},
   },
   {
     label: 'MCP: completion/complete',
+    cat:   'Spec coverage',
     hint:  'autocomplete endpoint — injection vector; check for reflected input and auth enforcement',
     payload: {"jsonrpc":"2.0","id":1,"method":"completion/complete","params":{"ref":{"type":"ref/prompt","name":"example"},"argument":{"name":"query","value":"test"}}},
   },
   {
     label: 'MCP: resources/subscribe',
+    cat:   'Spec coverage',
     hint:  'subscribe to resource updates — check if unauthorised subscriptions are accepted',
     payload: {"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"resource://EDIT_ME"}},
   },
   {
     label: 'MCP: logging/setLevel',
+    cat:   'Spec coverage',
     hint:  'control server log verbosity — check if unprivileged callers can set DEBUG and extract sensitive log data',
     payload: {"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"debug"}},
   },
   // ── MCP 2025-11-25 tasks (IDOR / cross-session disclosure surface) ─────────
   {
     label: 'MCP: tasks/list',
+    cat:   'Tasks (IDOR)',
     hint:  'enumerate tasks — if the server declares tasks.list without identifying requestors, this returns every task ID including ones you never created (IDOR enumeration)',
     payload: {"jsonrpc":"2.0","id":1,"method":"tasks/list","params":{}},
   },
   {
     label: 'MCP: tasks/get',
+    cat:   'Tasks (IDOR)',
     hint:  'poll a task status by ID — try an ID you did not create to check for missing ownership binding',
     payload: {"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"taskId":"EDIT_ME"}},
   },
   {
     label: 'MCP: tasks/result',
+    cat:   'Tasks (IDOR)',
     hint:  'retrieve a task result by ID — if results are returned without an ownership check, another session\'s long-running operation output is disclosed (task IDOR)',
     payload: {"jsonrpc":"2.0","id":1,"method":"tasks/result","params":{"taskId":"EDIT_ME"}},
+  },
+  // ── 2026-07-28 SEP-2243 Mcp-Method/Mcp-Name header–body desync ─────────────
+  {
+    label: 'MCP: header/body desync (SEP-2243)',
+    cat:   'SEP-2243',
+    hint:  'ALSO set a custom header Mcp-Method: prompts/get (via the server\'s Custom Headers) while sending this tools/list body. A 2026-07-28 server MUST reject the mismatch with 400 / -32020 HeaderMismatch. If it returns a tools/list result instead, any gateway routing/authz/rate-limiting on Mcp-Method is bypassable (request smuggling).',
+    payload: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
+  },
+  // ── 2026-07-28 modern/stateless caller-controlled _meta trust ───────────────
+  {
+    label: 'MCP: server/discover (modern era?)',
+    cat:   'Modern _meta',
+    hint:  'modern (stateless 2026-07-28) servers MUST implement server/discover and advertise their supported protocol versions. A result listing versions confirms modern mode — the _meta-trust probes below then apply. Method-not-found = legacy (handshake-based).',
+    payload: {"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}},
+  },
+  {
+    label: 'MCP: forged protocol version in _meta',
+    cat:   'Modern _meta',
+    hint:  'ALSO set custom header MCP-Protocol-Version: 1900-01-01. Modern servers carry version/identity/capabilities as per-request _meta with no session to pin them. A conformant server MUST reject an unsupported version with -32022 (UnsupportedProtocolVersion). If it returns a tools/list result, it does not validate the caller-declared version — an attacker forces weaker/legacy semantics or skips version-gated checks on every request (per-request downgrade).',
+    payload: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"mcpoke","version":"1.0"}}}},
+    metaProbe: 'forged-version',
+  },
+  {
+    label: 'MCP: required _meta omitted',
+    cat:   'Modern _meta',
+    hint:  'sends a modern request MISSING the required io.modelcontextprotocol/protocolVersion _meta field. A conformant modern server MUST reject it as malformed with -32602 (Invalid params) / 400. If it returns a result, it infers protocol context it was not given — the assumption the stateless model forbids — and likely trusts other caller _meta (identity, capabilities, tenant/trace) just as loosely.',
+    payload: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"mcpoke","version":"1.0"}}}},
+    metaProbe: 'meta-omitted',
+  },
+  {
+    label: 'MCP: forged clientInfo (identity trust)',
+    cat:   'Modern _meta',
+    hint:  'the spec says clientInfo is self-reported and unverified — servers SHOULD NOT change behavior or make security decisions from it. Send this with a spoofed privileged clientInfo and compare the exposed surface (tool list, permitted actions) against a normal clientInfo. Any behavioral difference = the server trusts unverified caller identity (privilege inflation / confused deputy).',
+    payload: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"admin-console","version":"1.0"}}}},
   },
 ];
 
@@ -6054,30 +6263,70 @@ function copyAsFormat(fmt) {
   });
 }
 
-function toggleProtocolMenu() {
-  const menu = document.getElementById('protocol-preset-menu');
-  if (menu.style.display !== 'none') { menu.style.display = 'none'; return; }
-  if (!menu.innerHTML) {
-    menu.innerHTML = PROTOCOL_PRESETS.map((p, i) =>
-      `<div class="export-opt" title="${esc(p.hint)}" onclick="injectProtocolPreset(${i})">${esc(p.label)}</div>`
-    ).join('');
-  }
-  menu.style.display = '';
-  setTimeout(() => document.addEventListener('click', _closeProtocolMenu, {once: true, capture: true}), 0);
+function openProtocolModal() {
+  document.getElementById('protocol-overlay')?.remove();
+  const cats = [...new Set(PROTOCOL_PRESETS.map(p => p.cat))];
+
+  const ov = document.createElement('div');
+  ov.id = 'protocol-overlay';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:3000;display:flex;align-items:stretch;justify-content:center;padding:24px;box-sizing:border-box';
+
+  ov.innerHTML = `
+<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;display:flex;flex-direction:column;width:100%;max-width:800px;overflow:hidden">
+  <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);flex-shrink:0">
+    <span style="font-weight:600;font-size:14px">&#128268; Protocol Presets</span>
+    <input id="protocol-search" type="text" placeholder="Filter..." oninput="filterProtocolSearch(this.value)"
+           style="margin-left:auto;padding:3px 8px;font-size:12px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--fg);width:180px">
+    <button class="btn-sm" onclick="document.getElementById('protocol-overlay').remove()">&#10005; Close</button>
+  </div>
+  <div style="padding:8px 16px;border-bottom:1px solid var(--border);display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0">
+    <button class="btn-sm protocol-cat-btn active" data-cat="all" onclick="filterProtocolCat(this,'all')">All</button>
+    ${cats.map(c => `<button class="btn-sm protocol-cat-btn" data-cat="${esc(c)}" onclick="filterProtocolCat(this,'${esc(c)}')">${esc(c)}</button>`).join('')}
+  </div>
+  <div style="overflow-y:auto;flex:1">
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <tbody id="protocol-tbody">
+        ${PROTOCOL_PRESETS.map((p,i) => `
+        <tr class="protocol-row" data-cat="${esc(p.cat)}" data-search="${esc((p.label+' '+p.hint).toLowerCase())}"
+            style="border-bottom:1px solid var(--border);cursor:pointer" onclick="injectProtocolPreset(${i})">
+          <td style="padding:6px 8px;color:var(--muted);width:90px;white-space:nowrap">${esc(p.cat)}</td>
+          <td style="padding:6px 8px;font-weight:600;color:var(--accent);white-space:nowrap">${esc(p.label)}</td>
+          <td style="padding:6px 8px;color:var(--fg)">${esc(p.hint)}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+  </div>
+</div>`;
+
+  document.body.appendChild(ov);
+  ov.addEventListener('click', e => { if (e.target === ov) ov.remove(); });
+  setTimeout(() => document.getElementById('protocol-search')?.focus(), 0);
 }
 
-function _closeProtocolMenu(e) {
-  const menu = document.getElementById('protocol-preset-menu');
-  if (menu && !menu.contains(e.target)) menu.style.display = 'none';
+function filterProtocolCat(btn, cat) {
+  document.querySelectorAll('.protocol-cat-btn').forEach(b => b.classList.toggle('active', b === btn));
+  document.getElementById('protocol-search').value = '';
+  document.querySelectorAll('.protocol-row').forEach(row => {
+    row.style.display = (cat === 'all' || row.dataset.cat === cat) ? '' : 'none';
+  });
+}
+
+function filterProtocolSearch(q) {
+  q = q.trim().toLowerCase();
+  document.querySelectorAll('.protocol-cat-btn').forEach(b => b.classList.toggle('active', b.dataset.cat === 'all'));
+  document.querySelectorAll('.protocol-row').forEach(row => {
+    row.style.display = (!q || row.dataset.search.includes(q)) ? '' : 'none';
+  });
 }
 
 function injectProtocolPreset(idx) {
-  document.getElementById('protocol-preset-menu').style.display = 'none';
+  document.getElementById('protocol-overlay')?.remove();
   const preset = PROTOCOL_PRESETS[idx];
   if (!preset) return;
   setMode('raw');
   document.getElementById('raw-editor').value = applyOobUrl(JSON.stringify(preset.payload, null, 2));
   S.pendingNoInitProbe = preset.noInitProbe || false;
+  S.pendingMetaProbe   = preset.metaProbe   || null;
 }
 
 // ── Form generation ────────────────────────────────────────────────────────
@@ -6372,12 +6621,19 @@ async function doSend() {
     const elapsed = Date.now() - t0;
     const isErr        = !!(body?.error || body?.result?.error || body?.result?.isError);
     const sensitiveHits = showResponse(body, elapsed, args);
+    const newHistId = S.history.length;
     addHistory(srv.url, toolName, args, body, isErr, elapsed, sensitiveHits, S.rawMode ? fetchBody.payload : null);
     addNotifications(srv.url, body?.notifications);
     // MCP-003: if this was a manual no-init probe and got a valid result, add finding
     if (S.pendingNoInitProbe) {
       S.pendingNoInitProbe = false;
-      if (!isErr && body?.result && !body.result?.error) _addNoInitFinding(srv);
+      if (!isErr && body?.result && !body.result?.error) _addNoInitFinding(srv, newHistId);
+    }
+    // Modern/_meta trust: if the server accepted a malformed/forged _meta instead of rejecting it, add finding
+    if (S.pendingMetaProbe) {
+      const _metaProbeKind = S.pendingMetaProbe;
+      S.pendingMetaProbe = null;
+      if (!isErr && body?.result && !body.result?.error) _addMetaTrustFinding(srv, _metaProbeKind, newHistId);
     }
   } catch (e) {
     showError(`Send failed: ${e.message}`);
@@ -6575,6 +6831,41 @@ function openHistEntryPopup(id) {
     <div class="panel-modal-hdr">
       <span style="color:var(--accent);font-weight:700;font-family:monospace;font-size:13px">&#9654; History #${id}</span>
       <span style="color:var(--muted);font-size:11px;margin-left:.5rem;flex:1">${esc(e.tool)} &nbsp;·&nbsp; ${e.time} &nbsp;·&nbsp; ${e.elapsed}ms</span>
+      <button class="btn-sm" onclick="document.getElementById('hist-entry-overlay').remove()">&#x2715; Close</button>
+    </div>
+    <div style="display:flex;flex:1;overflow:hidden;gap:1px;background:var(--border)">
+      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)">
+        <div style="padding:.3rem .5rem;font-size:11px;color:var(--muted);border-bottom:1px solid var(--border)">Request</div>
+        <pre style="flex:1;overflow:auto;margin:0;padding:.5rem;font-size:11px;font-family:monospace;white-space:pre-wrap;word-break:break-all">${esc(reqText)}</pre>
+      </div>
+      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)">
+        <div style="padding:.3rem .5rem;font-size:11px;color:var(--muted);border-bottom:1px solid var(--border)">Response</div>
+        <pre style="flex:1;overflow:auto;margin:0;padding:.5rem;font-size:11px;font-family:monospace;white-space:pre-wrap;word-break:break-all">${esc(respText)}</pre>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener('click', ev => { if (ev.target === ov) ov.remove(); });
+  const onKey = ev => { if (ev.key === 'Escape') { ov.remove(); document.removeEventListener('keydown', onKey); } };
+  document.addEventListener('keydown', onKey);
+}
+
+function openConnectProbePopup(url, field) {
+  field = field || 'connectProbe';
+  const srv = S.servers[url];
+  const probe = srv?.[field];
+  if (!probe) return;
+  document.getElementById('hist-entry-overlay')?.remove();
+  const ov = document.createElement('div');
+  ov.id = 'hist-entry-overlay';
+  ov.style.cssText = 'position:fixed;inset:0;z-index:3000;display:flex;flex-direction:column;background:var(--bg)';
+  const reqText  = JSON.stringify(probe.request, null, 2);
+  const respText = JSON.stringify(probe.response, null, 2);
+  const label = field === 'noInitProbeEvidence'
+    ? 'no-init probe used to infer this finding' : 'initialize handshake used to infer this finding';
+  ov.innerHTML = `
+    <div class="panel-modal-hdr">
+      <span style="color:var(--accent);font-weight:700;font-family:monospace;font-size:13px">&#9654; Connect probe</span>
+      <span style="color:var(--muted);font-size:11px;margin-left:.5rem;flex:1">${esc(label)}</span>
       <button class="btn-sm" onclick="document.getElementById('hist-entry-overlay').remove()">&#x2715; Close</button>
     </div>
     <div style="display:flex;flex:1;overflow:hidden;gap:1px;background:var(--border)">
@@ -7064,6 +7355,11 @@ function buildProjectData() {
     tools: srv.tools, resources: srv.resources, prompts: srv.prompts,
     findings: srv.findings || [], lastSeen: srv.lastSeen,
     noInitProbe: srv.noInitProbe || false,
+    noInitProbeHistId: srv.noInitProbeHistId,
+    noInitProbeEvidence: srv.noInitProbeEvidence || null,
+    metaTrustFindings: srv.metaTrustFindings || {},
+    metaTrustHistIds: srv.metaTrustHistIds || {},
+    connectProbe: srv.connectProbe || null,
   }));
   return {
     version: 2,
@@ -7402,6 +7698,11 @@ function restoreSessionData(session) {
     srv.findings     = s.findings     || [];
     srv.lastSeen     = s.lastSeen     || null;
     srv.noInitProbe  = s.noInitProbe  || false;
+    srv.noInitProbeHistId = s.noInitProbeHistId;
+    srv.noInitProbeEvidence = s.noInitProbeEvidence || null;
+    srv.metaTrustFindings = s.metaTrustFindings || {};
+    srv.metaTrustHistIds  = s.metaTrustHistIds  || {};
+    srv.connectProbe = s.connectProbe || null;
     srv.fromCache    = true;
     S.servers[s.url] = srv;
   }
