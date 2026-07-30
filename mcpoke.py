@@ -1059,6 +1059,32 @@ async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None) -> dict:
                 except Exception as e:
                     tests.append({"name": f"Scope: {scope}", "error": str(e)})
 
+        # 7 — iss binding (RFC 9207) — mix-up attack mitigation. Metadata-only, no extra
+        # request: MCP agents typically hold tokens/authorization flows against MANY
+        # authorization servers concurrently (one per MCP server); without the AS advertising
+        # authorization_response_iss_parameter_supported (and including iss in every
+        # authorization response), a client can't verify which AS a given code/token came
+        # from — an attacker's or compromised server's AS relationship can be used to
+        # intercept/redirect an authorization artifact meant for a DIFFERENT, legitimate
+        # server's AS. See https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate/
+        # ("mix-up attacks... more prevalent in MCP's single-client, many-server deployment
+        # pattern"). This is a discovery-metadata indicator only — confirming iss actually
+        # appears in a live authorization response needs a real interactive flow (browser +
+        # human login), which this probe does not attempt.
+        # No tests[] row: unlike steps 2-6 this isn't an HTTP-response-based active probe
+        # (no status code to show), just a metadata field check — surfaces via findings only.
+        iss_supported = meta.get("authorization_response_iss_parameter_supported")
+        if not iss_supported:
+            finds.append({"severity": "medium", "category": "OAuth",
+                          "detail": "authorization_response_iss_parameter_supported absent or "
+                                    "false — server does not advertise RFC 9207 iss binding, "
+                                    "leaving clients unable to defend against an OAuth mix-up "
+                                    "attack when juggling multiple authorization servers "
+                                    "(mirrors MCPensive MCP-061)",
+                          "remediation": "Advertise authorization_response_iss_parameter_supported: "
+                                         "true and include iss (this server's issuer identifier) in "
+                                         "every authorization response (RFC 9207)."})
+
     return {"metadata": meta, "tests": tests, "findings": finds}
 
 
@@ -4720,6 +4746,141 @@ function _addMetaTrustFinding(srv, kind, historyId) {
   debouncedSaveProject();
 }
 
+// ── Elicitation (draft spec: server/client/elicitation) ─────────────────────
+// Draft spec uses the Multi Round-Trip Requests (MRTR) pattern: the server
+// returns an InputRequiredResult (result.resultType === 'input_required') as
+// the RESULT of the original request, containing an inputRequests MAP (keyed
+// by server-assigned id) with entries like {method:'elicitation/create', params}.
+// The client must retry the SAME method+params with a NEW id, adding
+// params.inputResponses (keyed the same way) and echoing params.requestState
+// verbatim if the server sent one.
+
+function extractElicitRequests(body) {
+  const rpcResult = body?.result?.result;
+  if (!rpcResult || typeof rpcResult !== 'object') return null;
+  if (rpcResult.resultType !== 'input_required') return null;
+  const reqs = rpcResult.inputRequests;
+  if (!reqs || typeof reqs !== 'object') return null;
+  const entries = Object.entries(reqs).filter(([, r]) => r?.method === 'elicitation/create');
+  if (!entries.length) return null;
+  return {entries, requestState: rpcResult.requestState};
+}
+
+function _checkElicitSchemaShape(schema) {
+  const issues = [];
+  if (!schema || typeof schema !== 'object') { issues.push('requestedSchema is missing or not an object'); return issues; }
+  if (schema.type !== 'object') issues.push(`top-level type is "${schema.type}", expected "object"`);
+  if (schema.$ref) issues.push('uses $ref (not permitted — schema must be inlined)');
+  const props = schema.properties || {};
+  for (const [name, s] of Object.entries(props)) {
+    if (!s || typeof s !== 'object') continue;
+    const t = s.type;
+    if (t === 'object') { issues.push(`property "${name}" is a nested object (flat primitives only)`); continue; }
+    if (t === 'array') {
+      const items = s.items || {};
+      const isEnumArray = items.enum || items.anyOf;
+      if (!isEnumArray) issues.push(`property "${name}" is an array not restricted to an enum/anyOf of consts (arrays of objects are not permitted)`);
+      continue;
+    }
+    if (!['string', 'number', 'integer', 'boolean'].includes(t) && !s.enum && !s.oneOf) {
+      issues.push(`property "${name}" has unsupported type "${t}"`);
+    }
+  }
+  return issues;
+}
+
+function _checkElicitUrlSafety(url) {
+  const issues = [];
+  if (!url || typeof url !== 'string') {
+    issues.push({severity: 'medium', detail: 'url-mode elicitation missing a valid url parameter',
+      remediation: 'Always include a valid absolute URL for url-mode elicitation.'});
+    return issues;
+  }
+  let u;
+  try { u = new URL(url); } catch {
+    issues.push({severity: 'medium', detail: `url "${url}" is not a valid absolute URL`,
+      remediation: 'Provide a well-formed absolute URL.'});
+    return issues;
+  }
+  if (u.protocol !== 'https:') {
+    issues.push({severity: 'high', detail: `scheme is "${u.protocol}" — non-HTTPS url-mode elicitation targets should be treated as suspicious`,
+      remediation: 'Serve url-mode elicitation targets over HTTPS only.'});
+  }
+  if (/xn--/i.test(u.hostname)) {
+    issues.push({severity: 'high', detail: `hostname "${u.hostname}" uses punycode — possible homoglyph/domain-spoofing attempt`,
+      remediation: 'Avoid punycode hostnames for elicitation targets; if internationalized domains are required, display the decoded form prominently to the user.'});
+  }
+  const qp = [...u.searchParams.keys()].map(k => k.toLowerCase());
+  const suspicious = qp.filter(k => /token|session|auth|code|secret|key|password/.test(k));
+  if (suspicious.length) {
+    issues.push({severity: 'high', detail: `URL query string carries what looks like a pre-authenticated credential (${suspicious.join(', ')}) — servers MUST NOT provide a URL pre-authenticated to access a protected resource`,
+      remediation: 'Never embed session tokens, auth codes, or credentials directly in a URL handed to the client for elicitation — authenticate the destination page through its own login/session flow instead.'});
+  }
+  return issues;
+}
+
+function _pushFindingDedup(srv, finding) {
+  srv.findings = srv.findings || [];
+  const fp = findingFp(finding);
+  if (srv.findings.some(f => findingFp(f) === fp)) return;
+  srv.findings.push(finding);
+  renderFindings();
+  debouncedSaveProject();
+}
+
+function _runElicitationChecks(srv, key, req, originalPayload, historyId) {
+  const p = req.params || {};
+  const mode = p.mode || 'form';
+  const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  const mkFinding = (item, severity, category, detail, remediation) => ({
+    severity, category, server: srvShort, item, detail, remediation,
+    source: 'auto', historyId, serverUrl: srv.url,
+  });
+
+  // Capability-mismatch — only checked when the request declared per-request
+  // _meta capabilities at all (the "modern" 2026-07-28 pathway). Legacy
+  // session-based capability declarations happen once at initialize and
+  // aren't tracked per-request today, so this scope is deliberately narrow.
+  const meta = originalPayload?.params?._meta || {};
+  const declaredCaps = meta['io.modelcontextprotocol/clientCapabilities'];
+  if (declaredCaps !== undefined) {
+    const elicitCap = declaredCaps.elicitation;
+    if (!elicitCap) {
+      _pushFindingDedup(srv, mkFinding('elicit-capability-mismatch', 'high', 'Protocol',
+        `Server sent an elicitation/create request (mode: ${mode}) even though the caller's per-request _meta declared no elicitation support at all — servers MUST NOT send inputRequests for capabilities the client hasn't declared.`,
+        'Track declared client capabilities per request and never include elicitation/create in inputRequests unless the caller has declared support for it.'));
+    } else {
+      const supportsMode = Object.keys(elicitCap).length === 0 ? ['form'] : Object.keys(elicitCap);
+      if (!supportsMode.includes(mode)) {
+        _pushFindingDedup(srv, mkFinding('elicit-mode-mismatch', 'high', 'Protocol',
+          `Server sent an elicitation/create request with mode "${mode}" but the caller only declared support for [${supportsMode.join(', ')}] — servers MUST NOT send a mode the client hasn't declared.`,
+          'Only send elicitation modes explicitly present in the caller-declared elicitation capability.'));
+      }
+    }
+  }
+
+  if (mode === 'form') {
+    const texts = [p.message, ...Object.values(p.requestedSchema?.properties || {}).flatMap(s => [s?.title, s?.description])].filter(Boolean);
+    for (const t of texts) {
+      for (const h of scanText('elicitation', t)) {
+        _pushFindingDedup(srv, mkFinding(`elicit-sensitive-form-${h.cat}`, h.severity, 'Injection/Poisoning',
+          `Live elicitation (form mode) message/schema text matched "${h.cat}": "${h.preview}" — servers MUST NOT request sensitive info (passwords, API keys, tokens, payment data) via form mode; MUST use url mode instead.`,
+          'Move any credential/sensitive-data collection to url-mode elicitation directed at a secure, trusted page — never collect secrets via in-band form mode.'));
+      }
+    }
+    for (const issue of _checkElicitSchemaShape(p.requestedSchema)) {
+      _pushFindingDedup(srv, mkFinding('elicit-schema-shape', 'medium', 'Protocol',
+        `Elicitation requestedSchema violates the spec's flat-primitives-only restriction: ${issue}`,
+        'Restrict requestedSchema to a flat object of primitive properties (string/number/integer/boolean, or single/multi-select enum) — no nested objects, arrays-of-objects, or $ref.'));
+    }
+  } else if (mode === 'url') {
+    for (const issue of _checkElicitUrlSafety(p.url)) {
+      _pushFindingDedup(srv, mkFinding('elicit-url-unsafe', issue.severity, 'Client-Side SSRF',
+        `URL-mode elicitation target is unsafe: ${issue.detail}`, issue.remediation));
+    }
+  }
+}
+
 function deleteManualFinding(id) {
   if (!confirm('Delete this finding?')) return;
   for (const srv of Object.values(S.servers)) {
@@ -6213,6 +6374,13 @@ const PROTOCOL_PRESETS = [
     hint:  'the spec says clientInfo is self-reported and unverified — servers SHOULD NOT change behavior or make security decisions from it. Send this with a spoofed privileged clientInfo and compare the exposed surface (tool list, permitted actions) against a normal clientInfo. Any behavioral difference = the server trusts unverified caller identity (privilege inflation / confused deputy).',
     payload: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"admin-console","version":"1.0"}}}},
   },
+  // ── 2026-07-28 SEP-2549 CacheableResult (cacheScope/ttlMs) abuse ────────────
+  {
+    label: 'MCP: tools/list — check cacheScope/ttlMs (SEP-2549)',
+    cat:   'CacheableResult',
+    hint:  'a 2026-07-28+ server must return cacheScope ("public"/"private") + ttlMs on list/read results. Look at the raw response below: cacheScope:"public" with a long ttlMs means any shared cache (CDN, gateway, corporate proxy) in front of this server may serve this tool list for that whole lifetime — a rug pull that survives fixing the origin, since the intermediary\'s cache is never purged by re-scanning it. cacheScope:"public" on content containing a credential/secret is a cross-caller leak via that same shared cache. Fields absent entirely means caching behavior is undefined (mirrors MCPensive MCP-060).',
+    payload: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
+  },
 ];
 
 function toggleCopyMenu() {
@@ -6531,6 +6699,7 @@ async function doSend() {
 
   try {
     let fetchUrl, fetchBody, toolName, args;
+    let originalPayload = null;  // captured for elicitation retry construction
     const isStdio = srv.transport === 'stdio';
 
     if (S.rawMode || isStdio) {
@@ -6574,11 +6743,13 @@ async function doSend() {
                      payload: isGet ? null : payload,
                      custom_headers: Object.keys(customHdrs).length ? customHdrs : null,
                      auth_header: authHdr !== null ? authHdr : ''};
+        originalPayload = isGet ? null : payload;
       } else if (S.rawMode) {
         try { payload = JSON.parse(document.getElementById('raw-editor').value); }
         catch { showError('Raw editor contains invalid JSON'); return; }
         toolName  = payload?.params?.name || payload?.method || '(raw)';
         args      = payload?.params?.arguments || payload?.params || {};
+        originalPayload = payload;
         if (isStdio) {
           fetchUrl  = '/stdio/raw';
           fetchBody = {command: srv.command, payload};
@@ -6599,6 +6770,7 @@ async function doSend() {
         toolName = tool.name;
         fetchUrl  = '/stdio/raw';
         fetchBody = {command: srv.command, payload};
+        originalPayload = payload;
       }
     } else {
       // Form mode on HTTP/SSE: normal tool call
@@ -6611,6 +6783,7 @@ async function doSend() {
       fetchBody = {url:srv.url, token:srv.token, proxy:srv.proxy,
                    transport:srv.transport, tool:tool.name, args,
                    custom_headers: srv.customHeaders || null};
+      originalPayload = {jsonrpc:'2.0', id:1, method:'tools/call', params:{name:tool.name, arguments:args}};
     }
 
     const res     = await fetch(fetchUrl, {
@@ -6635,10 +6808,175 @@ async function doSend() {
       S.pendingMetaProbe = null;
       if (!isErr && body?.result && !body.result?.error) _addMetaTrustFinding(srv, _metaProbeKind, newHistId);
     }
+    // Elicitation (draft spec): server returned an InputRequiredResult with elicitation/create entries
+    if (!isErr) {
+      const elicit = extractElicitRequests(body);
+      if (elicit) {
+        for (const [key, req] of elicit.entries) _runElicitationChecks(srv, key, req, originalPayload, newHistId);
+        openElicitationModal(srv, originalPayload, elicit);
+      }
+    }
   } catch (e) {
     showError(`Send failed: ${e.message}`);
   } finally {
     btn.disabled = false; btn.textContent = 'Send   Ctrl+Enter';
+  }
+}
+
+// ── Elicitation modal ────────────────────────────────────────────────────────
+
+function _renderElicitField(entryKey, propName, schema, isRequired) {
+  const id = `elicit-f-${entryKey}-${propName}`;
+  const title = schema.title || propName;
+  const desc = schema.description ? `<div style="font-size:10px;color:var(--muted)">${esc(schema.description)}</div>` : '';
+  const reqMark = isRequired ? ' <span style="color:#e85c5c">*</span>' : '';
+  let input;
+  if (schema.type === 'array') {
+    const opts = schema.items?.enum
+      ? schema.items.enum.map(v => ({value: v, label: v}))
+      : (schema.items?.anyOf || []).map(o => ({value: o.const, label: o.title || o.const}));
+    const defaults = new Set(schema.default || []);
+    input = `<div data-multi-id="${esc(id)}">${opts.map(o => `
+      <label style="display:block;font-size:11px"><input type="checkbox" value="${esc(String(o.value))}" ${defaults.has(o.value) ? 'checked' : ''}> ${esc(o.label)}</label>`).join('')}</div>`;
+  } else if (schema.enum || schema.oneOf) {
+    const opts = schema.enum
+      ? schema.enum.map(v => ({value: v, label: v}))
+      : schema.oneOf.map(o => ({value: o.const, label: o.title || o.const}));
+    input = `<select id="${esc(id)}" style="width:100%">${opts.map(o =>
+      `<option value="${esc(String(o.value))}" ${o.value === schema.default ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}</select>`;
+  } else if (schema.type === 'boolean') {
+    input = `<input type="checkbox" id="${esc(id)}" ${schema.default ? 'checked' : ''}>`;
+  } else if (schema.type === 'number' || schema.type === 'integer') {
+    input = `<input type="number" id="${esc(id)}" value="${schema.default ?? ''}"
+      ${schema.minimum != null ? `min="${schema.minimum}"` : ''} ${schema.maximum != null ? `max="${schema.maximum}"` : ''} style="width:100%">`;
+  } else {
+    const inputType = schema.format === 'email' ? 'email' : schema.format === 'date' ? 'date'
+      : schema.format === 'date-time' ? 'datetime-local' : schema.format === 'uri' ? 'url' : 'text';
+    input = `<input type="${inputType}" id="${esc(id)}" value="${esc(schema.default ?? '')}" style="width:100%;box-sizing:border-box">`;
+  }
+  return `<div style="margin-bottom:6px"><label style="font-size:11px;font-weight:600">${esc(title)}${reqMark}</label>${desc}${input}</div>`;
+}
+
+function _collectElicitFormValue(entryKey, propName, schema) {
+  const id = `elicit-f-${entryKey}-${propName}`;
+  if (schema.type === 'array') {
+    const container = document.querySelector(`[data-multi-id="${CSS.escape(id)}"]`);
+    if (!container) return undefined;
+    return [...container.querySelectorAll('input[type=checkbox]:checked')].map(el => el.value);
+  }
+  const el = document.getElementById(id);
+  if (!el) return undefined;
+  if (schema.type === 'boolean') return el.checked;
+  if (schema.enum || schema.oneOf) return el.value;
+  if (schema.type === 'number' || schema.type === 'integer') return el.value === '' ? undefined : Number(el.value);
+  return el.value;
+}
+
+function openElicitationModal(srv, originalPayload, elicitData) {
+  document.getElementById('elicit-overlay')?.remove();
+  const ov = document.createElement('div');
+  ov.id = 'elicit-overlay';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:3500;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box';
+
+  const sections = elicitData.entries.map(([key, req]) => {
+    const p = req.params || {};
+    const mode = p.mode || 'form';
+    let body;
+    if (mode === 'url') {
+      let host = '(invalid URL)', rest = p.url || '', proto = '';
+      try { const u = new URL(p.url); host = u.hostname; proto = u.protocol; rest = (p.url || '').replace(u.origin, ''); } catch {}
+      const suspicious = /xn--/i.test(host) || proto !== 'https:';
+      body = `
+        <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Target URL</div>
+        <div style="font-family:monospace;font-size:12px;padding:4px 6px;background:var(--bg);border:1px solid var(--border);border-radius:4px;word-break:break-all">
+          <span style="color:${suspicious ? '#e85c5c' : 'var(--accent)'};font-weight:700">${esc(host)}</span>${esc(rest)}
+        </div>
+        ${suspicious ? '<div style="color:#e85c5c;font-size:11px;margin-top:4px">&#9888; non-HTTPS or punycode host — see auto-finding</div>' : ''}
+        <div style="font-size:10px;color:var(--muted);margin-top:6px">MCPoke will NOT open this URL. "Accept" only sends action:accept with no content, per spec.</div>`;
+    } else {
+      const schema = p.requestedSchema || {};
+      const required = new Set(schema.required || []);
+      body = Object.entries(schema.properties || {}).map(([name, s]) =>
+        _renderElicitField(key, name, s || {}, required.has(name))).join('')
+        || '<div style="font-size:11px;color:var(--muted)">(no fields)</div>';
+    }
+    return `
+    <div class="elicit-entry" data-key="${esc(key)}" data-mode="${esc(mode)}" style="border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:10px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <span style="font-family:monospace;font-size:11px;color:var(--muted)">${esc(key)}</span>
+        <span style="font-size:10px;padding:1px 6px;border:1px solid var(--border);border-radius:3px">${esc(mode)}</span>
+      </div>
+      <div style="font-size:12px;margin-bottom:8px">${esc(p.message || '')}</div>
+      ${body}
+      <div style="margin-top:8px;display:flex;gap:10px;font-size:11px">
+        <label><input type="radio" name="elicit-action-${esc(key)}" value="accept" checked> Accept</label>
+        <label><input type="radio" name="elicit-action-${esc(key)}" value="decline"> Decline</label>
+        <label><input type="radio" name="elicit-action-${esc(key)}" value="cancel"> Cancel</label>
+      </div>
+    </div>`;
+  }).join('');
+
+  ov.innerHTML = `
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;width:100%;max-width:560px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden">
+    <div style="display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border)">
+      <span style="font-weight:700;font-size:13px;color:#e3b341">&#10068; Elicitation request${elicitData.entries.length > 1 ? 's' : ''}</span>
+      <span style="font-size:11px;color:var(--muted);flex:1">draft spec — server needs input to continue</span>
+      <button class="btn-sm" onclick="document.getElementById('elicit-overlay').remove()">&#x2715; Close</button>
+    </div>
+    <div style="overflow-y:auto;padding:12px;flex:1">${sections}</div>
+    <div style="padding:10px 14px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px">
+      <button class="btn-sm btn-cyan" onclick="sendElicitationRetry()">Send Retry</button>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  ov._mcpokeElicitCtx = {srv, originalPayload, elicitData};
+  ov.addEventListener('click', e => { if (e.target === ov) ov.remove(); });
+}
+
+async function sendElicitationRetry() {
+  const ov = document.getElementById('elicit-overlay');
+  if (!ov) return;
+  const {srv, originalPayload, elicitData} = ov._mcpokeElicitCtx;
+  const inputResponses = {};
+  for (const [key, req] of elicitData.entries) {
+    const p = req.params || {};
+    const mode = p.mode || 'form';
+    const actionEl = ov.querySelector(`input[name="elicit-action-${CSS.escape(key)}"]:checked`);
+    const action = actionEl ? actionEl.value : 'cancel';
+    if (action !== 'accept') { inputResponses[key] = {action}; continue; }
+    if (mode === 'url') { inputResponses[key] = {action: 'accept'}; continue; }
+    const schema = p.requestedSchema || {};
+    const content = {};
+    for (const [name, s] of Object.entries(schema.properties || {})) {
+      const v = _collectElicitFormValue(key, name, s || {});
+      if (v !== undefined && v !== '') content[name] = v;
+    }
+    inputResponses[key] = {action: 'accept', content};
+  }
+
+  const retryPayload = JSON.parse(JSON.stringify(originalPayload || {jsonrpc: '2.0', method: 'tools/call', params: {}}));
+  retryPayload.id = Date.now();
+  retryPayload.params = retryPayload.params || {};
+  retryPayload.params.inputResponses = inputResponses;
+  if (elicitData.requestState !== undefined) retryPayload.params.requestState = elicitData.requestState;
+
+  ov.remove();
+  try {
+    const res     = await rawFetch(srv, retryPayload);
+    const body    = await res.json();
+    const isErr   = !!(body?.error || body?.result?.error || body?.result?.isError);
+    const sensitiveHits = showResponse(body, 0, {});
+    const newHistId = S.history.length;
+    addHistory(srv.url, originalPayload?.params?.name || originalPayload?.method || '(elicit-retry)', {}, body, isErr, 0, sensitiveHits, retryPayload);
+    if (!isErr) {
+      const nextElicit = extractElicitRequests(body);
+      if (nextElicit) {
+        for (const [key, req] of nextElicit.entries) _runElicitationChecks(srv, key, req, retryPayload, newHistId);
+        openElicitationModal(srv, retryPayload, nextElicit);
+      }
+    }
+  } catch (e) {
+    showError(`Elicitation retry failed: ${e.message}`);
   }
 }
 
@@ -9741,6 +10079,7 @@ async function runOAuthProbe(srv, baseUrl) {
         ['PKCE methods',           (m.code_challenge_methods_supported || []).join(', ') || '—'],
         ['Response types',         (m.response_types_supported || []).join(', ') || '—'],
         ['Issuer',                 m.issuer || '—'],
+        ['iss binding (RFC 9207)', m.authorization_response_iss_parameter_supported ? 'supported' : 'NOT advertised'],
       ];
       meta.innerHTML = `<h4 style="font-size:11px;color:var(--muted);margin:0 0 0.4rem">Discovery metadata</h4>
         <table style="width:100%;border-collapse:collapse;font-size:11px;margin-bottom:0.6rem">
