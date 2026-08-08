@@ -36,11 +36,11 @@ CACHE_PATH         = Path.home() / ".mcpoke" / "cache.json"
 
 # ── MCP primitives ────────────────────────────────────────────────────────────
 
-def make_initialize(client_name: str = "mcpoke") -> dict:
+def make_initialize(client_name: str = "mcpoke", protocol_version: Optional[str] = None) -> dict:
     return {
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {
-            "protocolVersion": MCP_LATEST_VERSION,
+            "protocolVersion": protocol_version or MCP_LATEST_VERSION,
             "capabilities": {"roots": {"listChanged": True}, "sampling": {}},
             "clientInfo": {"name": client_name, "version": "1.0"},
         },
@@ -272,6 +272,11 @@ class SSESession:
         self._task: Optional[asyncio.Task] = None
         self._ready         = asyncio.Event()
         self._notifications: list = []
+        # Server-initiated requests (elicitation/create, sampling/createMessage,
+        # roots/list — have both a method AND an id) seen while waiting for a
+        # different reply. Phase 1: captured for passive inspection only; MCPoke
+        # does not yet respond to these mid-stream (see backlog).
+        self._server_requests: list = []
 
     async def __aenter__(self):
         self._task = asyncio.create_task(self._reader())
@@ -366,10 +371,21 @@ class SSESession:
                 for m in pending:
                     await self._queue.put(m)
                 return msg
+            if "method" in msg and "id" in msg:
+                # Server-initiated request (elicitation/create, sampling/createMessage,
+                # roots/list) arriving while we wait for our own reply. Capture for
+                # passive inspection — we don't answer it, so the original call will
+                # simply time out below if the server is blocked on a response.
+                self._server_requests.append(msg)
+                continue
             pending.append(msg)
         for m in pending:
             await self._queue.put(m)
         return None
+
+    @property
+    def server_requests(self) -> list:
+        return list(self._server_requests)
 
     @property
     def ready(self) -> bool:
@@ -397,7 +413,8 @@ def _build_connect_probe(url: str, payload: dict, extra_headers: dict,
 
 async def _probe_http(session: aiohttp.ClientSession, url: str,
                       extra_headers: dict,
-                      proxy: Optional[str] = None) -> Optional[dict]:
+                      proxy: Optional[str] = None,
+                      protocol_version: Optional[str] = None) -> Optional[dict]:
     for payload in (TOOLS_LIST, TOOLS_LIST_NULL, TOOLS_LIST_NOID):
         body, status, hdrs = await _post_json_headers(session, url, payload,
                                         extra_headers=extra_headers, proxy=proxy)
@@ -410,7 +427,7 @@ async def _probe_http(session: aiohttp.ClientSession, url: str,
             if tools is not None:
                 no_init_probe_evidence = _build_connect_probe(
                     url, payload, extra_headers, status, hdrs, body)
-                init_payload = make_initialize()
+                init_payload = make_initialize(protocol_version=protocol_version)
                 init_body, init_status, init_hdrs = await _post_json_headers(
                     session, url, init_payload, extra_headers=extra_headers, proxy=proxy)
                 res_body,  _ = await _post_json(session, url, RESOURCES_LIST,
@@ -425,10 +442,11 @@ async def _probe_http(session: aiohttp.ClientSession, url: str,
                         "no_init_probe": True,
                         "no_init_probe_evidence": no_init_probe_evidence,
                         "response_headers": init_hdrs,
+                        "client_capabilities": init_payload["params"]["capabilities"],
                         "connect_probe": _build_connect_probe(
                             url, init_payload, extra_headers, init_status, init_hdrs, init_body)}
 
-    init_payload = make_initialize()
+    init_payload = make_initialize(protocol_version=protocol_version)
     init_body, status, init_hdrs = await _post_json_headers(
         session, url, init_payload, extra_headers=extra_headers, proxy=proxy)
     if status == -1:
@@ -452,18 +470,20 @@ async def _probe_http(session: aiohttp.ClientSession, url: str,
             "resources": _extract_resources(res_body)   or [],
             "prompts":   _extract_prompts(pmt_body)     or [],
             "response_headers": init_hdrs,
+            "client_capabilities": init_payload["params"]["capabilities"],
             "connect_probe": _build_connect_probe(
                 url, init_payload, extra_headers, status, init_hdrs, init_body)}
 
 
 async def _probe_sse(session: aiohttp.ClientSession, url: str,
                      extra_headers: dict,
-                     proxy: Optional[str] = None) -> Optional[dict]:
+                     proxy: Optional[str] = None,
+                     protocol_version: Optional[str] = None) -> Optional[dict]:
     async with SSESession(session, url, extra_headers=extra_headers,
                           timeout=SSE_TIMEOUT, proxy=proxy) as sse:
         if not sse.ready:
             return None
-        init_resp = await sse.send(make_initialize())
+        init_resp = await sse.send(make_initialize(protocol_version=protocol_version))
         if not init_resp:
             return {"error": "SSE: no response to initialize"}
         server_info = _extract_server_info(init_resp)
@@ -474,12 +494,14 @@ async def _probe_sse(session: aiohttp.ClientSession, url: str,
     return {"transport": "sse", "server_info": server_info,
             "tools":     _extract_tools(tools_resp)   or [],
             "resources": _extract_resources(res_resp) or [],
-            "prompts":   _extract_prompts(pmt_resp)   or []}
+            "prompts":   _extract_prompts(pmt_resp)   or [],
+            "client_capabilities": make_initialize(protocol_version=protocol_version)["params"]["capabilities"]}
 
 
 async def probe_target(url: str, auth_token: Optional[str] = None,
                        proxy: Optional[str] = None,
-                       custom_headers: Optional[dict] = None) -> dict:
+                       custom_headers: Optional[dict] = None,
+                       protocol_version: Optional[str] = None) -> dict:
     extra_headers: dict = {}
     if custom_headers:
         extra_headers.update(custom_headers)
@@ -490,10 +512,10 @@ async def probe_target(url: str, auth_token: Optional[str] = None,
     except RuntimeError as e:
         return {"error": str(e)}
     async with session_ctx as session:
-        result = await _probe_http(session, url, extra_headers, proxy)
+        result = await _probe_http(session, url, extra_headers, proxy, protocol_version)
         if result is not None:
             return result
-        result = await _probe_sse(session, url, extra_headers, proxy)
+        result = await _probe_sse(session, url, extra_headers, proxy, protocol_version)
         if result is not None:
             return result
     return {"error": "Could not detect MCP transport. Check the URL and try again."}
@@ -590,6 +612,7 @@ class ConnectRequest(BaseModel):
     token:          Optional[str]  = None
     proxy:          Optional[str]  = None
     custom_headers: Optional[dict] = None
+    protocol_version: Optional[str] = None
 
     @field_validator("url")
     @classmethod
@@ -605,6 +628,7 @@ class CallRequest(BaseModel):
     args:           dict = {}
     proxy:          Optional[str]  = None
     custom_headers: Optional[dict] = None
+    protocol_version: Optional[str] = None
 
     @field_validator("url")
     @classmethod
@@ -621,6 +645,7 @@ class RawRequest(BaseModel):
     proxy:          Optional[str]  = None
     payload:        Optional[dict] = None
     custom_headers: Optional[dict] = None
+    protocol_version: Optional[str] = None
 
     @field_validator("url")
     @classmethod
@@ -685,11 +710,12 @@ async def raw_call(req: RawRequest):
                                   proxy=req.proxy) as sse:
                 if not sse.ready:
                     return {"error": "SSE: session failed to establish"}
-                await sse.send(make_initialize())
+                await sse.send(make_initialize(protocol_version=req.protocol_version))
                 await sse.send(INITIALIZED_NOTIF)
                 resp = await sse.send(req.payload)
                 notifs = sse.notifications
-            return {"status": 200, "result": resp, "notifications": notifs}
+                srv_reqs = sse.server_requests
+            return {"status": 200, "result": resp, "notifications": notifs, "server_requests": srv_reqs}
         else:
             body, status = await _post_json(session, req.url, req.payload,
                                             extra_headers=extra_headers,
@@ -701,7 +727,8 @@ async def raw_call(req: RawRequest):
 
 @app.post("/connect")
 async def connect(req: ConnectRequest):
-    result = await probe_target(req.url, req.token, req.proxy, req.custom_headers)
+    result = await probe_target(req.url, req.token, req.proxy, req.custom_headers,
+                                req.protocol_version)
     if not result.get("error"):
         _update_cache(req.url, result)
     return result
@@ -730,13 +757,14 @@ async def call_tool(req: CallRequest):
                                   proxy=req.proxy) as sse:
                 if not sse.ready:
                     return {"error": "SSE: session failed to establish"}
-                await sse.send(make_initialize())
+                await sse.send(make_initialize(protocol_version=req.protocol_version))
                 await sse.send(INITIALIZED_NOTIF)
                 resp = await sse.send(payload)
                 notifs = sse.notifications
+                srv_reqs = sse.server_requests
             if resp is None:
                 return {"error": "SSE: no response to tool call"}
-            return {"status": 200, "result": resp, "notifications": notifs}
+            return {"status": 200, "result": resp, "notifications": notifs, "server_requests": srv_reqs}
         else:
             body, status = await _post_json(session, req.url, payload,
                                             extra_headers=extra_headers,
@@ -1124,7 +1152,8 @@ async def _stdio_send(command: str, payload: dict, timeout: float = 30.0) -> dic
         return json.loads(resp.decode())
 
 
-async def _connect_stdio(command: str, env: Optional[dict] = None) -> dict:
+async def _connect_stdio(command: str, env: Optional[dict] = None,
+                         protocol_version: Optional[str] = None) -> dict:
     # Kill dead process
     existing = _stdio_procs.get(command)
     if existing is not None and existing.returncode is not None:
@@ -1157,7 +1186,8 @@ async def _connect_stdio(command: str, env: Optional[dict] = None) -> dict:
         _stdio_locks[command] = asyncio.Lock()
 
     # MCP handshake
-    init_resp   = await _stdio_send(command, make_initialize(), timeout=15.0)
+    init_resp   = await _stdio_send(command, make_initialize(protocol_version=protocol_version),
+                                    timeout=15.0)
     server_info = _extract_server_info(init_resp)
 
     notif_line = (json.dumps(INITIALIZED_NOTIF) + "\n").encode()
@@ -1180,6 +1210,7 @@ async def _connect_stdio(command: str, env: Optional[dict] = None) -> dict:
 class StdioConnectRequest(BaseModel):
     command: str
     env:     Optional[dict] = None
+    protocol_version: Optional[str] = None
 
 
 class StdioRawRequest(BaseModel):
@@ -1192,7 +1223,7 @@ async def stdio_connect(req: StdioConnectRequest):
     if not req.command.strip():
         return {"error": "Command cannot be empty"}
     try:
-        return await _connect_stdio(req.command, req.env)
+        return await _connect_stdio(req.command, req.env, req.protocol_version)
     except Exception as e:
         return {"error": str(e)}
 
@@ -2469,6 +2500,7 @@ function mkServer(url, token, proxy, customHeaders, command) {
   return {url, token: token || null, proxy: proxy || null,
           customHeaders: customHeaders || null,
           command: command || null, env: null,
+          pinnedVersion: null,
           status: 'disconnected', transport: null, serverInfo: {}, tools: [],
           resources: [], prompts: [],
           fromCache: false, lastSeen: null, error: null};
@@ -2667,7 +2699,7 @@ async function connectStdioServer(command, env) {
   try {
     const res  = await fetch('/stdio/connect', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({command, env: env || null}),
+      body: JSON.stringify({command, env: env || null, protocol_version: srv.pinnedVersion || null}),
     });
     const data = await res.json();
     if (data.error) {
@@ -2712,7 +2744,8 @@ async function connectServer(url, token, proxy, customHeaders) {
     const res  = await fetch('/connect', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({url, token: srv.token, proxy: srv.proxy,
-                            custom_headers: srv.customHeaders || null})
+                            custom_headers: srv.customHeaders || null,
+                            protocol_version: srv.pinnedVersion || null})
     });
     const data = await res.json();
     if (data.error) {
@@ -2728,6 +2761,7 @@ async function connectServer(url, token, proxy, customHeaders) {
       srv.connectProbe    = data.connect_probe || null;
       srv.noInitProbe     = data.no_init_probe || false;
       srv.noInitProbeEvidence = data.no_init_probe_evidence || null;
+      srv.declaredCapabilities = data.client_capabilities || null;
       srv.fromCache       = false;
       srv.certInfo        = null;
       const _preserved = (srv.findings || []).filter(f => ['auth-test','oauth-probe','cert'].includes(f.item));
@@ -2941,6 +2975,8 @@ function renderServers() {
       ? `<span class="badge" style="background:#2a1a3a;color:#c792ea" title="${esc(srv.proxy)}">proxy</span>` : '';
     const hBadge   = srv.customHeaders
       ? `<span class="badge" style="background:#1a2a1a;color:#7ee787" title="${esc(Object.keys(srv.customHeaders).join(', '))}">hdrs</span>` : '';
+    const vBadge   = srv.pinnedVersion
+      ? `<span class="badge" style="background:#2a2a1a;color:#e3b341" title="Protocol version pinned — all handshakes for this server force ${esc(srv.pinnedVersion)}">pin ${esc(srv.pinnedVersion)}</span>` : '';
     const errText  = srv.error
       ? `<span class="srv-err" title="${esc(srv.error)}">${esc(srv.error.slice(0,60))}</span>` : '';
     const lsText   = (!srv.error && srv.lastSeen && srv.fromCache)
@@ -2978,7 +3014,7 @@ function renderServers() {
         ${discBtn}
         <button class="srv-close btn-sm" data-close="${esc(srv.url)}">&#x2715;</button>
       </div>
-      <div class="srv-meta">${tBadge}${certBadge}${cBadge}${pBadge}${hBadge}${injText}${cveText}${fpText}${shadowText}${errText}${lsText}</div>
+      <div class="srv-meta">${tBadge}${certBadge}${cBadge}${pBadge}${hBadge}${vBadge}${injText}${cveText}${fpText}${shadowText}${errText}${lsText}</div>
       ${capBadgesHtml ? `<div class="srv-caps">${capBadgesHtml}</div>` : ''}
     </div>`;
   }).join('');
@@ -4395,6 +4431,31 @@ function capabilityBadges(srv) {
   }).join(' ');
 }
 
+const KNOWN_PROTOCOL_VERSIONS = ['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25', '2026-07-28'];
+
+function onPinVersionSelect(url, value) {
+  if (value === '__custom__') {
+    const srv = S.servers[url];
+    const custom = prompt('Protocol version to pin (e.g. 2026-07-28):', srv?.pinnedVersion || '');
+    if (custom === null) { renderCapPanel(srv); return; } // cancelled — revert dropdown
+    setPinnedVersion(url, custom.trim());
+    return;
+  }
+  setPinnedVersion(url, value || null);
+}
+
+function setPinnedVersion(url, version) {
+  const srv = S.servers[url];
+  if (!srv) return;
+  srv.pinnedVersion = version || null;
+  debouncedSaveProject();
+  if (srv.status !== 'connected') { renderCapPanel(srv); renderServers(); return; }
+  // Reconnect so the pin takes effect on the handshake immediately, the same
+  // way changing token/proxy/headers already does.
+  if (srv.transport === 'stdio') connectStdioServer(srv.command, srv.env);
+  else connectServer(srv.url, srv.token, srv.proxy, srv.customHeaders);
+}
+
 function renderCapPanel(srv) {
   const panel  = document.getElementById('cap-panel');
   const hint   = document.getElementById('req-placeholder-hint');
@@ -4418,6 +4479,18 @@ function renderCapPanel(srv) {
   const rows = [];
   if (si.name)            rows.push(`<div class="cap-panel-row"><span class="cap-panel-label">Server</span><span class="cap-panel-val">${esc(si.name)}${si.version ? ' <span style="color:var(--muted)">v' + esc(si.version) + '</span>' : ''}</span></div>`);
   if (si.protocolVersion) rows.push(`<div class="cap-panel-row"><span class="cap-panel-label">Protocol</span><span class="cap-panel-val cap-${si.protocolVersion < '2025-11-25' ? 'medium' : 'info'}">${esc(si.protocolVersion)}</span></div>`);
+  {
+    const pinOpts = KNOWN_PROTOCOL_VERSIONS.map(v =>
+      `<option value="${v}" ${srv.pinnedVersion === v ? 'selected' : ''}>${v}</option>`).join('');
+    const isCustomPin = srv.pinnedVersion && !KNOWN_PROTOCOL_VERSIONS.includes(srv.pinnedVersion);
+    rows.push(`<div class="cap-panel-row"><span class="cap-panel-label" title="Force every initialize/handshake for this server to use one protocol version, overriding MCPoke's default. Reconnects immediately and stays pinned until changed. Manual version-mismatch pokes are unaffected.">Pin version</span><span class="cap-panel-val">
+      <select onchange="onPinVersionSelect('${esc(srv.url)}', this.value)" style="font-size:11px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:1px 4px">
+        <option value="">off</option>
+        ${pinOpts}
+        <option value="__custom__" ${isCustomPin ? 'selected' : ''}>${isCustomPin ? esc(srv.pinnedVersion) + ' (custom)' : 'Custom…'}</option>
+      </select>
+    </span></div>`);
+  }
   if (fp)                 rows.push(`<div class="cap-panel-row"><span class="cap-panel-label">Fingerprint</span><span class="cap-panel-val" style="color:var(--muted)">${esc(fp)}</span></div>`);
 
   // Capabilities section
@@ -4837,23 +4910,28 @@ function _runElicitationChecks(srv, key, req, originalPayload, historyId) {
     source: 'auto', historyId, serverUrl: srv.url,
   });
 
-  // Capability-mismatch — only checked when the request declared per-request
-  // _meta capabilities at all (the "modern" 2026-07-28 pathway). Legacy
-  // session-based capability declarations happen once at initialize and
-  // aren't tracked per-request today, so this scope is deliberately narrow.
+  // Capability-mismatch. Two pathways for where the client declares elicitation
+  // support: modern per-request _meta (2026-07-28 stateless pathway), or the
+  // classic session-level `capabilities.elicitation` declared once at initialize
+  // (2025-06-18+ legacy pathway — this is what MCPoke's own make_initialize()
+  // sends, and it never includes elicitation, so any elicitation observed over
+  // a legacy connection is, correctly, always a violation today).
   const meta = originalPayload?.params?._meta || {};
-  const declaredCaps = meta['io.modelcontextprotocol/clientCapabilities'];
-  if (declaredCaps !== undefined) {
+  const perRequestCaps = meta['io.modelcontextprotocol/clientCapabilities'];
+  const usesModernMeta = perRequestCaps !== undefined;
+  const declaredCaps = usesModernMeta ? perRequestCaps : (srv.declaredCapabilities || {});
+  const pathway = usesModernMeta ? "the caller's per-request _meta" : "this session's initialize capabilities";
+  if (usesModernMeta || srv.declaredCapabilities) {
     const elicitCap = declaredCaps.elicitation;
     if (!elicitCap) {
       _pushFindingDedup(srv, mkFinding('elicit-capability-mismatch', 'high', 'Protocol',
-        `Server sent an elicitation/create request (mode: ${mode}) even though the caller's per-request _meta declared no elicitation support at all — servers MUST NOT send inputRequests for capabilities the client hasn't declared.`,
-        'Track declared client capabilities per request and never include elicitation/create in inputRequests unless the caller has declared support for it.'));
+        `Server sent an elicitation/create request (mode: ${mode}) even though ${pathway} declared no elicitation support at all — servers MUST NOT send inputRequests for capabilities the client hasn't declared.`,
+        'Track declared client capabilities (per-request _meta or session-level initialize) and never include elicitation/create in inputRequests unless the caller has declared support for it.'));
     } else {
       const supportsMode = Object.keys(elicitCap).length === 0 ? ['form'] : Object.keys(elicitCap);
       if (!supportsMode.includes(mode)) {
         _pushFindingDedup(srv, mkFinding('elicit-mode-mismatch', 'high', 'Protocol',
-          `Server sent an elicitation/create request with mode "${mode}" but the caller only declared support for [${supportsMode.join(', ')}] — servers MUST NOT send a mode the client hasn't declared.`,
+          `Server sent an elicitation/create request with mode "${mode}" but ${pathway} only declared support for [${supportsMode.join(', ')}] — servers MUST NOT send a mode the client hasn't declared.`,
           'Only send elicitation modes explicitly present in the caller-declared elicitation capability.'));
       }
     }
@@ -6678,6 +6756,7 @@ async function rawFetch(srv, payload, opts = {}) {
     url: srv.url, token: srv.token, proxy: srv.proxy,
     transport: srv.transport || 'http', payload,
     custom_headers: srv.customHeaders || null,
+    protocol_version: srv.pinnedVersion || null,
   };
   if (opts.authHeader !== undefined) body.auth_header = opts.authHeader;
   return fetch('/raw', {
@@ -6742,7 +6821,8 @@ async function doSend() {
                      method, transport: srv.transport || 'http',
                      payload: isGet ? null : payload,
                      custom_headers: Object.keys(customHdrs).length ? customHdrs : null,
-                     auth_header: authHdr !== null ? authHdr : ''};
+                     auth_header: authHdr !== null ? authHdr : '',
+                     protocol_version: srv.pinnedVersion || null};
         originalPayload = isGet ? null : payload;
       } else if (S.rawMode) {
         try { payload = JSON.parse(document.getElementById('raw-editor').value); }
@@ -6757,7 +6837,8 @@ async function doSend() {
           fetchUrl  = '/raw';
           fetchBody = {url:srv.url, token:srv.token, proxy:srv.proxy,
                        transport:srv.transport, payload,
-                       custom_headers: srv.customHeaders || null};
+                       custom_headers: srv.customHeaders || null,
+                       protocol_version: srv.pinnedVersion || null};
         }
       } else {
         // Form mode on stdio: build tools/call payload
@@ -6782,7 +6863,8 @@ async function doSend() {
       fetchUrl  = '/call';
       fetchBody = {url:srv.url, token:srv.token, proxy:srv.proxy,
                    transport:srv.transport, tool:tool.name, args,
-                   custom_headers: srv.customHeaders || null};
+                   custom_headers: srv.customHeaders || null,
+                   protocol_version: srv.pinnedVersion || null};
       originalPayload = {jsonrpc:'2.0', id:1, method:'tools/call', params:{name:tool.name, arguments:args}};
     }
 
@@ -6814,6 +6896,17 @@ async function doSend() {
       if (elicit) {
         for (const [key, req] of elicit.entries) _runElicitationChecks(srv, key, req, originalPayload, newHistId);
         openElicitationModal(srv, originalPayload, elicit);
+      }
+    }
+    // Elicitation (2025-11-25/current spec, SSE transport): server pushed a real
+    // async elicitation/create request mid-call instead of waiting for the reply
+    // we asked for. Phase 1 — detect and run passive checks only; MCPoke does not
+    // yet answer these mid-stream, so the original call likely timed out.
+    if (body?.server_requests?.length) {
+      const liveElicits = body.server_requests.filter(r => r?.method === 'elicitation/create');
+      for (const req of liveElicits) _runElicitationChecks(srv, String(req.id), req, originalPayload, newHistId);
+      if (liveElicits.length) {
+        showError(`Server pushed ${liveElicits.length} live elicitation/create request(s) over SSE mid-call — see Findings. MCPoke does not yet respond to these (Phase 1: detection only), so this call likely timed out.`);
       }
     }
   } catch (e) {
@@ -7698,6 +7791,8 @@ function buildProjectData() {
     metaTrustFindings: srv.metaTrustFindings || {},
     metaTrustHistIds: srv.metaTrustHistIds || {},
     connectProbe: srv.connectProbe || null,
+    declaredCapabilities: srv.declaredCapabilities || null,
+    pinnedVersion: srv.pinnedVersion || null,
   }));
   return {
     version: 2,
@@ -8041,6 +8136,8 @@ function restoreSessionData(session) {
     srv.metaTrustFindings = s.metaTrustFindings || {};
     srv.metaTrustHistIds  = s.metaTrustHistIds  || {};
     srv.connectProbe = s.connectProbe || null;
+    srv.declaredCapabilities = s.declaredCapabilities || null;
+    srv.pinnedVersion = s.pinnedVersion || null;
     srv.fromCache    = true;
     S.servers[s.url] = srv;
   }
@@ -9241,6 +9338,7 @@ async function runAuthTests(srv, payload) {
           token:          isCustomVar ? (srv.token || null) : (v.header === null ? (srv.token || null) : null),
           auth_header:    isCustomVar ? null                : (v.header === null ? null : v.header),
           custom_headers: isCustomVar ? v.customHeadersOverride : (srv.customHeaders || null),
+          protocol_version: srv.pinnedVersion || null,
         }),
       });
       data    = await res.json();
@@ -9774,6 +9872,7 @@ async function startFuzz() {
             transport: srv.transport || 'http', payload: parsed,
             custom_headers: requestOverride.custom_headers,
             auth_header: requestOverride.auth_header,
+            protocol_version: srv.pinnedVersion || null,
           }),
         });
       } else {
