@@ -6,6 +6,9 @@ Priority order within each section. Tick items off as they land.
 
 ## High priority
 
+- [ ] **Full HTTP request/response as the Response panel default**
+  The 2026-07-28 spec moved substantial protocol semantics into HTTP headers (`x-mcp-header` → `Mcp-Param-*`, `Mcp-Session-Id`, `Mcp-Protocol-Version`, `Mcp-Method`/SEP-2243) — the JSON-RPC body alone is no longer the full picture of what's happening on the wire. The Response panel should default to showing the full HTTP request/response (status line, all headers, body) instead of just the JSON-RPC body, with a toggle to switch to a JSON-only view for the common case where headers aren't relevant. Builds on the full-headers work already shipped (`_renderHeadersBlock`, currently a collapsed-by-default section above the JSON view) — this changes that from opt-in/collapsed to the default view, not new plumbing.
+
 - [x] **Raw / manual request editor**
   Edit the full JSON-RPC payload directly in a text area instead of (or alongside) the generated form. Critical for testing malformed payloads, schema bypass, type confusion, missing required fields, oversized values. Should sit as a toggle ("Form / Raw") in the request panel.
 
@@ -82,3 +85,30 @@ Priority order within each section. Tick items off as they land.
 
 - [x] **Project file model / autosave**
   Implemented as server-side `.mcpoke` project files (not localStorage). On first launch without `--project`, a picker prompts to create a new project, open an existing one (with a filesystem browser), use a dated default, or continue without saving. Project files auto-save every 60 s, on every tool call, connect, finding status change, note edit, and tab close (via `sendBeacon`). `--project PATH` CLI flag opens a project directly. "Export Session" / "Import Session" remain for portable copies. Project name and last-saved time shown in the toolbar. Paths restricted to user home directory with `.mcpoke`/`.json` extension enforcement.
+
+---
+
+## GhostSplice / instruction-splitting detection coverage
+
+A malicious server can smuggle a split instruction through *any* channel that carries server-controlled text back to the client, not just a tool call's success result. Tracking every such channel here as each is closed off. See [MALICIOUS_SERVER_ATTACKS.md](MALICIOUS_SERVER_ATTACKS.md) §4 for the underlying technique and the README's "GhostSplice / instruction-splitting detection" section for how the checks work.
+
+- [x] **Tool call result content** (`content[].text`)
+  Every tool call result is injection-scanned, not just static `tools/list` metadata — closes the original gap the technique exploits.
+- [x] **Opaque tool parameter naming**
+  Static check at connect time flags tools with ≥2 generic, undescribed parameters (`alpha`/`beta`/`param1`/...) — the setup half of the pattern.
+- [x] **Error responses** (JSON-RPC protocol errors and tool-execution `isError:true` results)
+  Neither was scanned before — a server can smuggle the mapping fragment into error text exactly as easily as a success response, and operators scrutinize errors less closely by habit.
+- [x] **`resources/read` content**
+  Resource *content* is now scanned, not just its `resources/list`-time name/title/uri/description metadata.
+- [x] **`prompts/get` rendered messages**
+  A prompt's list-time metadata was already scanned; the actual messages a prompt renders when invoked now are too (`_runPromptGetChecks`).
+- [x] **`structuredContent`**
+  Now scanned for injection language (stringified as a whole, since it can be any JSON value per 2026-07-28), in addition to the existing `outputSchema` shape check.
+- [x] **`serverInfo.instructions`** (returned at `initialize`)
+  Now scanned at connect time (`_runServerInstructionsChecks`), across all three connect paths (HTTP, SSE, stdio).
+- [x] **`resource_link.name` / `.description`** (inside tool results)
+  The `uri` was already checked for SSRF; the accompanying display text is now scanned for injection too.
+- [x] **Notification `params`** (e.g. `notifications/message`'s log text)
+  Now scanned (`_runNotificationChecks`) alongside the existing capability/spoofing checks. `ghostsplice_server.py` can't exercise this itself (plain stateless HTTP, no stream to push a notification over) — live coverage added to `spec_probes_server.py`'s `/sse` instead (`data_ingest` + `spam_notification_with_mapping`).
+
+All seven locations closed as of 2026-08-19, all with live fixture coverage: six in `mcp_test_servers/ghostsplice_server.py`, notification params in `mcp_test_servers/spec_probes_server.py`.

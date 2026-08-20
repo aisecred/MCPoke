@@ -31,6 +31,7 @@ The MCP spec is young and implementations vary widely. Auth handling, input vali
 - **Icon URL SSRF scanner** — passive scan of `icons[].src` on every tool, resource, and prompt (2025-11-25 icons); the MCP client fetches these URLs to render them, so flags internal/loopback/metadata targets (client-side SSRF), off-host remote URLs (tracking beacon leaking user IP/timing), and plaintext HTTP (MITM)
 - **MCP Apps UI scanner** — passive scan for tools declaring `_meta.ui.resourceUri` (2026-07-28 `io.modelcontextprotocol/ui`); the host renders this server-supplied HTML in a sandboxed iframe with a tool-invocation bridge, so flags the confused-deputy / phishing surface (`ui://` scheme) and escalates when the UI resource is loaded from an external, internal, or `data:` URL (external HTML fetch / client-side SSRF)
 - **Prompt injection / tool poisoning scanner** — passive scan on connect of all tool names, descriptions, parameter descriptions, resource names/URIs, and prompt content; flags instruction overrides, template injection, hidden Unicode, CRLF injection, exfiltration indicators, and LLM-specific delimiters; shows ⚑ badge per item
+- **GhostSplice / instruction-splitting detection** — flags tools with opaquely-named parameters, scans tool results, resource reads, and error responses for language that maps sensitive data onto those parameters, and escalates to a confirmed finding when two fragments correlate — see [GhostSplice / instruction-splitting detection](#ghostsplice--instruction-splitting-detection) below
 - **Cross-server tool shadowing detection** — flags duplicate tool names across connected servers; a malicious server registering the same name as a legitimate one can intercept calls
 - **Transport security info** — TLS/plaintext indicator per server; fetches cert details (CN, expiry, self-signed flag) on hover
 - **SSE notification capture** — live feed of server-pushed `notifications/` events that most clients silently discard
@@ -182,6 +183,24 @@ Switch between **Overview**, **Tools**, **Resources**, and **Prompts** tabs in t
 - Click a **tool** → opens the form/raw editor pre-filled with its schema
 - Click a **resource** → seeds the raw editor with a `resources/read` payload
 - Click a **prompt** → seeds the raw editor with a `prompts/get` payload with argument stubs
+
+### GhostSplice / instruction-splitting detection
+
+**GhostSplice** (disclosed Aug 2026) is a technique for smuggling a harmful instruction past both a human reviewer and a single-message content scanner: a malicious server splits the instruction across two or more separate protocol messages, so that no individual message looks malicious on its own. The published proof of concept: a tool declares four parameters named `alpha`, `beta`, `gamma`, `delta` — generic, meaningless, gives nothing away. A *second, unrelated-looking* tool result (framed as a routine "project scan" or "hash verification") later tells the agent to populate those four fields with the contents of `~/.ssh/id_rsa`, proprietary source code, a customer data export, and a `.env` file. Read separately, neither message raises a flag. Reassembled in the agent's context, they instruct it to collect and exfiltrate secrets through the first tool.
+
+MCPoke detects this by checking two things and connecting them, rather than scanning each message in isolation:
+
+1. **Opaque parameter naming** (static, at connect time) — a tool whose parameters are all generic, undescribed placeholders (`alpha`/`beta`/`param1`/`field_a`/bare letters, 2 or more of them) is flagged as a medium-severity **Instruction Splitting** finding, and its parameter names are remembered for the next step. A legitimate tool almost never names its own fields this vaguely.
+2. **Content scanning + correlation** (on every message that can carry server-controlled text back to the client) — every one of the following is scanned for language that maps sensitive file paths or data onto a tool's parameters, and specifically checked for whether it references *two or more* of an already-flagged tool's opaque parameter names together. A single coincidental word match isn't enough signal on its own; two or more named together is. When that correlation fires, MCPoke raises a **critical, confirmed** finding that names both tools explicitly, rather than leaving two disconnected low-confidence hits for the operator to piece together:
+   - Tool call **results** (`content[].text`) and **`structuredContent`** (any JSON value per 2026-07-28, stringified before scanning)
+   - Tool call **error responses** — both a JSON-RPC protocol error's `message` field and a spec-legitimate tool-execution error (`isError: true`, which still carries a normal `content[]` array); a server can smuggle the mapping fragment into error text exactly as easily as a success response, and error text tends to get scrutinized less closely
+   - **`resource_link`** `name`/`description` text inside a tool result (the `uri` itself is separately checked for SSRF)
+   - **`resources/read`** content (as opposed to a resource's `resources/list`-time name/title/description, which was already scanned)
+   - **`prompts/get`** rendered messages (as opposed to a prompt's `prompts/list`-time metadata, which was already scanned)
+   - **`serverInfo.instructions`** — the free-text field a server can return at `initialize` specifically to steer the client/model; scanned at connect time
+   - **Notification `params`** (e.g. `notifications/message`'s log text), alongside the existing capability/spoofing checks on notifications
+
+This closes what was, before it, a real gap in MCPoke's own scanning: prior to this detection, only *static* `tools/list`/`resources/list`/`prompts/list` metadata was ever scanned for injected instructions — the actual content returned by a tool call, a resource read, a prompt render, an error, or a notification was never inspected at all, which is exactly the blind spot this class of technique is built to exploit. See [MALICIOUS_SERVER_ATTACKS.md](MALICIOUS_SERVER_ATTACKS.md) for the full technique writeup and [BACKLOG.md](BACKLOG.md) for the tracking history.
 
 ### Sending requests
 

@@ -37,7 +37,7 @@ CACHE_PATH         = Path.home() / ".mcpoke" / "cache.json"
 # Server-initiated (method+id) requests MCPoke can park a call on and let the
 # operator answer live, instead of just detecting-and-timing-out (Phase 1
 # style). Both are pushed mid-call the same way over SSE/Streamable HTTP.
-LIVE_ANSWERABLE_METHODS = frozenset({"elicitation/create", "sampling/createMessage"})
+LIVE_ANSWERABLE_METHODS = frozenset({"elicitation/create", "sampling/createMessage", "roots/list"})
 
 # ── MCP primitives ────────────────────────────────────────────────────────────
 
@@ -137,8 +137,10 @@ async def _get_request(
     timeout_sec:   float          = READ_TIMEOUT,
     extra_headers: Optional[dict] = None,
     proxy:         Optional[str]  = None,
-) -> tuple[Optional[str], int]:
-    """GET request returning raw response text (not JSON-decoded)."""
+) -> tuple[Optional[str], int, dict, dict]:
+    """GET request returning raw response text (not JSON-decoded), plus the
+    request headers actually sent and the response headers received — so
+    callers can show the full wire request/response, not just the body."""
     headers = {"Accept": "*/*"}
     if extra_headers:
         headers.update(extra_headers)
@@ -149,11 +151,12 @@ async def _get_request(
             kw["proxy"] = _http_proxy(proxy)
         async with session.get(url, **kw) as resp:
             text = await _read_bounded(resp)
-            return text, resp.status
+            resp_hdrs = {k: v for k, v in resp.headers.items()}
+            return text, resp.status, headers, resp_hdrs
     except aiohttp.ClientConnectorSSLError:
-        return None, -1
+        return None, -1, headers, {}
     except Exception:
-        return None, 0
+        return None, 0, headers, {}
 
 
 async def _post_json(
@@ -269,6 +272,43 @@ def _extract_server_info(init_body: Any) -> dict:
     }
 
 
+_MODERN_VERSION = "2026-07-28"
+_PROTO_VER_RE   = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+def _discover_advertises_versions(result: Any) -> bool:
+    """Field-name-agnostic: true if any list value anywhere in a server/discover
+    result contains date-shaped (YYYY-MM-DD) protocol version strings — the
+    same un-spoofable signal MCPensive's srv.modern determination relies on
+    (mcpensive.py's _discover_advertises_versions)."""
+    if not isinstance(result, dict):
+        return False
+    for val in result.values():
+        if isinstance(val, list) and any(isinstance(x, str) and _PROTO_VER_RE.match(x) for x in val):
+            return True
+    return False
+
+
+async def _determine_modern(session: aiohttp.ClientSession, url: str,
+                            extra_headers: dict, proxy: Optional[str],
+                            negotiated_version: str) -> bool:
+    """Is this server operating under the 2026-07-28+ modern/stateless era?
+    True when EITHER the negotiated initialize protocolVersion is >= that
+    revision, OR a one-off server/discover probe (plain HTTP POST, regardless
+    of the primary transport under test — a pure-stateless server may never
+    meaningfully answer the legacy initialize handshake at all, so
+    protocolVersion alone would read as empty/unknown) advertises supported
+    protocol versions. Ports MCPensive's srv.modern signal
+    (mcpensive.py's _determine_modern) so MCP-003 (responds to tools/list
+    without a prior initialize) doesn't false-positive on a server that's
+    stateless by design under 2026-07-28 — there's no handshake to have
+    skipped in the first place."""
+    if negotiated_version and negotiated_version >= _MODERN_VERSION:
+        return True
+    disc_payload = {"jsonrpc": "2.0", "id": 600, "method": "server/discover", "params": {}}
+    body, _status = await _post_json(session, url, disc_payload, extra_headers=extra_headers, proxy=proxy)
+    return _discover_advertises_versions(body.get("result") if isinstance(body, dict) else None)
+
+
 # ── SSESession ────────────────────────────────────────────────────────────────
 
 async def _drain_reply_queue(queue: "asyncio.Queue", eof: "asyncio.Event",
@@ -355,6 +395,13 @@ class SSESession:
         # different reply, captured instead of discarded so a caller can park
         # and answer them (currently: elicitation/create only — see /elicit/respond).
         self._server_requests: list = []
+        # Captured from the most recent post() — "most recent" is deliberate:
+        # when a caller re-invokes post() to answer a parked live request, what
+        # was just sent for THAT answer is what the UI should show, not the
+        # original call. Surfaced to the frontend via _finish_or_park.
+        self.last_request_headers: dict = {}
+        self.last_response_headers: dict = {}
+        self.last_response_status: Optional[int] = None
 
     async def start(self):
         self._task = asyncio.create_task(self._reader())
@@ -440,9 +487,11 @@ class SSESession:
         kw: dict = dict(json=payload, headers=hdrs, timeout=to)
         if _http_proxy(self._proxy):
             kw["proxy"] = _http_proxy(self._proxy)
+        self.last_request_headers = dict(hdrs)
         try:
-            async with self._http.post(self._msg_url, **kw):
-                pass
+            async with self._http.post(self._msg_url, **kw) as resp:
+                self.last_response_headers = {k: v for k, v in resp.headers.items()}
+                self.last_response_status  = resp.status
             return True
         except Exception:
             return False
@@ -511,6 +560,11 @@ class StreamableSession:
         self._server_requests: list = []
         self._reader_tasks: set = set()
         self._response_ctxs: list = []  # keep each streaming POST's context alive until close()
+        # Captured from the most recent post() — see SSESession's identical
+        # fields for why "most recent" (not "original") is the right semantics.
+        self.last_request_headers: dict = {}
+        self.last_response_headers: dict = {}
+        self.last_response_status: Optional[int] = None
 
     async def start(self):
         return self  # nothing to pre-open — every message is its own POST
@@ -550,11 +604,15 @@ class StreamableSession:
         kw: dict = dict(json=payload, headers=hdrs, timeout=to)
         if _http_proxy(self._proxy):
             kw["proxy"] = _http_proxy(self._proxy)
+        self.last_request_headers = dict(hdrs)
         try:
             ctx  = self._http.post(self._url, **kw)
             resp = await ctx.__aenter__()
         except Exception:
             return False
+
+        self.last_response_headers = {k: v for k, v in resp.headers.items()}
+        self.last_response_status  = resp.status
 
         sid = resp.headers.get("Mcp-Session-Id")
         if sid:
@@ -730,13 +788,17 @@ async def _probe_http(session: aiohttp.ClientSession, url: str,
                                                 extra_headers=extra_headers, proxy=proxy)
                 pmt_body,  _ = await _post_json(session, url, PROMPTS_LIST,
                                                 extra_headers=extra_headers, proxy=proxy)
+                server_info = _extract_server_info(init_body)
+                is_modern = await _determine_modern(session, url, extra_headers, proxy,
+                                                    server_info.get("protocolVersion", ""))
                 return {"transport": "http",
-                        "server_info": _extract_server_info(init_body),
+                        "server_info": server_info,
                         "tools":     tools,
                         "resources": _extract_resources(res_body) or [],
                         "prompts":   _extract_prompts(pmt_body)   or [],
                         "no_init_probe": True,
                         "no_init_probe_evidence": no_init_probe_evidence,
+                        "is_modern": is_modern,
                         "response_headers": init_hdrs,
                         "client_capabilities": init_payload["params"]["capabilities"],
                         "connect_probe": _build_connect_probe(
@@ -761,10 +823,13 @@ async def _probe_http(session: aiohttp.ClientSession, url: str,
                                      extra_headers=extra_headers, proxy=proxy)
     pmt_body,   _ = await _post_json(session, url, PROMPTS_LIST,
                                      extra_headers=extra_headers, proxy=proxy)
+    is_modern = await _determine_modern(session, url, extra_headers, proxy,
+                                        server_info.get("protocolVersion", ""))
     return {"transport": "http", "server_info": server_info,
             "tools":     _extract_tools(tools_body)     or [],
             "resources": _extract_resources(res_body)   or [],
             "prompts":   _extract_prompts(pmt_body)     or [],
+            "is_modern": is_modern,
             "response_headers": init_hdrs,
             "client_capabilities": init_payload["params"]["capabilities"],
             "connect_probe": _build_connect_probe(
@@ -788,10 +853,13 @@ async def _probe_sse(session: aiohttp.ClientSession, url: str,
         tools_resp = await sse.send(TOOLS_LIST)
         res_resp   = await sse.send(RESOURCES_LIST)
         pmt_resp   = await sse.send(PROMPTS_LIST)
+    is_modern = await _determine_modern(session, url, extra_headers, proxy,
+                                        server_info.get("protocolVersion", ""))
     return {"transport": "sse", "server_info": server_info,
             "tools":     _extract_tools(tools_resp)   or [],
             "resources": _extract_resources(res_resp) or [],
             "prompts":   _extract_prompts(pmt_resp)   or [],
+            "is_modern": is_modern,
             "client_capabilities": make_initialize(protocol_version=protocol_version, elicitation=elicitation)["params"]["capabilities"]}
 
 
@@ -987,20 +1055,27 @@ async def _finish_or_park(live, http_session: aiohttp.ClientSession,
     notifs   = live.notifications
     srv_reqs = live.server_requests
     live_answerable = [r for r in srv_reqs if r.get("method") in LIVE_ANSWERABLE_METHODS]
+    # Captured from the live session's most recent post() — see SSESession/
+    # StreamableSession's last_request_headers docstrings. Surfaced on every
+    # return path (including the timeout/error one) so the operator can always
+    # see what actually went over the wire for this call.
+    hdr_fields = {"request_headers": live.last_request_headers,
+                 "response_headers": live.last_response_headers,
+                 "response_status": live.last_response_status}
     if resp is not None:
         await live.close()
         await http_session.close()
-        return {"status": 200, "result": resp, "notifications": notifs, "server_requests": srv_reqs}
+        return {"status": 200, "result": resp, "notifications": notifs, "server_requests": srv_reqs, **hdr_fields}
     if live_answerable:
         token = secrets.token_urlsafe(16)
         _pending_exchanges[token] = _PendingExchange(live, http_session, rid, url, transport)
         return {"status": "pending_live_request", "pending_token": token,
                 "notifications": notifs, "server_requests": srv_reqs,
-                "live_request": live_answerable[-1]}
+                "live_request": live_answerable[-1], **hdr_fields}
     await live.close()
     await http_session.close()
     return {"error": "no response to tool call",
-            "notifications": notifs, "server_requests": srv_reqs}
+            "notifications": notifs, "server_requests": srv_reqs, **hdr_fields}
 
 
 MAX_AUTO_REJECT_ITERATIONS = 5
@@ -1013,9 +1088,11 @@ async def _await_reply_with_auto_reject(live, rid: Any, elicitation_declared: bo
     capabilities the client hasn't declared) — auto-reject it with a
     JSON-RPC error explaining exactly that, and keep waiting, rather than
     parking for a human to answer something the server was never allowed to
-    ask for. Sampling, and elicitation when it IS declared, are unaffected
-    and still park normally via _finish_or_park. Bounded so a server that
-    keeps re-eliciting can't hang the call indefinitely."""
+    ask for. Sampling, roots/list (always declared — MCPoke's own
+    make_initialize() unconditionally sends the roots capability, no toggle),
+    and elicitation when it IS declared, are unaffected and still park
+    normally via _finish_or_park. Bounded so a server that keeps re-eliciting
+    can't hang the call indefinitely."""
     rejected_ids: set = set()
     for _ in range(MAX_AUTO_REJECT_ITERATIONS):
         resp = await live.await_reply(rid, timeout=timeout, stop_on_methods=LIVE_ANSWERABLE_METHODS)
@@ -1133,16 +1210,17 @@ async def raw_call(req: RawRequest):
     except RuntimeError as e:
         return {"error": str(e)}
     async with session_ctx as session:
-        raw_text, status = await _get_request(session, req.url,
-                                              extra_headers=extra_headers,
-                                              proxy=req.proxy)
+        raw_text, status, req_hdrs, resp_hdrs = await _get_request(
+            session, req.url, extra_headers=extra_headers, proxy=req.proxy)
         if raw_text is None:
-            return {"error": f"HTTP {status} — no response", "status": status}
+            return {"error": f"HTTP {status} — no response", "status": status,
+                    "request_headers": req_hdrs, "response_headers": resp_hdrs, "response_status": status}
         try:
             parsed = json.loads(raw_text)
         except json.JSONDecodeError:
             parsed = raw_text
-        return {"status": status, "result": parsed, "raw": raw_text}
+        return {"status": status, "result": parsed, "raw": raw_text,
+                "request_headers": req_hdrs, "response_headers": resp_hdrs, "response_status": status}
 
 
 @app.post("/connect")
@@ -1183,8 +1261,8 @@ class ElicitRespondRequest(BaseModel):
 
 @app.post("/elicit/respond")
 async def elicit_respond(req: ElicitRespondRequest):
-    """Answer (or abandon, or poll) a live elicitation/create or
-    sampling/createMessage request a call parked on. See _sse_call/
+    """Answer (or abandon, or poll) a live elicitation/create,
+    sampling/createMessage, or roots/list request a call parked on. See _sse_call/
     _streamable_call/_finish_or_park — those park the exchange instead of
     letting the original call time out; this resumes it.
 
@@ -1670,6 +1748,12 @@ async def _connect_stdio(command: str, env: Optional[dict] = None,
         "tools":       _extract_tools(tools_resp)     or [],
         "resources":   _extract_resources(res_resp)   or [],
         "prompts":     _extract_prompts(prompts_resp) or [],
+        # Version-only check — stdio always initializes before tools/list (no
+        # cold-probe path exists here), so there's no discover-fallback need;
+        # this just keeps srv.isModern populated consistently for any manual
+        # No-init-probe preset re-fire later in the session.
+        "is_modern": bool(server_info.get("protocolVersion", "")) and
+                    server_info.get("protocolVersion", "") >= _MODERN_VERSION,
     }
 
 
@@ -2222,8 +2306,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   padding: 0.35rem 0.75rem; border-bottom: 1px solid var(--border);
   background: var(--bg);
 }
-.findings-detail { color: var(--muted); font-size: 10px; word-break: break-all; }
-.findings-remediation { color: #b3c2d1; font-size: 10px; word-break: break-all; }
+.findings-detail { color: var(--muted); font-size: 10px; word-break: break-word; }
+.findings-remediation { color: #b3c2d1; font-size: 10px; word-break: break-word; }
 /* Overview dashboard */
 .ov-grid { display:grid; grid-template-columns:1fr; gap:.5rem; padding:.4rem; }
 .ov-card { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:.5rem .65rem; min-width:0; overflow:hidden; word-break:break-word; }
@@ -3117,6 +3201,7 @@ async function loadCache() {
         srv.prompts    = entry.prompts   || [];
         srv.transport  = entry.transport;
         srv.findings   = scanServerFindings(srv);
+        _runServerInstructionsChecks(srv);
         S.servers[url] = srv;
       }
     }
@@ -3190,9 +3275,11 @@ async function connectStdioServer(command, env) {
       srv.tools      = data.tools     || [];
       srv.resources  = data.resources || [];
       srv.prompts    = data.prompts   || [];
+      srv.isModern   = data.is_modern || false;
       srv.fromCache  = false;
       const _preserved = (srv.findings || []).filter(f => ['auth-test','oauth-probe','cert'].includes(f.item));
       srv.findings   = [...scanServerFindings(srv), ..._preserved];
+      _runServerInstructionsChecks(srv);
       if (srv.url === S.activeUrl || !S.activeUrl || !S.servers[S.activeUrl] ||
           S.servers[S.activeUrl].status !== 'connected') {
         setActiveServer(url);
@@ -3242,10 +3329,12 @@ async function connectServer(url, token, proxy, customHeaders) {
       srv.noInitProbe     = data.no_init_probe || false;
       srv.noInitProbeEvidence = data.no_init_probe_evidence || null;
       srv.declaredCapabilities = data.client_capabilities || null;
+      srv.isModern        = data.is_modern || false;
       srv.fromCache       = false;
       srv.certInfo        = null;
       const _preserved = (srv.findings || []).filter(f => ['auth-test','oauth-probe','cert'].includes(f.item));
       srv.findings   = [...scanServerFindings(srv), ..._preserved];
+      _runServerInstructionsChecks(srv);
       // Fetch TLS cert info in the background (non-blocking)
       if (url.startsWith('https://')) fetchCertInfo(srv);
       // If this is the only/first connected server, activate it
@@ -4589,6 +4678,202 @@ function flagTool(tool) {
   return hits;
 }
 
+// ── Tool annotation trust (readOnlyHint/destructiveHint vs apparent behavior) ─
+// Spec (all versions): "clients MUST consider tool annotations to be untrusted
+// unless they come from trusted servers." Annotations alone can't be verified,
+// but a tool whose OWN name/description already signals a mutative action
+// while its annotations explicitly claim otherwise is a concrete, checkable
+// contradiction — not just a generic "annotations exist, trust nothing" note.
+const MUTATIVE_TERMS = ['write','delete','remove','upload','mkdir','chmod','chown',
+                        'insert','update','drop','exec','execute','shell','spawn','run_cmd','run_code'];
+
+function _annotationTrustIssues(tool) {
+  const ann = tool.annotations;
+  if (!ann || typeof ann !== 'object') return [];
+  const name   = (tool.name        || '').toLowerCase();
+  const desc   = (tool.description || '').toLowerCase();
+  const tokens = name.split(/[_\-.\s]+/);
+  const mutativeMatch = MUTATIVE_TERMS.some(term =>
+    tokens.includes(term) || name.includes(term) || new RegExp('\\b' + term + '\\b').test(desc));
+  const codeExecMatch = flagTool(tool).includes('code exec');
+  const issues = [];
+  if ((mutativeMatch || codeExecMatch) && ann.readOnlyHint === true) {
+    issues.push(`declares annotations.readOnlyHint: true, but its own name/description ("${tool.name}"${tool.description ? ': ' + tool.description : ''}) signals a mutating or executing action — annotations are self-reported and MUST be treated as untrusted unless the server itself is trusted.`);
+  }
+  if (mutativeMatch && ann.destructiveHint === false) {
+    issues.push(`declares annotations.destructiveHint: false, but its own name/description ("${tool.name}"${tool.description ? ': ' + tool.description : ''}) signals a mutating action — a server can freely lie about destructiveHint to suppress a client's confirmation prompt for a genuinely destructive operation.`);
+  }
+  return issues;
+}
+
+// ── x-mcp-header (2026-07-28): tool inputSchema properties mirrored into an
+// HTTP header (Mcp-Param-{name}) on Streamable HTTP. Spec: servers SHOULD NOT
+// mark sensitive params this way (header values are visible to intermediaries/
+// logs a JSON body field wouldn't be); values MUST be RFC 9110 token syntax
+// with no CR/LF, and clients MUST reject tool definitions that violate this.
+const XMCP_HEADER_SENSITIVE_RE = /token|password|passwd|secret|apikey|api_key|credential|auth|private_key|privatekey/i;
+const XMCP_HEADER_TOKEN_RE     = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/; // RFC 9110 §5.1 tchar, 1*
+
+function _xmcpHeaderIssues(tool) {
+  const props = tool.inputSchema?.properties;
+  if (!props || typeof props !== 'object') return [];
+  const issues = [];
+  for (const [propName, schema] of Object.entries(props)) {
+    const hv = schema && schema['x-mcp-header'];
+    if (hv === undefined || hv === null) continue;
+    const hvStr = String(hv);
+    if (XMCP_HEADER_SENSITIVE_RE.test(propName)) {
+      issues.push({severity: 'high',
+        detail: `parameter "${propName}" is marked x-mcp-header (mirrored into HTTP header Mcp-Param-${hvStr} on Streamable HTTP) but its name looks like a credential/secret — the spec says servers SHOULD NOT mark sensitive params this way, since header values are visible to network intermediaries and logs a JSON body field would not be.`});
+    }
+    if (/[\r\n]/.test(hvStr) || !XMCP_HEADER_TOKEN_RE.test(hvStr)) {
+      issues.push({severity: 'high',
+        detail: `parameter "${propName}" declares x-mcp-header: ${JSON.stringify(hvStr)}, which is not valid RFC 9110 token syntax (or contains CR/LF) — the spec requires clients to REJECT tool definitions with a malformed x-mcp-header value entirely. A client that doesn't validate before mirroring this into an HTTP header is exposed to HTTP header/request smuggling.`});
+    }
+  }
+  return issues;
+}
+
+// ── Opaque parameter naming (GhostSplice-style instruction-splitting setup) ──
+// A legitimate tool schema almost never names its own parameters this
+// vaguely — genuine params describe what they hold (path, query, user_id).
+// Generic placeholder names (alpha/beta/gamma/delta, param1, field_a, bare
+// single letters) with no explanatory description are the structural
+// fingerprint of a tool built to have its fields' real purpose revealed
+// later, by a separate message, rather than declared honestly up front.
+const OPAQUE_PARAM_NAME_RE = /^(alpha|beta|gamma|delta|epsilon|zeta|eta|theta|param(eter)?\d*|field\d*|value\d*|input\d*|arg\d*|data\d*|item\d*|[a-z]\d?)$/i;
+
+function _opaqueParamNames(tool) {
+  const props = tool.inputSchema?.properties;
+  if (!props || typeof props !== 'object') return [];
+  const names = Object.keys(props);
+  if (names.length < 2) return []; // a single generic param isn't enough of a pattern to flag
+  const allOpaque = names.every(n => OPAQUE_PARAM_NAME_RE.test(n) && !props[n]?.description);
+  return allOpaque ? names : [];
+}
+
+// ── Mcp-Param-{Name} header/body desync probe (SEP-2243, ported from
+// MCPensive's MCP-058 Probes 2/3). MCPensive runs this automatically in
+// aggressive mode; MCPoke is manual/interactive, so it's exposed as a single
+// operator-triggered action (cap panel) against the first qualifying tool,
+// rather than auto-firing a real tools/call against every connected server.
+const DESTRUCTIVE_TOOL_RE = /(delete|remove|drop|destroy|wipe|truncate|purge|erase|unlink|revoke)/i;
+
+function _xMcpHeaderProbeTarget(srv) {
+  for (const t of (srv.tools || [])) {
+    if (!t.name || DESTRUCTIVE_TOOL_RE.test(t.name)) continue;
+    const props = t.inputSchema?.properties;
+    if (!props || typeof props !== 'object') continue;
+    for (const [propName, schema] of Object.entries(props)) {
+      const hdr = schema && schema['x-mcp-header'];
+      if (typeof hdr === 'string' && hdr) {
+        return {tool: t, propName, headerSuffix: hdr, jsonType: schema.type || 'string'};
+      }
+    }
+  }
+  return null;
+}
+
+function _bhProbeValues(jsonType) {
+  if (jsonType === 'integer') return [111, '222'];
+  if (jsonType === 'boolean') return [true, 'false'];
+  return ['mcpoke-probe-a', 'mcpoke-probe-b'];
+}
+
+// Minimal plausible-value filler for required string params so the probed
+// tool actually executes (rather than failing its own input validation
+// before the header/body check is even reached) — ported from MCPensive's
+// _plausible_args, trimmed to the common cases.
+function _plausibleArgsForSchema(schema) {
+  const props = schema?.properties || {};
+  const required = schema?.required || [];
+  const args = {};
+  for (const name of required) {
+    const prop = props[name] || {};
+    if (prop.type && prop.type !== 'string') continue;
+    const n = name.toLowerCase();
+    if (/url|uri|link|endpoint/.test(n)) args[name] = 'https://example.com';
+    else if (/path|file|filename|filepath/.test(n)) args[name] = '/tmp/test.txt';
+    else if (/query|sql|search/.test(n)) args[name] = 'test';
+    else if (/text|content|document|input|message|data|body/.test(n)) args[name] = 'test document content';
+    else if (/user|username/.test(n)) args[name] = 'testuser';
+    else if (/password|pass|secret|token|key/.test(n)) args[name] = 'testpassword';
+    else if (/email|mail/.test(n)) args[name] = 'test@example.com';
+    else args[name] = 'test';
+  }
+  return args;
+}
+
+async function runXMcpHeaderDesyncProbe(url) {
+  const srv = S.servers[url];
+  if (!srv) return;
+  const target = _xMcpHeaderProbeTarget(srv);
+  if (!target) return;
+  const {tool, propName, headerSuffix, jsonType} = target;
+  const headerName = `Mcp-Param-${headerSuffix}`;
+  const [bodyVal, mismatchVal] = _bhProbeValues(jsonType);
+  const args = _plausibleArgsForSchema(tool.inputSchema);
+  args[propName] = bodyVal;
+
+  // Deliberately does NOT check body.result.result.isError (the correct depth
+  // for a tool-execution error — see every other isErr computation in this
+  // file for the general-purpose version). This probe only cares whether the
+  // server dispatched to the tool handler at all (vs. rejecting the request
+  // itself with a protocol-level 400/-32020 HeaderMismatch) — a tool that
+  // executed and then reported its own business-logic isError:true still
+  // proves the header/body desync wasn't caught, so it must still count as
+  // "executed despite mismatch" here.
+  const executedDespiteMismatch = body => {
+    const isErr = !!(body?.error || body?.result?.error || body?.result?.isError);
+    return !isErr && !!body?.result?.result;
+  };
+
+  const fire = async customHeaders => {
+    const res = await fetch('/call', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url: srv.url, token: srv.token, proxy: srv.proxy,
+                            transport: srv.transport, tool: tool.name, args,
+                            custom_headers: customHeaders,
+                            protocol_version: srv.pinnedVersion || null,
+                            elicitation: srv.elicitationEnabled || false}),
+    });
+    return await res.json();
+  };
+
+  showError(`Running SEP-2243 Mcp-Param probe against "${tool.name}"…`);
+
+  // Probe 2 — header present but mismatched vs. body.
+  const body2 = await fire({[headerName]: String(mismatchVal)});
+  const newHistId2 = S.history.length;
+  addHistory(srv.url, `sep2243-mismatch:${tool.name}`, args, body2, executedDespiteMismatch(body2), 0, [], null);
+  if (executedDespiteMismatch(body2)) {
+    _pushFindingDedup(srv, {
+      severity: 'high', category: 'SEP-2243',
+      server: srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, ''), item: tool.name,
+      detail: `Tool "${tool.name}" declares parameter "${propName}" with x-mcp-header:"${headerSuffix}" (SEP-2243), so a conforming client mirrors its value into the ${headerName} header on every call. The server executed the tool despite ${headerName} disagreeing with the body value instead of rejecting with HTTP 400 / JSON-RPC -32020 (HeaderMismatch). A gateway that authorizes or routes on ${headerName} (e.g. tenant/region isolation) can be bypassed: it approves one value while the backend actually executes a different one from the body.`,
+      remediation: `Validate that every Mcp-Param-{Name} header equals its corresponding body argument on every Streamable HTTP tools/call request, and reject mismatches with HTTP 400 and JSON-RPC error -32020 (HeaderMismatch) before dispatching.`,
+      source: 'auto', historyId: newHistId2, serverUrl: srv.url,
+    });
+  }
+
+  // Probe 3 — header omitted entirely while the body value is present.
+  const body3 = await fire(null);
+  const newHistId3 = S.history.length;
+  addHistory(srv.url, `sep2243-omitted:${tool.name}`, args, body3, executedDespiteMismatch(body3), 0, [], null);
+  if (executedDespiteMismatch(body3)) {
+    _pushFindingDedup(srv, {
+      severity: 'high', category: 'SEP-2243',
+      server: srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, ''), item: tool.name,
+      detail: `Tool "${tool.name}" declares parameter "${propName}" with x-mcp-header:"${headerSuffix}" (SEP-2243). The spec requires a conforming client to always send ${headerName} when the parameter has a value — a client that omits it while the body carries a value is non-conforming and the server MUST reject the request. The server executed the call anyway with the header entirely absent, meaning it does not enforce header-body binding for this parameter at all — any gateway relying on ${headerName} for routing/authorization sees no signal whatsoever for this call.`,
+      remediation: `Reject any Streamable HTTP tools/call where a parameter marked x-mcp-header has a body value but the corresponding Mcp-Param-{Name} header is absent.`,
+      source: 'auto', historyId: newHistId3, serverUrl: srv.url,
+    });
+  }
+
+  showError(`SEP-2243 Mcp-Param probe against "${tool.name}" complete — see Findings.`);
+  if (srv.url === S.activeUrl) renderTabContent(srv);
+}
+
 // ── Injection / poisoning scanner ─────────────────────────────────────────
 
 const INJECTION_RULES = [
@@ -4688,6 +4973,20 @@ const INJECTION_RULES = [
      /`[^`]{1,60}`/,              // `backtick` execution
      /\|\s*(bash|sh|cmd|powershell|python|ruby|perl|node)\b/i,  // pipe to shell
      /;\s*(curl|wget|nc|ncat|netcat|bash|sh)\b/i,  // chained shell commands
+   ]},
+  // GhostSplice-style instruction splitting (ASSET Research Group, Aug 2026):
+  // a malicious server never states "exfiltrate X" in one message — instead a
+  // LATER, separately-innocuous-looking tool result tells the agent to
+  // populate an earlier tool's (deliberately opaque, e.g. alpha/beta/gamma/
+  // delta) parameters with the contents of sensitive local files, framed as
+  // routine verification. This catches that mapping fragment on its own, even
+  // without correlating it back to the opaque-named tool (see
+  // _opaqueParamNames/srv.opaqueParamTools for the correlated, higher-
+  // confidence version of this check).
+  {cat: 'field-mapping exfiltration instruction', severity: 'critical',
+   pats: [
+     /\b(populate|fill in|fill|set|put|insert|place)\b[^.]{0,60}\b(contents?|content)\s+of\b[^.]{0,100}(\.ssh\b|id_rsa|id_ed25519|\.env\b|\.pem\b|\.aws[\\\/]credentials|\.npmrc|\.git-credentials|\/etc\/passwd|shadow\b|credentials?\.json|customers?\.csv|\.pgpass|private.?key)/i,
+     /\bfor\s+(server-side|internal|integrity|hash)\s+verification\b[^.]{0,80}\b(contents?|content)\b/i,
    ]},
   {cat: 'sampling / AI model manipulation',
    pats: [
@@ -4837,7 +5136,13 @@ const SENSITIVE_PATTERNS = [
 
 function scanResponse(data, requestArgs) {
   if (!data) return [];
-  const text = JSON.stringify(data);
+  // request_headers is what MCPoke itself sent (Authorization, custom
+  // headers, ...) — never server output, so it must never be scanned as a
+  // "sensitive data in response" source, or an operator's own configured
+  // bearer token would falsely flag as a credential the server exposed.
+  // response_headers stays in scope: those ARE server-controlled.
+  const {request_headers, ...toScan} = data;
+  const text = JSON.stringify(toScan);
   // Build a set of all request argument values so we can detect reflections
   const argValues = [];
   if (requestArgs && typeof requestArgs === 'object') {
@@ -5010,6 +5315,14 @@ function renderCapPanel(srv) {
       <label style="font-size:11px;cursor:pointer"><input type="checkbox" ${srv.elicitationEnabled ? 'checked' : ''}
         onchange="setElicitationEnabled('${esc(srv.url)}', this.checked)"> ${srv.elicitationEnabled ? 'on' : 'off (auto-reject)'}</label>
     </span></div>`);
+  {
+    const xmpTarget = _xMcpHeaderProbeTarget(srv);
+    if (xmpTarget) {
+      rows.push(`<div class="cap-panel-row"><span class="cap-panel-label" title="Calls '${esc(xmpTarget.tool.name)}' twice: once with Mcp-Param-${esc(xmpTarget.headerSuffix)} mismatched against the body value, once with it omitted entirely. A conforming server rejects both with HTTP 400 / JSON-RPC -32020 (HeaderMismatch); executing anyway is a header/body desync — a gateway authorizing on the header can be bypassed by a body that says something different.">SEP-2243 Mcp-Param probe</span><span class="cap-panel-val">
+        <button class="btn-sm" onclick="runXMcpHeaderDesyncProbe('${esc(srv.url)}')">Run against "${esc(xmpTarget.tool.name)}"</button>
+      </span></div>`);
+    }
+  }
   if (fp)                 rows.push(`<div class="cap-panel-row"><span class="cap-panel-label">Fingerprint</span><span class="cap-panel-val" style="color:var(--muted)">${esc(fp)}</span></div>`);
 
   // Capabilities section
@@ -5101,6 +5414,7 @@ function scanText(field, value) {
 function scanTool(tool) {
   const hits = [
     ...scanText('name',        tool.name),
+    ...scanText('title',       tool.title),
     ...scanText('description', tool.description),
   ];
   for (const [k, prop] of Object.entries(tool.inputSchema?.properties || {})) {
@@ -5113,6 +5427,7 @@ function scanTool(tool) {
 function scanResource(res) {
   return [
     ...scanText('name',        res.name),
+    ...scanText('title',       res.title),
     ...scanText('uri',         res.uri),
     ...scanText('description', res.description),
   ];
@@ -5121,6 +5436,7 @@ function scanResource(res) {
 function scanPrompt(pmt) {
   const hits = [
     ...scanText('name',        pmt.name),
+    ...scanText('title',       pmt.title),
     ...scanText('description', pmt.description),
   ];
   for (const a of (pmt.arguments || []))
@@ -5347,13 +5663,28 @@ function _addMetaTrustFinding(srv, kind, historyId) {
 // params.inputResponses (keyed the same way) and echoing params.requestState
 // verbatim if the server sent one.
 
+// MRTR_INPUT_REQUEST_METHODS: which inputRequests entries this modal knows how
+// to render/answer. roots/list is the 2026-07-28 delivery mechanism for roots
+// (deprecated but MUST-support per the feature lifecycle policy) — same
+// InputRequiredResult envelope as elicitation/create, but answered with a
+// bare {roots:[...]} in inputResponses, not the {action,content} shape.
+const MRTR_INPUT_REQUEST_METHODS = new Set(['elicitation/create', 'roots/list']);
+
+// roots/list has no capability toggle (MCPoke always declares roots in
+// make_initialize) and no {action} field in its answer — it must always be
+// shown to the operator, never silently auto-declined the way an undeclared
+// elicitation/create is.
+function _hasRootsEntry(elicitData) {
+  return elicitData.entries.some(([, req]) => req?.method === 'roots/list');
+}
+
 function extractElicitRequests(body) {
   const rpcResult = body?.result?.result;
   if (!rpcResult || typeof rpcResult !== 'object') return null;
   if (rpcResult.resultType !== 'input_required') return null;
   const reqs = rpcResult.inputRequests;
   if (!reqs || typeof reqs !== 'object') return null;
-  const entries = Object.entries(reqs).filter(([, r]) => r?.method === 'elicitation/create');
+  const entries = Object.entries(reqs).filter(([, r]) => MRTR_INPUT_REQUEST_METHODS.has(r?.method));
   if (!entries.length) return null;
   return {entries, requestState: rpcResult.requestState};
 }
@@ -5523,6 +5854,232 @@ function _runSamplingChecks(srv, req, originalPayload, historyId) {
   }
 }
 
+// ── Tool result checks: outputSchema conformance + resource_link URI safety ──
+// Lightweight structural check, not a full JSON Schema validator — matches
+// _checkElicitSchemaShape's style: catch obvious top-level type/required-key
+// violations, not every possible schema constraint.
+function _checkStructuredContentShape(schema, value) {
+  const issues = [];
+  const jsType = v => Array.isArray(v) ? 'array' : (v === null ? 'null' : typeof v);
+  if (schema.type && jsType(value) !== schema.type &&
+      !(schema.type === 'integer' && jsType(value) === 'number')) {
+    issues.push(`top-level type is "${jsType(value)}", schema declares "${schema.type}"`);
+    return issues; // type mismatch makes deeper checks meaningless
+  }
+  if (schema.type === 'object' && value && typeof value === 'object') {
+    for (const req of (schema.required || [])) {
+      if (!(req in value)) issues.push(`missing required property "${req}"`);
+    }
+  } else if (schema.type === 'array' && Array.isArray(value) && schema.items?.type) {
+    value.forEach((item, i) => {
+      const itemType = jsType(item);
+      if (itemType !== schema.items.type && !(schema.items.type === 'integer' && itemType === 'number')) {
+        issues.push(`item [${i}] has type "${itemType}", schema.items declares "${schema.items.type}"`);
+      }
+    });
+  }
+  return issues;
+}
+
+// Shared by every "scan this piece of server-controlled text for injected
+// instructions" call site (tool results, tool errors, resource reads, ...).
+// Runs the generic injection-rule scan AND the GhostSplice opaque-parameter
+// correlation (srv.opaqueParamTools, populated by _opaqueParamNames at
+// connect time) — factored out so every new fragment-carrying location gets
+// both checks for free instead of re-deriving them per call site.
+function _scanForSplitting(srv, historyId, findingPrefix, sourceDesc, itemKey, text) {
+  if (!text) return;
+  const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  const mkFinding = (item, severity, category, detail, remediation) => ({
+    severity, category, server: srvShort, item, detail, remediation,
+    source: 'auto', historyId, serverUrl: srv.url,
+  });
+  for (const h of scanText(findingPrefix, text)) {
+    _pushFindingDedup(srv, mkFinding(`${findingPrefix}-${h.cat}`, h.severity, 'Injection/Poisoning',
+      `${sourceDesc} matched "${h.cat}": "${h.preview}" — this content is exactly as untrusted as tool descriptions; a server can use it to inject instructions into the agent's context.`,
+      'Treat this content as untrusted input the same as tool metadata. Review it for injected instructions before trusting or forwarding it.'));
+  }
+  // Instruction-splitting correlation: does this text reference (by name, 2+
+  // together — one coincidental word match isn't enough signal) the opaque
+  // parameters of a DIFFERENT tool on this server? If so this isn't an
+  // isolated hit — it's the second half of a GhostSplice-style split
+  // instruction, confirmed by tying it back to the specific tool it's
+  // instructing the operator to (mis)use.
+  for (const [otherTool, paramNames] of Object.entries(srv.opaqueParamTools || {})) {
+    if (otherTool === itemKey) continue;
+    const mentioned = paramNames.filter(p => new RegExp(`\\b${p}\\b`, 'i').test(text));
+    if (mentioned.length >= 2) {
+      _pushFindingDedup(srv, mkFinding('instruction-splitting-confirmed', 'critical', 'Instruction Splitting',
+        `${sourceDesc} references ${mentioned.length} opaquely-named parameters (${mentioned.join(', ')}) declared on tool "${otherTool}" — this is the GhostSplice pattern (ASSET Research Group, Aug 2026): an innocuous-looking tool schema with generic field names, completed by a LATER, separate message that reveals what sensitive data to place in each field. Neither message alone looks malicious; only combined does the injected instruction reassemble.`,
+        `Do not call "${otherTool}" with values derived from this content. Treat "${otherTool}"'s generic parameter names as already suspicious and manually verify exactly what data is being requested and why before ever populating them.`));
+    }
+  }
+}
+
+// Error responses (JSON-RPC error object OR a tool-execution error's
+// isError:true text) were never scanned before this — a server can smuggle
+// the GhostSplice mapping fragment (or any injection) into error text
+// exactly as easily as a success response, and operators scrutinize error
+// text less closely by habit.
+function _runErrorContentChecks(srv, toolName, errorObj, historyId) {
+  if (!errorObj || typeof errorObj !== 'object') return;
+  const texts = [errorObj.message, errorObj.data !== undefined ? JSON.stringify(errorObj.data) : null].filter(Boolean);
+  for (const t of texts) {
+    _scanForSplitting(srv, historyId, 'tool-error', `Tool "${toolName}" ERROR response`, toolName, t);
+  }
+}
+
+// resources/read content — resources are only ever injection-scanned at
+// resources/list time (name/title/uri/description metadata); the actual
+// content a resource read returns was never scanned. Note the field name
+// difference from tool results: resources/read returns `contents[]` with
+// `text`/`blob`, not tools/call's `content[]` with `type`/`text`.
+function _runResourceReadChecks(srv, uri, body, historyId) {
+  const rpcResult = body?.result?.result;
+  if (!rpcResult || typeof rpcResult !== 'object') return;
+  const contents = Array.isArray(rpcResult.contents) ? rpcResult.contents : [];
+  for (const c of contents) {
+    if (!c || typeof c.text !== 'string') continue; // skip blob (base64, not readable text)
+    const label = c.uri || uri || '(resource)';
+    _scanForSplitting(srv, historyId, 'resource-read', `Resource "${label}" read content`, `resource:${label}`, c.text);
+  }
+}
+
+// prompts/get rendered messages — prompts.list metadata (name/title/
+// description/argument descriptions) was already scanned; the actual
+// messages a prompt renders when invoked never were. Note the shape
+// difference from tools/call: each message's `content` is a SINGLE content
+// object per spec, not a content[] array — read liberally (some servers
+// return an array anyway) rather than assuming strict compliance.
+function _runPromptGetChecks(srv, promptName, body, historyId) {
+  const rpcResult = body?.result?.result;
+  if (!rpcResult || typeof rpcResult !== 'object') return;
+  const messages = Array.isArray(rpcResult.messages) ? rpcResult.messages : [];
+  for (const m of messages) {
+    const items = Array.isArray(m?.content) ? m.content : [m?.content];
+    for (const item of items) {
+      if (item?.type !== 'text' || typeof item.text !== 'string') continue;
+      _scanForSplitting(srv, historyId, 'prompt-get', `Prompt "${promptName}" rendered message (${m.role || '?'})`, `prompt:${promptName}`, item.text);
+    }
+  }
+}
+
+function _runToolResultChecks(srv, toolName, body, historyId) {
+  const tool = (srv.tools || []).find(t => t.name === toolName);
+  const rpcResult = body?.result?.result;
+  if (!rpcResult || typeof rpcResult !== 'object') return;
+  if (rpcResult.resultType === 'input_required') return; // intermediate MRTR result, not the final tool result
+  const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  const mkFinding = (item, severity, category, detail, remediation) => ({
+    severity, category, server: srvShort, item, detail, remediation,
+    source: 'auto', historyId, serverUrl: srv.url,
+  });
+
+  // Output schema conformance — spec: "Servers MUST provide structured results
+  // that conform to this schema" when outputSchema is declared.
+  if (tool?.outputSchema) {
+    if (rpcResult.structuredContent === undefined) {
+      _pushFindingDedup(srv, mkFinding('output-schema-unused', 'low', 'Protocol',
+        `Tool "${toolName}" declares an outputSchema but this call's result contains no structuredContent — the schema is never actually exercised, so its guarantees can't be relied on.`,
+        'Either populate structuredContent conforming to the declared outputSchema on every call, or remove the outputSchema declaration if structured output isn\'t actually produced.'));
+    } else {
+      const issues = _checkStructuredContentShape(tool.outputSchema, rpcResult.structuredContent);
+      for (const issue of issues) {
+        _pushFindingDedup(srv, mkFinding('output-schema-violation', 'medium', 'Protocol',
+          `Tool "${toolName}" returned structuredContent that violates its own declared outputSchema: ${issue}. Servers MUST provide structured results that conform to their declared outputSchema.`,
+          'Validate structuredContent against outputSchema server-side before returning it — a client that trusts the declared schema without checking (as the spec\'s "Clients SHOULD validate" language anticipates) will misparse or crash on non-conforming data.'));
+      }
+    }
+  }
+
+  // Resource links in tool results — same host/scheme risk logic as icons[].
+  const content = Array.isArray(rpcResult.content) ? rpcResult.content : [];
+  for (const c of content) {
+    if (!c || c.type !== 'resource_link' || typeof c.uri !== 'string') continue;
+    const risk = iconHostRisk(c.uri, srvShort);
+    if (risk) {
+      const reason = risk === 'internal'
+        ? 'points at an internal/loopback/link-local address — a client that auto-fetches resource_link targets is coerced into a client-side SSRF request, including cloud metadata endpoints'
+        : (risk === 'offhost'
+            ? 'is a remote URL on a host different from the MCP server — a tracking beacon or exfiltration channel if the client auto-fetches resource_link targets'
+            : 'is served over plaintext HTTP — content can be substituted in transit (MITM) if the client auto-fetches it');
+      _pushFindingDedup(srv, mkFinding('resource-link-unsafe', risk === 'internal' ? 'high' : 'medium', 'Client-Side SSRF',
+        `Tool "${toolName}" returned a resource_link (${c.name || c.uri}) whose URI ${reason}: ${c.uri}`,
+        'Never auto-fetch resource_link URIs without validating scheme/host first. Restrict to the MCP server\'s own origin or an explicit allowlist; block internal/loopback/link-local targets client-side.'));
+    }
+    // The URI is checked above; the accompanying display text never was —
+    // a resource_link's name/description is exactly as capable of carrying
+    // a GhostSplice mapping fragment as a text content item is.
+    for (const t of [c.name, c.description]) {
+      _scanForSplitting(srv, historyId, 'resource-link', `Tool "${toolName}" resource_link (${c.name || c.uri})`, toolName, t);
+    }
+  }
+
+  // Injection-scan the actual RESULT content, not just static tools/list
+  // metadata (scanTool only ever looked at descriptions/param names — a tool
+  // call's result was never scanned before this). This is what closes the
+  // GhostSplice gap: the field-mapping fragment arrives as a normal tool
+  // result, so without this it's invisible regardless of content.
+  const textItems = content.filter(c => c?.type === 'text' && c.text).map(c => c.text);
+  for (const t of textItems) {
+    _scanForSplitting(srv, historyId, 'tool-result', `Tool "${toolName}" result content`, toolName, t);
+  }
+
+  // structuredContent can carry the mapping fragment in a structured JSON
+  // field instead of content[].text — only ever checked against a declared
+  // outputSchema's shape above, never scanned for injection language. Any
+  // JSON value per 2026-07-28 (object/array/string/...), so stringify the
+  // whole thing rather than assuming a particular shape.
+  if (rpcResult.structuredContent !== undefined) {
+    _scanForSplitting(srv, historyId, 'structured-content', `Tool "${toolName}" structuredContent`, toolName,
+      JSON.stringify(rpcResult.structuredContent));
+  }
+}
+
+// ── CacheableResult (SEP-2549, 2026-07-28) auto-detection — mirrors
+// MCPensive's MCP-060, ported from a hint-only manual preset to an actual
+// finding. Applies to any list/read result, not just tools/list, since
+// that's the spec's own scope for CacheableResult — called from doSend() on
+// every successful raw-mode response, keyed on cacheScope/ttlMs simply being
+// present (a legacy server never has them, so this never fires there).
+const CACHEABLE_LONG_TTL_MS = 3600000; // 1 hour, mirrors MCPensive's threshold
+
+function _runCacheableResultChecks(srv, rpcResult, historyId) {
+  if (!rpcResult || typeof rpcResult !== 'object') return;
+  const cacheScope = rpcResult.cacheScope;
+  const ttlMs = rpcResult.ttlMs;
+  if (cacheScope === undefined && ttlMs === undefined) return; // server doesn't use CacheableResult
+  const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  const mkFinding = (item, severity, detail, remediation) => ({
+    severity, category: 'CacheableResult', server: srvShort, item, detail, remediation,
+    source: 'auto', historyId, serverUrl: srv.url,
+  });
+
+  if (cacheScope === 'public' && typeof ttlMs === 'number' && ttlMs > CACHEABLE_LONG_TTL_MS) {
+    _pushFindingDedup(srv, mkFinding('cacheable-long-public-ttl', 'high',
+      `Result marked cacheScope:"public" with ttlMs:${ttlMs} (> ${CACHEABLE_LONG_TTL_MS}ms / 1 hour). Any shared intermediary (CDN, corporate proxy, MCP gateway) in front of this server may cache and redistribute this content for that whole lifetime — a malicious or compromised server can poison it once, and the poisoned copy keeps being served from the shared cache even after the origin is fixed or taken offline, since fixing the origin doesn't purge the intermediary's cache.`,
+      'Default cacheScope to "private" unless content is verified identical and non-sensitive for every caller. Keep ttlMs short (minutes, not hours) on anything that can change. If long-lived public caching is required, pair it with an integrity mechanism (signing or a content hash) so a stale or poisoned cached copy is detectable.'));
+  }
+
+  if (cacheScope === 'public') {
+    const text = JSON.stringify(rpcResult);
+    for (const p of SENSITIVE_PATTERNS.filter(p => p.type === 'credential')) {
+      const m = text.match(p.re);
+      if (!m) continue;
+      if (p.hint === 'near AWS') {
+        const idx = text.indexOf(m[0]);
+        const ctx = text.slice(Math.max(0, idx - 300), idx + m[0].length + 300).toLowerCase();
+        if (!ctx.includes('aws') && !ctx.includes('amazon') && !/akia[0-9a-z]{16}/i.test(ctx)) continue;
+      }
+      const preview = m[0].length > 80 ? m[0].slice(0, 77) + '…' : m[0];
+      _pushFindingDedup(srv, mkFinding('cacheable-public-credentials', 'critical',
+        `Result marked cacheScope:"public" but contains what looks like ${p.cat} (${preview}) — a shared intermediary caching this response makes the credential readable by every other caller behind that cache, not just this session.`,
+        'Never mark cacheScope:"public" on any result whose content could contain caller-specific or sensitive data. Audit what this endpoint returns and remove the credential; rotate anything confirmed exposed.'));
+      break;
+    }
+  }
+}
+
 function deleteManualFinding(id) {
   if (!confirm('Delete this finding?')) return;
   for (const srv of Object.values(S.servers)) {
@@ -5646,11 +6203,20 @@ function scanServerFindings(srv) {
   // findings (auth-test, oauth-probe, cert) so a reconnect doesn't wipe them.
   const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
   const rows = [];
+  // Reset each connect/reconnect (recomputed fresh below) — a stale entry
+  // for a tool that no longer exists would otherwise linger forever and
+  // could wrongly correlate against a future, unrelated tool's result.
+  srv.opaqueParamTools = {};
 
   // MCP-003: responds to tool calls without initialize handshake
   // Auto-detected at connect time (srv.noInitProbeEvidence) — a manual re-fire of the
   // "No-init probe" preset (srv.noInitProbeHistId) takes precedence if one was done.
-  if (srv.noInitProbe) {
+  // Suppressed entirely on a confirmed-modern (2026-07-28+, srv.isModern) server —
+  // that era is stateless BY DESIGN, so there's no handshake to have skipped;
+  // answering cold is correct, not a weakness. Mirrors MCPensive's
+  // _check_responds_without_init, which fully suppresses MCP-003 the same way
+  // rather than just rewording it.
+  if (srv.noInitProbe && !srv.isModern) {
     rows.push({
       severity: 'medium',
       category: 'Protocol',
@@ -5818,6 +6384,24 @@ function scanServerFindings(srv) {
         detail: fmtInjectionDetail(f, t.name),
         remediation: INJECTION_REMEDIATION});
     }
+    for (const detail of _annotationTrustIssues(t)) {
+      rows.push({severity: 'medium', category: 'Tool Annotation Trust',
+        server: srvShort, item: t.name, detail,
+        remediation: 'Tool annotations (readOnlyHint/destructiveHint/idempotentHint/openWorldHint) are self-reported by the server and MUST be treated as untrusted unless the server itself is trusted. Do not let annotations alone suppress confirmation prompts or gate access control decisions — base those on the tool\'s actual observed behavior, or on an out-of-band trust relationship with the server operator.'});
+    }
+    for (const issue of _xmcpHeaderIssues(t)) {
+      rows.push({severity: issue.severity, category: 'x-mcp-header',
+        server: srvShort, item: t.name, detail: issue.detail,
+        remediation: 'Never mark sensitive parameters (passwords, API keys, tokens, PII) with x-mcp-header — header values are visible to network intermediaries. Validate x-mcp-header values against RFC 9110 token syntax (no CR/LF or control characters) before mirroring them into an HTTP header, and reject the entire tool definition if any x-mcp-header value is malformed, per spec.'});
+    }
+    const opaqueNames = _opaqueParamNames(t);
+    if (opaqueNames.length) {
+      srv.opaqueParamTools[t.name] = opaqueNames;
+      rows.push({severity: 'medium', category: 'Instruction Splitting',
+        server: srvShort, item: t.name,
+        detail: `Tool "${t.name}" declares ${opaqueNames.length} parameters with generic, non-descriptive names (${opaqueNames.join(', ')}) and no per-parameter descriptions — this opacity is the setup half of a GhostSplice-style instruction-splitting attack (ASSET Research Group, Aug 2026): a tool's true field purpose is revealed later by a separate, innocuous-looking tool result rather than declared honestly up front. Watch subsequent tool call results for a "field-mapping exfiltration instruction" finding referencing these same parameter names.`,
+        remediation: 'Treat opaquely-named tool parameters as suspicious by default. Do not populate them based on instructions found in a later tool result without independently verifying what data is actually being requested and why.'});
+    }
   }
 
   // Resources — injection findings
@@ -5883,6 +6467,32 @@ function scanServerFindings(srv) {
       detail: `Tool names "${names.join('" and "')}" are visually identical — both normalize to "${norm}". An LLM cannot distinguish between them; calling either may invoke the other.`,
       remediation: 'Remove or rename the tool using confusable Unicode characters. Tool identifiers must be ASCII-only. This pattern is used in active tool-poisoning attacks — treat as intentional until proven otherwise.',
     });
+  }
+
+  // Title/name spoofing: `title` is an optional, purely-cosmetic display field
+  // distinct from `name` (the actual identifier invoked on tools/call). Any
+  // human-approval UI that shows title instead of name can be tricked into
+  // approving a different tool than the one that actually gets called if a
+  // tool's title normalizes to collide with a DIFFERENT tool's real name.
+  const _nameNormMap = new Map(); // normalized real name -> real name
+  for (const t of (srv.tools || [])) {
+    if (!t.name) continue;
+    _nameNormMap.set(normalizeHomoglyphs(t.name.toLowerCase()), t.name);
+  }
+  for (const t of (srv.tools || [])) {
+    if (!t.title || !t.name) continue;
+    const titleNorm = normalizeHomoglyphs(t.title.toLowerCase());
+    const collidesWith = _nameNormMap.get(titleNorm);
+    if (collidesWith && collidesWith !== t.name) {
+      rows.push({
+        severity: 'high',
+        category: 'Title Spoofing',
+        server: srvShort,
+        item: t.name,
+        detail: `Tool "${t.name}" has title "${t.title}", which is visually identical to the real name of a DIFFERENT tool ("${collidesWith}") on this server. A human approving by title in a confirmation UI can be tricked into authorizing "${t.name}" while believing they approved "${collidesWith}".`,
+        remediation: 'Ensure a tool\'s title cannot be confused with another tool\'s identifier. Client UIs that display title for human approval should also show the underlying name, and should flag/reject titles that normalize to collide with a different tool\'s name.',
+      });
+    }
   }
 
   // Icon URL SSRF / phone-home (2025-11-25 icons[]). Tools, resources, and prompts
@@ -6088,28 +6698,40 @@ function buildFindingRows(findings, filterQ) {
       ? `<td class="findings-remediation">${esc(f.remediation)}</td>`
       : `<td style="color:var(--border);font-size:10px">—</td>`;
     const isSuppressed = S.findingDismissed.has(fp);
+    // fp/f.detail/f.serverUrl are not attacker-controlled here, but they're
+    // free text that can contain a quote character (e.g. this session's own
+    // "Tool "X"'s result references..." finding text) — never splice that
+    // into an inline onclick="fn('...')" (or any JS-source context): browsers
+    // HTML-entity-decode intrinsic event-handler attributes before compiling
+    // them as JS, so esc()'s quote-escaping doesn't stop a breakout there.
+    // data-* + reading back via this.dataset in the handler (see
+    // saveFindingNote below, which already did this correctly) is the safe
+    // pattern — same lesson as feedback_no_onclick_from_server_data.
     const delBtn = f.source === 'manual'
-      ? `<button class="btn-sm" title="Delete finding" onclick="deleteManualFinding('${esc(f.id)}')">&#x2715;</button>`
+      ? `<button class="btn-sm" title="Delete finding" data-fid="${esc(f.id)}" onclick="deleteManualFinding(this.dataset.fid)">&#x2715;</button>`
       : isSuppressed
-      ? `<button class="btn-sm" title="Undismiss — restore this finding" style="color:var(--accent)" onclick="undismissFinding('${safeFp}')">&#8635; Undismiss</button>`
-      : `<button class="btn-sm" title="Dismiss finding (hides it — use status for false positive tracking)" style="color:var(--muted)" onclick="dismissFinding('${safeFp}')">&#x2715;</button>`;
+      ? `<button class="btn-sm" title="Undismiss — restore this finding" style="color:var(--accent)" data-fp="${safeFp}" onclick="undismissFinding(this.dataset.fp)">&#8635; Undismiss</button>`
+      : `<button class="btn-sm" title="Dismiss finding (hides it — use status for false positive tracking)" style="color:var(--muted)" data-fp="${safeFp}" onclick="dismissFinding(this.dataset.fp)">&#x2715;</button>`;
     const probeField = f.probeField || 'connectProbe';
     const hasConnectProbe = f.serverUrl !== undefined && !!S.servers[f.serverUrl]?.[probeField];
-    const reqOnclick = f.historyId !== undefined ? `openHistEntryPopup(${f.historyId})`
-      : hasConnectProbe ? `openConnectProbePopup('${esc(f.serverUrl).replace(/'/g,"\\'")}','${probeField}')`
+    const reqAttrs = f.historyId !== undefined ? `data-hist-id="${f.historyId}"`
+      : hasConnectProbe ? `data-server-url="${esc(f.serverUrl)}" data-probe-field="${esc(probeField)}"`
       : null;
-    const histBtn = reqOnclick
-      ? `<button class="btn-sm" title="Show the request/response that triggered this finding" style="color:var(--accent);font-weight:700" onclick="${reqOnclick}">&#8594; request</button>`
+    const reqHandler = f.historyId !== undefined ? `openHistEntryPopup(this.dataset.histId)`
+      : hasConnectProbe ? `openConnectProbePopup(this.dataset.serverUrl, this.dataset.probeField)`
+      : null;
+    const histBtn = reqAttrs
+      ? `<button class="btn-sm" title="Show the request/response that triggered this finding" style="color:var(--accent);font-weight:700" ${reqAttrs} onclick="${reqHandler}">&#8594; request</button>`
       : '';
     const rowStyle = isSuppressed ? ' style="opacity:.45"'
       : status === 'false_positive' ? ' style="opacity:.45;text-decoration:line-through"' : '';
-    const detailClick = reqOnclick
-      ? ` style="cursor:pointer;color:var(--text)" title="Click to view request/response" onclick="${reqOnclick}"`
+    const detailClick = reqAttrs
+      ? ` style="cursor:pointer;color:var(--text)" title="Click to view request/response" ${reqAttrs} onclick="${reqHandler}"`
       : '';
     return `<tr${rowStyle}>
       <td><span class="cap-${esc(f.severity)}">${esc(f.severity)}</span></td>
       <td><button class="btn-sm" style="font-size:9px;color:${FINDING_STATUS_COLOR[status]};white-space:nowrap"
-          title="Click to cycle status" onclick="cycleFindingStatus('${safeFp}')">${FINDING_STATUS_LABEL[status]}</button></td>
+          title="Click to cycle status" data-fp="${safeFp}" onclick="cycleFindingStatus(this.dataset.fp)">${FINDING_STATUS_LABEL[status]}</button></td>
       <td>${esc(f.category)}${isSuppressed ? ' <span style="font-size:9px;color:var(--muted);border:1px solid var(--border);border-radius:3px;padding:0 3px">SUPPRESSED</span>' : ''}</td>
       <td style="color:var(--muted)">${esc(f.server)}</td>
       <td style="color:var(--accent)">${esc(f.item)}</td>
@@ -6202,27 +6824,97 @@ function _findingsModalEsc(e) {
 
 // ── Notifications ──────────────────────────────────────────────────────────
 
-function addNotifications(serverUrl, notifs) {
+function addNotifications(srv, notifs, historyId) {
   if (!notifs?.length) return;
   const time = new Date().toLocaleTimeString();
-  let host = serverUrl;
-  try { host = new URL(serverUrl).host; } catch {}
+  let host = srv.url;
+  try { host = new URL(srv.url).host; } catch {}
   for (const n of notifs)
-    S.notifications.push({time, server: host, method: n.method || '?', params: n.params ?? {}});
+    S.notifications.push({time, server: host, method: n.method || '?', params: n.params ?? {}, historyId});
   renderNotifications();
+  _runNotificationChecks(srv, notifs, historyId);
+}
+
+// ── Notification spoofing ────────────────────────────────────────────────────
+// Version-agnostic capability-declared check (no legacy/modern branching —
+// MCPoke has no reliably-tracked "is this server 2026-07-28+" flag; server/
+// discover is only a manual preset today). Works either way: a legacy server
+// pushing a listChanged notification without having declared the matching
+// listChanged/subscribe capability is already a violation under the pre-
+// 2026-07-28 implicit-push model; a modern server is additionally required to
+// have the client opt in via subscriptions/listen (which MCPoke never sends),
+// so every such notification MCPoke observes is unsolicited either way.
+function _runNotificationChecks(srv, notifs, historyId) {
+  const caps = srv.serverInfo?.capabilities || {};
+  const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  const mkFinding = (item, severity, detail, remediation) => ({
+    severity, category: 'Notification Spoofing', server: srvShort, item, detail, remediation,
+    source: 'auto', historyId, serverUrl: srv.url,
+  });
+  const CHECKS = [
+    {method: 'notifications/tools/list_changed',     declared: !!caps.tools?.listChanged,
+     label: 'tools.listChanged'},
+    {method: 'notifications/resources/list_changed', declared: !!caps.resources?.listChanged,
+     label: 'resources.listChanged'},
+    {method: 'notifications/resources/updated',      declared: !!caps.resources?.subscribe,
+     label: 'resources.subscribe'},
+    {method: 'notifications/prompts/list_changed',   declared: !!caps.prompts?.listChanged,
+     label: 'prompts.listChanged'},
+  ];
+  for (const n of notifs) {
+    for (const c of CHECKS) {
+      if (n.method !== c.method || c.declared) continue;
+      _pushFindingDedup(srv, mkFinding(`notif-spoofed-${c.method}`, 'medium',
+        `Server sent ${c.method} even though it never declared ${c.label} capability (or, under 2026-07-28+, without MCPoke ever opening a subscriptions/listen stream requesting it) — servers MUST NOT send notification types the client hasn't opted into.`,
+        `Only send ${c.method} to clients that have declared/requested it (legacy: ${c.label} at initialize; 2026-07-28+: via subscriptions/listen). Sending it unconditionally can trigger unnecessary re-fetches or be used to time context-injection via a subsequent list/read.`));
+    }
+    // notifications/roots/list_changed is CLIENT->SERVER only per spec — a server sending it is always wrong-direction.
+    if (n.method === 'notifications/roots/list_changed') {
+      _pushFindingDedup(srv, mkFinding('notif-spoofed-roots-list-changed', 'medium',
+        'Server sent notifications/roots/list_changed — this notification only ever flows client→server (the client informs the server its roots changed). A server sending it is spoofed/malformed traffic, not a spec-compliant push in either direction.',
+        'Servers must never emit notifications/roots/list_changed themselves. Investigate why this server is sending client-directional notification types back at the client.'));
+    }
+    // Notification payloads were only ever checked for capability/spoofing
+    // violations above, never scanned for injected content — e.g.
+    // notifications/message's free-text `data` field (server-side logging
+    // output pushed straight to the client) is as plausible a GhostSplice
+    // mapping-fragment carrier as any tool result.
+    if (n.params !== undefined && n.params !== null) {
+      const text = typeof n.params === 'string' ? n.params : JSON.stringify(n.params);
+      _scanForSplitting(srv, historyId, 'notification', `Notification ${n.method} params`, `notif:${n.method}`, text);
+    }
+  }
+}
+
+// serverInfo.instructions — a free-text field returned at initialize
+// specifically to steer the client/model. Captured into srv.serverInfo but
+// never scanned. Static/connect-time, so this must run AFTER
+// scanServerFindings() returns and srv.findings has been assigned from its
+// result — calling _pushFindingDedup (via _scanForSplitting) from inside
+// scanServerFindings itself would get silently discarded the moment the
+// caller does `srv.findings = [...scanServerFindings(srv), ...]`, since
+// that reassigns srv.findings to a brand new array after the fact.
+function _runServerInstructionsChecks(srv) {
+  const text = srv.serverInfo?.instructions;
+  if (!text) return;
+  _scanForSplitting(srv, undefined, 'server-instructions', 'Server instructions (initialize response)', '(server-instructions)', text);
 }
 
 function buildNotifRows() {
   if (!S.notifications.length)
     return '<tr><td colspan="4" class="empty" style="padding:.3rem .5rem">No notifications — SSE servers push these during tool calls</td></tr>';
-  return S.notifications.slice().reverse().map(n =>
-    `<tr>
+  return S.notifications.slice().reverse().map(n => {
+    const hasHist = n.historyId !== undefined && n.historyId !== null && !!S.history[n.historyId];
+    const attrs = hasHist
+      ? `data-notif-hist="${n.historyId}" style="cursor:pointer" title="Click to see the request/response that produced this notification"`
+      : `title="No linked request/response for this notification (restored from an older session, or not captured)"`;
+    return `<tr ${attrs}>
       <td style="color:var(--muted);white-space:nowrap">${esc(n.time)}</td>
       <td style="color:var(--muted);font-size:10px">${esc(n.server)}</td>
       <td class="notif-method">${esc(n.method)}</td>
       <td class="notif-params">${esc(JSON.stringify(n.params))}</td>
-    </tr>`
-  ).join('');
+    </tr>`;
+  }).join('');
 }
 
 function renderNotifications() {
@@ -6238,6 +6930,15 @@ function renderNotifications() {
       : 'No notifications';
   }
 }
+
+// Delegated so it covers both the inline notif-body panel and the full-screen
+// notif-modal-body (which is only in the DOM while that modal is open) —
+// same pattern as the hist-body/elicit-fuzz-icon delegated listeners.
+document.addEventListener('click', e => {
+  const tr = e.target.closest('tr[data-notif-hist]');
+  if (!tr) return;
+  openHistEntryPopup(parseInt(tr.dataset.notifHist));
+});
 
 function openNotificationsModal() {
   const existing = document.getElementById('notif-overlay');
@@ -6871,6 +7572,12 @@ const PROTOCOL_PRESETS = [
     payload: {"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{}},
   },
   {
+    label: 'Enumerate: resources/templates/list',
+    cat:   'Enumeration',
+    hint:  'list parameterized resource templates (URI templates, e.g. file:///{path}) — not guaranteed to overlap with resources/list; check each template\'s uriTemplate/description for injected instructions the same way tool descriptions are scanned',
+    payload: {"jsonrpc":"2.0","id":1,"method":"resources/templates/list","params":{}},
+  },
+  {
     label: 'MCP-003: No-init probe (tools/list)',
     cat:   'Enumeration',
     hint:  'send tools/list in a fresh session without initialize — if the server responds with a result (not an error), MCP-003 is confirmed and added to findings',
@@ -6962,6 +7669,31 @@ const PROTOCOL_PRESETS = [
     cat:   'Spec coverage',
     hint:  'control server log verbosity — check if unprivileged callers can set DEBUG and extract sensitive log data',
     payload: {"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"debug"}},
+  },
+  // ── resources/unsubscribe — legacy and 2026-07-28-compatible; the RPC itself
+  // is unchanged, only the newer push-gating mechanism (subscriptions/listen,
+  // below) changed how the resulting notifications are allowed to flow ──────
+  {
+    label: 'MCP: resources/unsubscribe (never subscribed)',
+    cat:   'Spec coverage',
+    hint:  'unsubscribe from a URI you never subscribed to in this session — this should error (e.g. "not subscribed"), not silently return success. A silent success leaks whether that URI is a valid subscribable resource at all, and normalizes clients not tracking their own subscription state server-side.',
+    payload: {"jsonrpc":"2.0","id":1,"method":"resources/unsubscribe","params":{"uri":"resource://EDIT_ME"}},
+  },
+  // ── 2026-07-28 subscriptions/listen (replaces resources/subscribe + the old
+  // implicit-push model entirely — server MUST NOT send a notification type
+  // the client hasn't explicitly requested here) ─────────────────────────────
+  {
+    label: 'MCP: subscriptions/listen (opt-in notification gate, 2026-07-28)',
+    cat:   'Spec coverage',
+    hint:  'opens a long-lived stream declaring exactly which notification types you want (here: toolsListChanged only). Watch for notifications/subscriptions/acknowledged first — the server MUST NOT send any notification on this subscription before that ack, and the ack\'s "notifications" field shows what it actually agreed to honor. This is best fired via the raw editor over a transport that keeps the connection open (SSE) so you can watch what arrives afterward; pairs with the notification-spoofing findings — any notification type NOT declared here (or via legacy listChanged capabilities) that still arrives is a MUST-NOT violation.',
+    payload: {"jsonrpc":"2.0","id":1,"method":"subscriptions/listen","params":{"notifications":{"toolsListChanged":true}}},
+  },
+  // ── completion/complete context.arguments information-disclosure probe ────
+  {
+    label: 'MCP: completion context.arguments canary',
+    cat:   'Spec coverage',
+    hint:  'sets a canary-looking value ("mcpoke-canary-<random-looking-string>") as an already-resolved argument in context.arguments while requesting completions for a DIFFERENT, unrelated argument name. The spec requires implementations to "prevent completion-based information disclosure" — if the canary value (or fragments of it) shows up reflected in the returned completion.values for the unrelated argument, the server is leaking context.arguments content it shouldn\'t be echoing back.',
+    payload: {"jsonrpc":"2.0","id":1,"method":"completion/complete","params":{"ref":{"type":"ref/prompt","name":"EDIT_ME"},"argument":{"name":"EDIT_ME_OTHER_ARG","value":""},"context":{"arguments":{"EDIT_ME_RESOLVED_ARG":"mcpoke-canary-7f3a9c21"}}}},
   },
   // ── MCP 2025-11-25 tasks (IDOR / cross-session disclosure surface) ─────────
   {
@@ -7442,15 +8174,17 @@ async function doSend() {
     });
     const body    = await res.json();
     const elapsed = Date.now() - t0;
-    const isErr        = !!(body?.error || body?.result?.error || body?.result?.isError);
+    const isErr        = !!(body?.error || body?.result?.error || body?.result?.result?.isError);
     const sensitiveHits = showResponse(body, elapsed, args);
     const newHistId = S.history.length;
     addHistory(srv.url, toolName, args, body, isErr, elapsed, sensitiveHits, S.rawMode ? fetchBody.payload : null);
-    addNotifications(srv.url, body?.notifications);
+    addNotifications(srv, body?.notifications, newHistId);
     // MCP-003: if this was a manual no-init probe and got a valid result, add finding
+    // — unless srv.isModern (2026-07-28+ stateless server, no handshake to skip; see
+    // scanServerFindings's identical guard on the auto-detected path).
     if (S.pendingNoInitProbe) {
       S.pendingNoInitProbe = false;
-      if (!isErr && body?.result && !body.result?.error) _addNoInitFinding(srv, newHistId);
+      if (!isErr && body?.result && !body.result?.error && !srv.isModern) _addNoInitFinding(srv, newHistId);
     }
     // Modern/_meta trust: if the server accepted a malformed/forged _meta instead of rejecting it, add finding
     if (S.pendingMetaProbe) {
@@ -7458,37 +8192,64 @@ async function doSend() {
       S.pendingMetaProbe = null;
       if (!isErr && body?.result && !body.result?.error) _addMetaTrustFinding(srv, _metaProbeKind, newHistId);
     }
+    // Output schema conformance + resource_link URI safety + result-content
+    // injection scan. Tool-execution errors (result.isError:true) still carry
+    // a normal content[] array per spec, so let those through too — only a
+    // genuine JSON-RPC/transport error (no result.result at all) is excluded,
+    // and that's handled separately just below.
+    if (!isErr || body?.result?.result?.isError) _runToolResultChecks(srv, toolName, body, newHistId);
+    // Error content was never scanned before — a server can smuggle an
+    // injected instruction (including a GhostSplice mapping fragment) into
+    // error text exactly as easily as a success response.
+    if (isErr) _runErrorContentChecks(srv, toolName, body?.result?.error || body?.error, newHistId);
+    // resources/read content — resources/list metadata was already scanned;
+    // the actual content a read returns never was until now.
+    if (!isErr && originalPayload?.method === 'resources/read') {
+      _runResourceReadChecks(srv, originalPayload?.params?.uri, body, newHistId);
+    }
+    // prompts/get rendered messages — prompts/list metadata was already
+    // scanned; the actual messages a prompt renders when invoked never were.
+    if (!isErr && originalPayload?.method === 'prompts/get') {
+      _runPromptGetChecks(srv, originalPayload?.params?.name, body, newHistId);
+    }
+    // CacheableResult (SEP-2549) — applies to any list/read result, not just tools/call
+    if (!isErr) _runCacheableResultChecks(srv, body?.result?.result, newHistId);
     // Elicitation (draft spec): server returned an InputRequiredResult with elicitation/create entries
     if (!isErr) {
       const elicit = extractElicitRequests(body);
       if (elicit) {
-        for (const [key, req] of elicit.entries) _runElicitationChecks(srv, key, req, originalPayload, newHistId);
-        if (srv.elicitationEnabled) {
+        for (const [key, req] of elicit.entries)
+          if (req.method === 'elicitation/create') _runElicitationChecks(srv, key, req, originalPayload, newHistId);
+        if (srv.elicitationEnabled || _hasRootsEntry(elicit)) {
           openElicitationModal(srv, originalPayload, elicit);
         } else {
           await _autoDeclineElicitation(srv, originalPayload, elicit, newHistId);
         }
       }
     }
-    // Live server-initiated requests (elicitation/create, sampling/createMessage)
-    // pushed mid-call instead of the reply we asked for. If the backend parked the
-    // exchange instead of timing out (status === 'pending_live_request'), open the
-    // matching live modal so the user can actually answer it and let the call
-    // complete. Passive checks always run regardless, same as Phase 1 did for
-    // elicitation alone.
+    // Live server-initiated requests (elicitation/create, sampling/createMessage,
+    // roots/list — the pre-2026-07-28 async-push mechanism roots used before
+    // moving to the MRTR pattern) pushed mid-call instead of the reply we
+    // asked for. If the backend parked the exchange instead of timing out
+    // (status === 'pending_live_request'), open the matching live modal so
+    // the user can actually answer it and let the call complete. Passive
+    // checks always run regardless, same as Phase 1 did for elicitation alone.
     if (body?.server_requests?.length) {
       const liveElicits  = body.server_requests.filter(r => r?.method === 'elicitation/create');
       const liveSampling = body.server_requests.filter(r => r?.method === 'sampling/createMessage');
+      const liveRoots     = body.server_requests.filter(r => r?.method === 'roots/list');
       for (const req of liveElicits)  _runElicitationChecks(srv, String(req.id), req, originalPayload, newHistId);
       for (const req of liveSampling) _runSamplingChecks(srv, req, originalPayload, newHistId);
       if (body.status === 'pending_live_request' && body.pending_token && body.live_request) {
         if (body.live_request.method === 'sampling/createMessage') {
           openLiveSamplingModal(srv, body.pending_token, body.live_request, newHistId, toolName, args);
+        } else if (body.live_request.method === 'roots/list') {
+          openLiveRootsModal(srv, body.pending_token, body.live_request, newHistId, toolName, args);
         } else {
           openLiveElicitationModal(srv, body.pending_token, body.live_request, newHistId, toolName, args);
         }
-      } else if (liveElicits.length || liveSampling.length) {
-        showError(`Server pushed ${liveElicits.length + liveSampling.length} live request(s) over SSE mid-call — see Findings.`);
+      } else if (liveElicits.length || liveSampling.length || liveRoots.length) {
+        showError(`Server pushed ${liveElicits.length + liveSampling.length + liveRoots.length} live request(s) over SSE mid-call — see Findings.`);
       }
     }
   } catch (e) {
@@ -7618,15 +8379,16 @@ async function _autoDeclineElicitation(srv, originalPayload, elicitData, histId,
   try {
     const res   = await rawFetch(srv, retryPayload);
     const body  = await res.json();
-    const isErr = !!(body?.error || body?.result?.error || body?.result?.isError);
+    const isErr = !!(body?.error || body?.result?.error || body?.result?.result?.isError);
     const sensitiveHits = showResponse(body, 0, {});
     const newHistId = S.history.length;
     addHistory(srv.url, originalPayload?.params?.name || originalPayload?.method || '(elicit-auto-decline)', {}, body, isErr, 0, sensitiveHits, retryPayload);
     if (!isErr) {
       const nextElicit = extractElicitRequests(body);
       if (nextElicit) {
-        for (const [key, req] of nextElicit.entries) _runElicitationChecks(srv, key, req, retryPayload, newHistId);
-        if (srv.elicitationEnabled) {
+        for (const [key, req] of nextElicit.entries)
+          if (req.method === 'elicitation/create') _runElicitationChecks(srv, key, req, retryPayload, newHistId);
+        if (srv.elicitationEnabled || _hasRootsEntry(nextElicit)) {
           openElicitationModal(srv, retryPayload, nextElicit);
         } else {
           await _autoDeclineElicitation(srv, retryPayload, nextElicit, newHistId, depth + 1);
@@ -7645,6 +8407,19 @@ function openElicitationModal(srv, originalPayload, elicitData) {
   ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:3500;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box';
 
   const sections = elicitData.entries.map(([key, req]) => {
+    if (req.method === 'roots/list') {
+      const seed = JSON.stringify([{uri: 'file:///EDIT_ME/project', name: 'example root'}], null, 2);
+      return `
+      <div class="elicit-entry" data-key="${esc(key)}" data-method="roots/list" style="border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:10px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="font-family:monospace;font-size:11px;color:var(--muted)">${esc(key)}</span>
+          <span style="font-size:10px;padding:1px 6px;border:1px solid var(--border);border-radius:3px">roots/list</span>
+        </div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Server is asking for the client's filesystem roots (deprecated as of 2026-07-28, SEP-2577 — still MUST-support for backward compat). Edit the JSON array below — spec requires uri to be a file:// URI; try a non-conformant value to see if the server validates its own client's answer.</div>
+        <textarea class="elicit-roots-json" data-key="${esc(key)}" spellcheck="false" style="width:100%;box-sizing:border-box;min-height:90px;font-family:monospace;font-size:11px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:6px">${esc(seed)}</textarea>
+        <div style="font-size:10px;color:var(--muted);margin-top:6px">Answered as inputResponses.${esc(key)} = {roots: &lt;parsed array&gt;} — no accept/decline for this method, per spec.</div>
+      </div>`;
+    }
     const p = req.params || {};
     const mode = p.mode || 'form';
     let body;
@@ -7685,8 +8460,8 @@ function openElicitationModal(srv, originalPayload, elicitData) {
   ov.innerHTML = `
   <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;width:100%;max-width:560px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden">
     <div style="display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border)">
-      <span style="font-weight:700;font-size:13px;color:#e3b341">&#10068; Elicitation request${elicitData.entries.length > 1 ? 's' : ''}</span>
-      <span style="font-size:11px;color:var(--muted);flex:1">draft spec — server needs input to continue</span>
+      <span style="font-weight:700;font-size:13px;color:#e3b341">&#10068; Input request${elicitData.entries.length > 1 ? 's' : ''}</span>
+      <span style="font-size:11px;color:var(--muted);flex:1">draft MRTR pattern — server needs input to continue</span>
       <button class="btn-sm" onclick="document.getElementById('elicit-overlay').remove()">&#x2715; Close</button>
     </div>
     <div style="overflow-y:auto;padding:12px;flex:1">${sections}</div>
@@ -7705,6 +8480,15 @@ async function sendElicitationRetry() {
   const {srv, originalPayload, elicitData} = ov._mcpokeElicitCtx;
   const inputResponses = {};
   for (const [key, req] of elicitData.entries) {
+    if (req.method === 'roots/list') {
+      const ta = ov.querySelector(`.elicit-roots-json[data-key="${CSS.escape(key)}"]`);
+      let roots;
+      try { roots = JSON.parse(ta ? ta.value : '[]'); }
+      catch (e) { showError(`roots/list entry "${key}": invalid JSON — ${e.message}`); return; }
+      if (!Array.isArray(roots)) { showError(`roots/list entry "${key}": must be a JSON array`); return; }
+      inputResponses[key] = {roots};
+      continue;
+    }
     const p = req.params || {};
     const mode = p.mode || 'form';
     const actionEl = ov.querySelector(`input[name="elicit-action-${CSS.escape(key)}"]:checked`);
@@ -7730,7 +8514,7 @@ async function sendElicitationRetry() {
   try {
     const res     = await rawFetch(srv, retryPayload);
     const body    = await res.json();
-    const isErr   = !!(body?.error || body?.result?.error || body?.result?.isError);
+    const isErr   = !!(body?.error || body?.result?.error || body?.result?.result?.isError);
     const sensitiveHits = showResponse(body, 0, {});
     const newHistId = S.history.length;
     addHistory(srv.url, originalPayload?.params?.name || originalPayload?.method || '(elicit-retry)', {}, body, isErr, 0, sensitiveHits, retryPayload);
@@ -7908,7 +8692,7 @@ async function _pollLiveRequest(pendingToken) {
 }
 
 function _handleLiveRequestOutcome(srv, body, histId, toolName, args) {
-  const isErr = !!(body?.error || body?.result?.error || body?.result?.isError);
+  const isErr = !!(body?.error || body?.result?.error || body?.result?.result?.isError);
   if (S.history[histId]) {
     S.history[histId].result = body;
     S.history[histId].isErr  = isErr;
@@ -7923,6 +8707,8 @@ function _handleLiveRequestOutcome(srv, body, histId, toolName, args) {
     if (method === 'sampling/createMessage') {
       for (const req0 of liveReqs) _runSamplingChecks(srv, req0, null, histId);
       openLiveSamplingModal(srv, body.pending_token, body.live_request, histId, toolName, args);
+    } else if (method === 'roots/list') {
+      openLiveRootsModal(srv, body.pending_token, body.live_request, histId, toolName, args);
     } else {
       for (const req0 of liveReqs) _runElicitationChecks(srv, String(req0.id), req0, null, histId);
       openLiveElicitationModal(srv, body.pending_token, body.live_request, histId, toolName, args);
@@ -8047,6 +8833,67 @@ async function declineLiveSampling() {
     _handleLiveRequestOutcome(srv, body, histId, toolName, args);
   } catch (e) {
     showError(`Sampling reject failed: ${e.message}`);
+  }
+}
+
+// ── Live roots modal (pre-2026-07-28 async roots/list pushed mid-call over an
+// open session — the mechanism roots used before 2026-07-28 moved it to the
+// MRTR pattern, see openElicitationModal's roots/list branch. Answered the
+// same way via /elicit/respond, {roots:[...]} directly as `result` — no
+// {action,content} wrapper, and roots has no capability toggle since MCPoke
+// always declares it in make_initialize) ────────────────────────────────────
+
+function openLiveRootsModal(srv, pendingToken, liveRequest, histId, toolName, args) {
+  document.getElementById('elicit-overlay')?.remove();
+  clearInterval(window._livePollTimer);
+  const ov = document.createElement('div');
+  ov.id = 'elicit-overlay';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:3500;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box';
+  const seed = JSON.stringify([{uri: 'file:///EDIT_ME/project', name: 'example root'}], null, 2);
+
+  ov.innerHTML = `
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;width:100%;max-width:560px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden">
+    <div style="display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border)">
+      <span style="font-weight:700;font-size:13px;color:#e3b341">&#10068; Live roots/list request</span>
+      <span style="font-size:11px;color:var(--muted);flex:1">deprecated (SEP-2577) but MUST-support — original call is parked waiting on this</span>
+      <button class="btn-sm" onclick="cancelLiveRequest()">&#x2715; Close</button>
+    </div>
+    <div style="overflow-y:auto;padding:12px;flex:1">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Server is asking for the client's filesystem roots over an open session (pre-2026-07-28 async push). Spec requires uri to be a file:// URI — try a non-conformant value to see if the server validates its own client's answer.</div>
+      <textarea id="live-roots-json" spellcheck="false" style="width:100%;height:110px;box-sizing:border-box;font-family:monospace;font-size:12px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:6px;resize:vertical">${esc(seed)}</textarea>
+    </div>
+    <div style="padding:10px 14px;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:8px">
+      <span id="live-elicit-status" style="font-size:10px;color:var(--muted)"></span>
+      <button class="btn-sm btn-cyan" onclick="sendLiveRootsResponse()">Send Roots</button>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+  ov._mcpokeLiveElicitCtx = {srv, pendingToken, liveRequest, histId, toolName, args};
+  ov.addEventListener('click', e => { if (e.target === ov) cancelLiveRequest(); });
+  window._livePollTimer = setInterval(() => _pollLiveRequest(pendingToken), 2000);
+}
+
+async function sendLiveRootsResponse() {
+  const ov = document.getElementById('elicit-overlay');
+  if (!ov || !ov._mcpokeLiveElicitCtx) return;
+  const {srv, pendingToken, histId, toolName, args} = ov._mcpokeLiveElicitCtx;
+  const ta = document.getElementById('live-roots-json');
+  let roots;
+  try { roots = JSON.parse(ta ? ta.value : '[]'); }
+  catch (e) { showError(`Invalid JSON: ${e.message}`); return; }
+  if (!Array.isArray(roots)) { showError('roots must be a JSON array'); return; }
+  clearInterval(window._livePollTimer);
+  const statusEl = document.getElementById('live-elicit-status');
+  if (statusEl) statusEl.textContent = 'Sending…';
+  try {
+    const res  = await fetch('/elicit/respond', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pending_token: pendingToken, result: {roots}}),
+    });
+    const body = await res.json();
+    _handleLiveRequestOutcome(srv, body, histId, toolName, args);
+  } catch (e) {
+    showError(`Roots response failed: ${e.message}`);
   }
 }
 
@@ -8179,7 +9026,9 @@ function openElicitFuzzModal(fctx, targetField, schema) {
     const idx = parseInt(row.dataset.efzIdx);
     const r = _efuzzState.results[idx];
     document.getElementById('efuzz-req-pane').textContent  = r ? JSON.stringify(r.sentPayload, null, 2) : '';
-    document.getElementById('efuzz-resp-pane').textContent = r ? JSON.stringify(r.rawBody, null, 2) : '';
+    // rawBody is MCPoke's own backend wrapper (see showResponse's identical
+    // note) — only .result is what the server actually returned.
+    document.getElementById('efuzz-resp-pane').textContent = r ? JSON.stringify(r.rawBody?.result ?? r.rawBody, null, 2) : '';
   });
   document.getElementById('efuzz-tbl').addEventListener('dblclick', ev => {
     const row = ev.target.closest('[data-efz-idx]');
@@ -8220,7 +9069,7 @@ function openElicitFuzzDetailPopup(idx) {
         </div>
         <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
           <div style="font-size:10px;font-weight:700;color:var(--muted);padding:0.3rem 0.6rem;background:var(--bg)">Response</div>
-          <pre style="flex:1;overflow:auto;padding:0.6rem;margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all">${esc(JSON.stringify(r.rawBody, null, 2))}</pre>
+          <pre style="flex:1;overflow:auto;padding:0.6rem;margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all">${esc(JSON.stringify(r.rawBody?.result ?? r.rawBody, null, 2))}</pre>
         </div>
       </div>
     </div>`;
@@ -8422,7 +9271,7 @@ async function runElicitFuzz(forceAll) {
     const resIdx = _efuzzState.results.length;
     _efuzzState.results.push({pl, rawBody: res, sentPayload, elapsed, sz, reflected, anomaly: sizeAnomaly});
 
-    const isErr = !!(res?.error || res?.result?.error || res?.result?.isError);
+    const isErr = !!(res?.error || res?.result?.error || res?.result?.result?.isError);
     addHistory(fctx.srv.url, `efuzz:${targetField}`, {[targetField]: pl}, res, isErr, elapsed);
 
     const preview = respText.slice(0, 80);
@@ -8468,10 +9317,36 @@ async function runElicitFuzz(forceAll) {
 
 // ── Response ───────────────────────────────────────────────────────────────
 
+// Shared by showResponse and openHistEntryPopup. Self-contained toggle (uses
+// `this`/nextElementSibling, not a fixed id) so it's safe to render more than
+// one instance at once — unlike #schema-tog's fixed-id toggle, which assumes
+// only one exists in the DOM. Server-controlled response header *values* are
+// untrusted the same as any other server data, so esc() them same as the body.
+function _renderHeadersBlock(reqHeaders, respHeaders, respStatus) {
+  const hasReq  = reqHeaders && Object.keys(reqHeaders).length;
+  const hasResp = respHeaders && Object.keys(respHeaders).length;
+  if (!hasReq && !hasResp) return '';
+  const fmt = h => Object.entries(h || {}).map(([k, v]) => `${esc(k)}: ${esc(String(v))}`).join('\n')
+    || '(none)';
+  const statusLabel = respStatus != null ? ` (status ${esc(String(respStatus))})` : '';
+  return `
+    <div class="hdrs-toggle" onclick="const c=this.nextElementSibling; const v=c.style.display!=='none'; c.style.display=v?'none':'block'; this.textContent=(v?'►':'▼')+' Headers'" style="cursor:pointer;font-size:11px;color:var(--muted);margin:4px 0 2px">&#9658; Headers</div>
+    <div style="display:none;margin-bottom:6px">
+      ${hasReq ? `<div style="font-size:10px;color:var(--muted);margin-top:2px">Request headers</div>
+      <pre style="margin:2px 0;padding:4px 6px;font-size:10px;font-family:monospace;white-space:pre-wrap;word-break:break-all;background:var(--bg);border:1px solid var(--border);border-radius:4px">${fmt(reqHeaders)}</pre>` : ''}
+      ${hasResp ? `<div style="font-size:10px;color:var(--muted);margin-top:4px">Response headers${statusLabel}</div>
+      <pre style="margin:2px 0;padding:4px 6px;font-size:10px;font-family:monospace;white-space:pre-wrap;word-break:break-all;background:var(--bg);border:1px solid var(--border);border-radius:4px">${fmt(respHeaders)}</pre>` : ''}
+    </div>`;
+}
+
 function showResponse(data, elapsed, requestArgs) {
   const panel   = document.getElementById('resp-content');
   const payload = data?.result ?? data;
-  const isErr   = !!(data?.error || payload?.error || payload?.isError);
+  // payload is the JSON-RPC envelope ({jsonrpc,id,result:{content,isError}}),
+  // so a tool-execution error's isError:true lives at payload.result.isError,
+  // not payload.isError directly (same nesting mistake fixed across every
+  // other isErr computation in this file — see commit history).
+  const isErr   = !!(data?.error || payload?.error || payload?.result?.error || payload?.result?.isError);
 
   let textHtml = '';
   const content = payload?.content || payload?.result?.content;
@@ -8491,7 +9366,14 @@ function showResponse(data, elapsed, requestArgs) {
       inError: true,
     }));
   }
-  window._lastJson = JSON.stringify(data, null, 2);
+  // payload (not data) — data is MCPoke's own backend wrapper ({status,
+  // result, notifications, server_requests, request_headers,
+  // response_headers, response_status}); only `result` is what the MCP
+  // server actually returned. Dumping the whole wrapper here made it look
+  // like the server itself sent request_headers/notifications/etc., and
+  // duplicated the dedicated Headers block above with the same data
+  // mislabeled as part of the response body.
+  window._lastJson = JSON.stringify(payload, null, 2);
   const ms = elapsed ? `<span style="color:var(--muted);font-size:11px">${elapsed}ms</span>` : '';
   panel.innerHTML = `
     <div class="resp-actions">
@@ -8499,6 +9381,7 @@ function showResponse(data, elapsed, requestArgs) {
       <button class="btn-sm" onclick="navigator.clipboard?.writeText(window._lastJson)">Copy JSON</button>
     </div>
     ${sensitiveAlertHtml(sensitiveHits)}
+    ${_renderHeadersBlock(data?.request_headers, data?.response_headers, data?.response_status)}
     ${textHtml}
     <pre class="json-view">${hlJson(window._lastJson)}</pre>`;
   return sensitiveHits;
@@ -8507,12 +9390,19 @@ function showResponse(data, elapsed, requestArgs) {
 // ── History ────────────────────────────────────────────────────────────────
 
 function addHistory(url, tool, args, result, isErr, elapsed, sensitiveHits, rawPayload) {
+  // request_headers/response_headers/response_status ride along on `result`
+  // already (every backend call path — /call, /raw, /elicit/respond — now
+  // includes them, see _finish_or_park/raw_call's GET branch) so every
+  // existing addHistory() call site picks this up for free, no signature change.
   S.history.push({
     id: S.history.length, time: new Date().toLocaleTimeString(),
     url, tool, args: JSON.parse(JSON.stringify(args)), result, isErr,
     elapsed: elapsed || 0,
     sensitiveHits: sensitiveHits || [],
     rawPayload: rawPayload ? JSON.parse(JSON.stringify(rawPayload)) : null,
+    requestHeaders:  result?.request_headers  || null,
+    responseHeaders: result?.response_headers || null,
+    responseStatus:  result?.response_status  ?? null,
   });
   renderHistory();
   if (sensitiveHits?.length) renderFindings();
@@ -8650,13 +9540,19 @@ function openHistEntryPopup(id) {
   ov.id = 'hist-entry-overlay';
   ov.style.cssText = 'position:fixed;inset:0;z-index:3000;display:flex;flex-direction:column;background:var(--bg)';
   const reqText  = e.rawPayload ? JSON.stringify(e.rawPayload, null, 2) : JSON.stringify({method: e.tool, params: {arguments: e.args}}, null, 2);
-  const respText = JSON.stringify(e.result, null, 2) || '(no response)';
+  // e.result is MCPoke's own backend wrapper, same as showResponse's `data`
+  // — only .result is what the server actually returned; the rest
+  // (notifications/server_requests/request_headers/response_headers/
+  // response_status) is already shown in the Headers block above.
+  const respPayload = e.result?.result ?? e.result;
+  const respText = JSON.stringify(respPayload, null, 2) || '(no response)';
   ov.innerHTML = `
     <div class="panel-modal-hdr">
       <span style="color:var(--accent);font-weight:700;font-family:monospace;font-size:13px">&#9654; History #${id}</span>
       <span style="color:var(--muted);font-size:11px;margin-left:.5rem;flex:1">${esc(e.tool)} &nbsp;·&nbsp; ${e.time} &nbsp;·&nbsp; ${e.elapsed}ms</span>
       <button class="btn-sm" onclick="document.getElementById('hist-entry-overlay').remove()">&#x2715; Close</button>
     </div>
+    <div style="padding:0 .5rem;background:var(--bg)">${_renderHeadersBlock(e.requestHeaders, e.responseHeaders, e.responseStatus) || '<div style="font-size:10px;color:var(--muted);padding:4px 0">No HTTP headers captured for this entry (stdio transport, or from before header capture was added)</div>'}</div>
     <div style="display:flex;flex:1;overflow:hidden;gap:1px;background:var(--border)">
       <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)">
         <div style="padding:.3rem .5rem;font-size:11px;color:var(--muted);border-bottom:1px solid var(--border)">Request</div>
@@ -8742,8 +9638,12 @@ function openDiffModal() {
   const [id1, id2] = [...S.histChecked].sort((a,b) => a-b);
   const e1 = S.history[id1], e2 = S.history[id2];
   if (!e1 || !e2) return;
-  const t1 = JSON.stringify(e1.result, null, 2) || '';
-  const t2 = JSON.stringify(e2.result, null, 2) || '';
+  // .result?.result, not .result — e1.result/e2.result are MCPoke's own
+  // backend wrapper (status/notifications/server_requests/*_headers), which
+  // would otherwise pollute every diff with e.g. a Date response header
+  // difference even when the actual server responses are identical.
+  const t1 = JSON.stringify(e1.result?.result ?? e1.result, null, 2) || '';
+  const t2 = JSON.stringify(e2.result?.result ?? e2.result, null, 2) || '';
   document.getElementById('diff-overlay')?.remove();
   const ov = document.createElement('div');
   ov.id = 'diff-overlay';
@@ -9187,6 +10087,7 @@ function buildProjectData() {
     declaredCapabilities: srv.declaredCapabilities || null,
     pinnedVersion: srv.pinnedVersion || null,
     elicitationEnabled: srv.elicitationEnabled || false,
+    isModern: srv.isModern || false,
   }));
   return {
     version: 2,
@@ -9533,6 +10434,7 @@ function restoreSessionData(session) {
     srv.declaredCapabilities = s.declaredCapabilities || null;
     srv.pinnedVersion = s.pinnedVersion || null;
     srv.elicitationEnabled = s.elicitationEnabled || false;
+    srv.isModern     = s.isModern || false;
     srv.fromCache    = true;
     S.servers[s.url] = srv;
   }
@@ -9732,7 +10634,10 @@ function exportMarkdown() {
       if (e.result !== undefined) {
         lines.push('**Response:**');
         lines.push('```json');
-        try { lines.push(JSON.stringify(e.result, null, 2)); } catch { lines.push(String(e.result)); }
+        // .result?.result, not .result — the rest of the wrapper
+        // (notifications/server_requests/*_headers) isn't part of what the
+        // server actually returned; it's MCPoke's own backend metadata.
+        try { lines.push(JSON.stringify(e.result?.result ?? e.result, null, 2)); } catch { lines.push(String(e.result)); }
         lines.push('```', '');
       }
     }
@@ -9867,7 +10772,8 @@ function exportHTML() {
       const statusCls = e.isErr ? 'status-error' : 'status-ok';
       const statusTxt = e.isErr ? 'error' : 'ok';
       const argsStr = JSON.stringify(e.args, null, 2);
-      const resStr  = e.result !== undefined ? (() => { try { return JSON.stringify(e.result, null, 2); } catch { return String(e.result); } })() : '';
+      // .result?.result, not .result — see the Markdown export's identical note.
+      const resStr  = e.result !== undefined ? (() => { try { return JSON.stringify(e.result?.result ?? e.result, null, 2); } catch { return String(e.result); } })() : '';
       return `<tr class="hist-row" onclick="var d=this.nextElementSibling;d.style.display=d.style.display==='none'?'table-row':'none'">
         <td class="sm muted">${he(e.time)}</td>
         <td class="mono sm">${he(host)}</td>
@@ -10739,7 +11645,7 @@ async function runAuthTests(srv, payload) {
       });
       data    = await res.json();
       elapsed = Date.now() - t0;
-      isErr   = !!(data?.error || data?.result?.error || data?.result?.isError);
+      isErr   = !!(data?.error || data?.result?.error || data?.result?.result?.isError);
     } catch(e) {
       elapsed = Date.now() - t0;
       data    = {error: e.message};
@@ -11282,7 +12188,7 @@ async function startFuzz() {
       const data    = JSON.parse(raw);
       const elapsed = Date.now() - t0;
       const size    = new TextEncoder().encode(raw).length;
-      const isErr   = !!(data?.error || data?.result?.error || data?.result?.isError);
+      const isErr   = !!(data?.error || data?.result?.error || data?.result?.result?.isError);
       const preview = JSON.stringify(data?.result ?? data).slice(0, 300);
 
       if (baselineSize === null && !isErr) baselineSize = size;
@@ -11938,7 +12844,7 @@ async function runHistFuzz() {
     const elapsed = Date.now() - t0;
     const sz      = JSON.stringify(res.result || res.error || '').length;
     const anomaly = baseSize !== null && Math.abs(sz - baseSize) / (baseSize || 1) >= 0.20;
-    const isErr   = !!(res?.error || res?.result?.error || res?.result?.isError);
+    const isErr   = !!(res?.error || res?.result?.error || res?.result?.result?.isError);
     const resIdx  = _hfuzzState.results.length;
     _hfuzzState.results.push({pl, res, elapsed, sz, anomaly, sentPayload: payload});
 
