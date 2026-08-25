@@ -110,5 +110,15 @@ A malicious server can smuggle a split instruction through *any* channel that ca
   The `uri` was already checked for SSRF; the accompanying display text is now scanned for injection too.
 - [x] **Notification `params`** (e.g. `notifications/message`'s log text)
   Now scanned (`_runNotificationChecks`) alongside the existing capability/spoofing checks. `ghostsplice_server.py` can't exercise this itself (plain stateless HTTP, no stream to push a notification over) — live coverage added to `spec_probes_server.py`'s `/sse` instead (`data_ingest` + `spam_notification_with_mapping`).
+- [x] **Elicitation form-mode + sampling correlation upgrade**
+  Both already ran a generic injection-language scan; neither checked matches against `srv.opaqueParamTools` for the correlated finding. `_checkOpaqueCorrelation` factored out of `_scanForSplitting` so both keep their existing spec-specific finding wording and gain the correlation. `ghostsplice_server.py`: `project_scan_via_elicitation_form`. Sampling has no live fixture (would need a persistent SSE push, which this fixture deliberately doesn't have — same constraint as notification params above) — covered by Node harness only.
+- [x] **Elicitation url-mode `message`**
+  Previously only the target URL was checked (SSRF/homoglyph); the accompanying message text itself was never scanned. `ghostsplice_server.py`: `project_scan_via_elicitation_url`.
+- [x] **`completion/complete` values**
+  Autocomplete suggestions returned straight to the client were never scanned (`_runCompletionChecks`). `ghostsplice_server.py`'s `completion/complete` handler.
+- [x] **`tasks/get` / `tasks/list` / `tasks/result`**
+  The tasks capability's status/progress/result text isn't strictly pinned by spec, so `_runTasksChecks` scans every string value found anywhere in the result rather than guessing field names (`_collectStrings`). `ghostsplice_server.py`'s task handlers (`task-ghost-1`).
+- [x] **Generic `_meta` extension fields**
+  An open extension point on almost any response — `_runMetaChecks` hooks centrally in `doSend()` and scans whatever's actually present, regardless of method. `ghostsplice_server.py`: `project_scan_via_meta`.
 
-All seven locations closed as of 2026-08-19, all with live fixture coverage: six in `mcp_test_servers/ghostsplice_server.py`, notification params in `mcp_test_servers/spec_probes_server.py`.
+Thirteen locations closed as of 2026-08-23 (seven on 2026-08-19, six more here). Still open: MCP Apps UI fetched resource content (would require MCPoke to actually fetch/render the resource, not just add a scan hook to an existing response — see [GHOSTSPLICE_LOCATIONS.md](GHOSTSPLICE_LOCATIONS.md)).

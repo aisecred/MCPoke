@@ -199,8 +199,13 @@ MCPoke detects this by checking two things and connecting them, rather than scan
    - **`prompts/get`** rendered messages (as opposed to a prompt's `prompts/list`-time metadata, which was already scanned)
    - **`serverInfo.instructions`** — the free-text field a server can return at `initialize` specifically to steer the client/model; scanned at connect time
    - **Notification `params`** (e.g. `notifications/message`'s log text), alongside the existing capability/spoofing checks on notifications
+   - **Elicitation** form-mode `message`/schema text and url-mode `message` text (the url-mode target itself is separately checked for SSRF/homoglyph risk)
+   - **Sampling** `messages[].content.text` and `systemPrompt`
+   - **`completion/complete`** suggestions (`completion.values[]`)
+   - **`tasks/get`**, **`tasks/list`**, **`tasks/result`** — the tasks capability's status/progress/result text isn't strictly pinned by spec, so every string value found anywhere in the response is scanned rather than guessing specific field names
+   - Generic **`_meta`** extension fields on any response — an open extension point by design, scanned wherever it's actually present regardless of method
 
-This closes what was, before it, a real gap in MCPoke's own scanning: prior to this detection, only *static* `tools/list`/`resources/list`/`prompts/list` metadata was ever scanned for injected instructions — the actual content returned by a tool call, a resource read, a prompt render, an error, or a notification was never inspected at all, which is exactly the blind spot this class of technique is built to exploit. See [MALICIOUS_SERVER_ATTACKS.md](MALICIOUS_SERVER_ATTACKS.md) for the full technique writeup and [BACKLOG.md](BACKLOG.md) for the tracking history.
+This closes what was, before it, a real gap in MCPoke's own scanning: prior to this detection, only *static* `tools/list`/`resources/list`/`prompts/list` metadata was ever scanned for injected instructions — the actual content returned by a tool call, a resource read, a prompt render, an error, or a notification was never inspected at all, which is exactly the blind spot this class of technique is built to exploit. See [MALICIOUS_SERVER_ATTACKS.md](MALICIOUS_SERVER_ATTACKS.md) for the full technique writeup, [GHOSTSPLICE_LOCATIONS.md](GHOSTSPLICE_LOCATIONS.md) for the full location-by-location coverage map, and [BACKLOG.md](BACKLOG.md) for the tracking history.
 
 ### Sending requests
 

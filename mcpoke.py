@@ -945,15 +945,6 @@ _CSP = (
 )
 
 @app.middleware("http")
-async def security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"]        = "DENY"
-    response.headers["Referrer-Policy"]        = "no-referrer"
-    response.headers["Content-Security-Policy"] = _CSP
-    return response
-
-@app.middleware("http")
 async def token_auth(request: Request, call_next):
     if API_TOKEN is None:
         return await call_next(request)
@@ -964,6 +955,21 @@ async def token_auth(request: Request, call_next):
     if not secrets.compare_digest(tok, API_TOKEN):
         return JSONResponse({'detail': 'Unauthorized'}, status_code=401)
     return await call_next(request)
+
+# Registered AFTER token_auth so it becomes the OUTERMOST middleware (Starlette
+# wraps middleware in reverse registration order — the last one added runs
+# first and wraps everything inside it). That way it still applies the
+# security headers to token_auth's own 401 short-circuit response, which
+# never reaches call_next and would otherwise skip whichever middleware was
+# registered after it.
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"]        = "DENY"
+    response.headers["Referrer-Policy"]        = "no-referrer"
+    response.headers["Content-Security-Policy"] = _CSP
+    return response
 
 # ── Request models ────────────────────────────────────────────────────────────
 
@@ -1200,6 +1206,8 @@ async def raw_call(req: RawRequest):
         extra_headers["Authorization"] = f"Bearer {req.token}"
 
     method = req.method.upper()
+    if method != "GET" and req.payload is None:
+        return {"error": "payload is required for a non-GET request"}
     if method != "GET" and req.transport == "sse":
         return await _sse_call(req.url, req.payload, extra_headers, req.proxy, req.protocol_version, req.elicitation)
     if method != "GET":
@@ -1667,7 +1675,33 @@ async def oauth_probe(req: OAuthProbeRequest):
 # ── stdio transport ───────────────────────────────────────────────────────────
 
 _stdio_procs: dict = {}  # command -> asyncio.subprocess.Process
-_stdio_locks: dict = {}  # command -> asyncio.Lock
+_stdio_locks: dict = {}  # command -> asyncio.Lock (guards individual _stdio_send request/response pairs)
+# Guards the *entire* connect+handshake sequence in _connect_stdio below (spawn,
+# initialize, notifications/initialized, tools/resources/prompts list) for a
+# given command — not just the spawn. Two concurrent connects for the same
+# command sharing one already-spawned process can still corrupt each other's
+# handshake even with the spawn race fixed: notifications/initialized is
+# written directly to stdin outside of _stdio_locks' per-request locking, and
+# even the individually-locked _stdio_send calls only serialize one
+# request/response pair at a time, not the whole multi-step handshake as a
+# unit — so one caller's initialize can land between another caller's
+# notification write and its own tools/list send, and reads can cross between
+# the two callers. Confirmed live: two concurrent /stdio/connect calls for the
+# same command reliably corrupted both handshakes before this lock existed.
+#
+# Keyed per-command (not a single global lock) so concurrent connects to
+# DIFFERENT commands aren't serialized behind each other. _stdio_connect_locks_guard
+# only protects the lazy creation of each per-command entry — a lock can't be
+# created ahead of time the way _stdio_locks' per-command locks are (those are
+# only created after a successful spawn).
+_stdio_connect_locks: dict = {}  # command -> asyncio.Lock
+_stdio_connect_locks_guard = asyncio.Lock()
+
+async def _get_stdio_connect_lock(command: str) -> "asyncio.Lock":
+    async with _stdio_connect_locks_guard:
+        if command not in _stdio_connect_locks:
+            _stdio_connect_locks[command] = asyncio.Lock()
+        return _stdio_connect_locks[command]
 
 def _cleanup_stdio_procs():
     for proc in _stdio_procs.values():
@@ -1698,63 +1732,65 @@ async def _stdio_send(command: str, payload: dict, timeout: float = 30.0) -> dic
 async def _connect_stdio(command: str, env: Optional[dict] = None,
                          protocol_version: Optional[str] = None,
                          elicitation: bool = False) -> dict:
-    # Kill dead process
-    existing = _stdio_procs.get(command)
-    if existing is not None and existing.returncode is not None:
-        del _stdio_procs[command]
-        _stdio_locks.pop(command, None)
+    # Locked for the entire spawn+handshake sequence — see _get_stdio_connect_lock's
+    # comment above for why this has to cover the handshake too, not just the spawn.
+    lock = await _get_stdio_connect_lock(command)
+    async with lock:
+        existing = _stdio_procs.get(command)
+        if existing is not None and existing.returncode is not None:
+            del _stdio_procs[command]
+            _stdio_locks.pop(command, None)
 
-    # Spawn if not running
-    if command not in _stdio_procs:
-        args      = shlex.split(command)
-        # Strip env keys that can hijack dynamic linker / interpreter loading
-        _BLOCKED_ENV = frozenset({
-            "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG",
-            "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
-            "PYTHONPATH", "PYTHONSTARTUP", "RUBYLIB",
-            "NODE_OPTIONS", "NODE_PATH", "PERL5LIB", "PERL5OPT",
-            "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
-        })
-        safe_env  = {k: v for k, v in (env or {}).items()
-                     if isinstance(k, str) and isinstance(v, str)
-                     and k not in _BLOCKED_ENV}
-        proc_env  = {**os.environ, **safe_env}
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=proc_env,
-        )
-        _stdio_procs[command] = proc
-        _stdio_locks[command] = asyncio.Lock()
+        if command not in _stdio_procs:
+            args      = shlex.split(command)
+            # Strip env keys that can hijack dynamic linker / interpreter loading
+            _BLOCKED_ENV = frozenset({
+                "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG",
+                "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+                "PYTHONPATH", "PYTHONSTARTUP", "RUBYLIB",
+                "NODE_OPTIONS", "NODE_PATH", "PERL5LIB", "PERL5OPT",
+                "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
+            })
+            safe_env  = {k: v for k, v in (env or {}).items()
+                         if isinstance(k, str) and isinstance(v, str)
+                         and k not in _BLOCKED_ENV}
+            proc_env  = {**os.environ, **safe_env}
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=proc_env,
+            )
+            _stdio_procs[command] = proc
+            _stdio_locks[command] = asyncio.Lock()
 
-    # MCP handshake
-    init_resp   = await _stdio_send(command, make_initialize(protocol_version=protocol_version, elicitation=elicitation),
-                                    timeout=15.0)
-    server_info = _extract_server_info(init_resp)
+        # MCP handshake
+        init_resp   = await _stdio_send(command, make_initialize(protocol_version=protocol_version, elicitation=elicitation),
+                                        timeout=15.0)
+        server_info = _extract_server_info(init_resp)
 
-    notif_line = (json.dumps(INITIALIZED_NOTIF) + "\n").encode()
-    _stdio_procs[command].stdin.write(notif_line)
-    await _stdio_procs[command].stdin.drain()
+        notif_line = (json.dumps(INITIALIZED_NOTIF) + "\n").encode()
+        _stdio_procs[command].stdin.write(notif_line)
+        await _stdio_procs[command].stdin.drain()
 
-    tools_resp   = await _stdio_send(command, TOOLS_LIST)
-    res_resp     = await _stdio_send(command, RESOURCES_LIST)
-    prompts_resp = await _stdio_send(command, PROMPTS_LIST)
+        tools_resp   = await _stdio_send(command, TOOLS_LIST)
+        res_resp     = await _stdio_send(command, RESOURCES_LIST)
+        prompts_resp = await _stdio_send(command, PROMPTS_LIST)
 
-    return {
-        "transport":   "stdio",
-        "server_info": server_info,
-        "tools":       _extract_tools(tools_resp)     or [],
-        "resources":   _extract_resources(res_resp)   or [],
-        "prompts":     _extract_prompts(prompts_resp) or [],
-        # Version-only check — stdio always initializes before tools/list (no
-        # cold-probe path exists here), so there's no discover-fallback need;
-        # this just keeps srv.isModern populated consistently for any manual
-        # No-init-probe preset re-fire later in the session.
-        "is_modern": bool(server_info.get("protocolVersion", "")) and
-                    server_info.get("protocolVersion", "") >= _MODERN_VERSION,
-    }
+        return {
+            "transport":   "stdio",
+            "server_info": server_info,
+            "tools":       _extract_tools(tools_resp)     or [],
+            "resources":   _extract_resources(res_resp)   or [],
+            "prompts":     _extract_prompts(prompts_resp) or [],
+            # Version-only check — stdio always initializes before tools/list (no
+            # cold-probe path exists here), so there's no discover-fallback need;
+            # this just keeps srv.isModern populated consistently for any manual
+            # No-init-probe preset re-fire later in the session.
+            "is_modern": bool(server_info.get("protocolVersion", "")) and
+                        server_info.get("protocolVersion", "") >= _MODERN_VERSION,
+        }
 
 
 class StdioConnectRequest(BaseModel):
@@ -3256,6 +3292,11 @@ async function connectStdioServer(command, env) {
   srv.status  = 'connecting';
   srv.command = command;
   srv.env     = env || null;
+  // Generation token: bumped on every connect attempt for this server, so a
+  // response from a superseded earlier attempt (e.g. rapid double-click
+  // connect) can be detected and discarded instead of silently overwriting
+  // whatever the most recent attempt just wrote.
+  const myGen = (srv._connectGen = (srv._connectGen || 0) + 1);
   hideError();
   renderServers();
 
@@ -3266,6 +3307,7 @@ async function connectStdioServer(command, env) {
                             elicitation: srv.elicitationEnabled || false}),
     });
     const data = await res.json();
+    if (srv._connectGen !== myGen) return; // superseded by a newer connect attempt
     if (data.error) {
       srv.status = 'error'; srv.error = data.error;
     } else {
@@ -3286,6 +3328,7 @@ async function connectStdioServer(command, env) {
       }
     }
   } catch (e) {
+    if (srv._connectGen !== myGen) return; // superseded by a newer connect attempt
     srv.status = 'error'; srv.error = e.message;
   }
   renderServers();
@@ -3304,6 +3347,12 @@ async function connectServer(url, token, proxy, customHeaders) {
   if (token         !== undefined) srv.token         = token;
   if (proxy         !== undefined) srv.proxy         = proxy || null;
   if (customHeaders !== undefined) srv.customHeaders = customHeaders || null;
+  // Generation token: bumped on every connect attempt for this server, so a
+  // response from a superseded earlier attempt (e.g. rapid double-click
+  // connect, or a reconnect firing while a previous attempt's cert fetch is
+  // still in flight) can be detected and discarded instead of silently
+  // overwriting whatever the most recent attempt just wrote.
+  const myGen = (srv._connectGen = (srv._connectGen || 0) + 1);
   renderServers();
 
   try {
@@ -3315,6 +3364,7 @@ async function connectServer(url, token, proxy, customHeaders) {
                             elicitation: srv.elicitationEnabled || false})
     });
     const data = await res.json();
+    if (srv._connectGen !== myGen) return; // superseded by a newer connect attempt
     if (data.error) {
       srv.status = 'error'; srv.error = data.error;
     } else {
@@ -3336,7 +3386,7 @@ async function connectServer(url, token, proxy, customHeaders) {
       srv.findings   = [...scanServerFindings(srv), ..._preserved];
       _runServerInstructionsChecks(srv);
       // Fetch TLS cert info in the background (non-blocking)
-      if (url.startsWith('https://')) fetchCertInfo(srv);
+      if (url.startsWith('https://')) fetchCertInfo(srv, myGen);
       // If this is the only/first connected server, activate it
       if (srv.url === S.activeUrl || !S.activeUrl || !S.servers[S.activeUrl] ||
           S.servers[S.activeUrl].status !== 'connected') {
@@ -3344,16 +3394,18 @@ async function connectServer(url, token, proxy, customHeaders) {
       }
     }
   } catch (e) {
+    if (srv._connectGen !== myGen) return; // superseded by a newer connect attempt
     srv.status = 'error'; srv.error = e.message;
   }
   renderServers();
   if (srv.url === S.activeUrl) renderTabContent(srv);
 }
 
-async function fetchCertInfo(srv) {
+async function fetchCertInfo(srv, gen) {
   try {
     const res  = await fetch('/cert?' + new URLSearchParams({url: srv.url}));
     const info = await res.json();
+    if (gen !== undefined && srv._connectGen !== gen) return; // a newer connect superseded this fetch
     srv.certInfo = info;
     // Add cert findings
     const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
@@ -3372,7 +3424,12 @@ async function fetchCertInfo(srv) {
         detail:`Self-signed certificate — not trusted by system store, susceptible to MITM if attacker has network positioning${info.verify_error ? ': ' + info.verify_error : ''}`,
         remediation:'Replace with a CA-signed certificate. For internal infrastructure, deploy a private CA and distribute the root certificate to clients. For public-facing servers, use Let\'s Encrypt (free, automated).'});
     }
-    if (certFindings.length) {
+    // Always drop the previous cert finding first, regardless of whether a
+    // new one was found — otherwise a cert that's since become valid (fixed,
+    // rotated, or just reconnecting to a different cert) leaves the stale
+    // expired/self-signed finding from a prior connection sitting forever.
+    const hadCertFinding = (srv.findings || []).some(f => f.item === 'cert');
+    if (hadCertFinding || certFindings.length) {
       srv.findings = (srv.findings || []).filter(f => f.item !== 'cert');
       srv.findings.push(...certFindings);
       renderFindings();
@@ -5787,6 +5844,10 @@ function _runElicitationChecks(srv, key, req, originalPayload, historyId) {
     }
   }
 
+  // itemKey = the tool whose call triggered this elicitation — excludes a
+  // tool's own opaque params from matching against its own elicitation text.
+  const itemKey = originalPayload?.params?.name || null;
+
   if (mode === 'form') {
     const texts = [p.message, ...Object.values(p.requestedSchema?.properties || {}).flatMap(s => [s?.title, s?.description])].filter(Boolean);
     for (const t of texts) {
@@ -5795,6 +5856,10 @@ function _runElicitationChecks(srv, key, req, originalPayload, historyId) {
           `Live elicitation (form mode) message/schema text matched "${h.cat}": "${h.preview}" — servers MUST NOT request sensitive info (passwords, API keys, tokens, payment data) via form mode; MUST use url mode instead.`,
           'Move any credential/sensitive-data collection to url-mode elicitation directed at a secure, trusted page — never collect secrets via in-band form mode.'));
       }
+      // GhostSplice correlation — a form-mode message/schema field is exactly
+      // as capable of carrying the mapping-fragment half of a split
+      // instruction as a tool result is.
+      _checkOpaqueCorrelation(srv, historyId, 'Live elicitation (form mode) message/schema text', itemKey, t);
     }
     for (const issue of _checkElicitSchemaShape(p.requestedSchema)) {
       _pushFindingDedup(srv, mkFinding('elicit-schema-shape', 'medium', 'Protocol',
@@ -5806,6 +5871,11 @@ function _runElicitationChecks(srv, key, req, originalPayload, historyId) {
       _pushFindingDedup(srv, mkFinding('elicit-url-unsafe', issue.severity, 'Client-Side SSRF',
         `URL-mode elicitation target is unsafe: ${issue.detail}`, issue.remediation));
     }
+    // url-mode's accompanying message was never scanned before — only the
+    // target URL was checked (SSRF/homoglyph angle). The message itself is
+    // exactly as capable of carrying injected instructions or a GhostSplice
+    // mapping fragment as form mode's message is.
+    _scanForSplitting(srv, historyId, 'elicit-sensitive-url', 'Live elicitation (url mode) message text', itemKey, p.message);
   }
 }
 
@@ -5837,6 +5907,7 @@ function _runSamplingChecks(srv, req, originalPayload, historyId) {
   // server-controlled text, and the server both writes the prompt and reads
   // the completion — a built-in exfiltration channel if content is smuggled
   // into messages/systemPrompt.
+  const itemKey = originalPayload?.params?.name || null;
   const texts = [
     p.systemPrompt,
     ...(Array.isArray(p.messages) ? p.messages : []).flatMap(m => {
@@ -5851,6 +5922,10 @@ function _runSamplingChecks(srv, req, originalPayload, historyId) {
         `Live sampling/createMessage message/system-prompt text matched "${h.cat}": "${h.preview}" — sampling content is server-controlled and can be used to exfiltrate context or manipulate the client's LLM the same as any other injection vector.`,
         'Review sampling requests before forwarding to a real model; treat message/systemPrompt content as untrusted input, same as any other server-controlled text.'));
     }
+    // GhostSplice correlation — same reasoning as the elicitation form-mode
+    // check above: sampling messages/systemPrompt are server-controlled text
+    // exactly as capable of carrying a mapping fragment.
+    _checkOpaqueCorrelation(srv, historyId, 'Live sampling/createMessage message/system-prompt text', itemKey, t);
   }
 }
 
@@ -5899,12 +5974,28 @@ function _scanForSplitting(srv, historyId, findingPrefix, sourceDesc, itemKey, t
       `${sourceDesc} matched "${h.cat}": "${h.preview}" — this content is exactly as untrusted as tool descriptions; a server can use it to inject instructions into the agent's context.`,
       'Treat this content as untrusted input the same as tool metadata. Review it for injected instructions before trusting or forwarding it.'));
   }
-  // Instruction-splitting correlation: does this text reference (by name, 2+
-  // together — one coincidental word match isn't enough signal) the opaque
-  // parameters of a DIFFERENT tool on this server? If so this isn't an
-  // isolated hit — it's the second half of a GhostSplice-style split
-  // instruction, confirmed by tying it back to the specific tool it's
-  // instructing the operator to (mis)use.
+  _checkOpaqueCorrelation(srv, historyId, sourceDesc, itemKey, text);
+}
+
+// Instruction-splitting correlation only, no standalone injection-language
+// scan — split out of _scanForSplitting so call sites that already run their
+// own specific scanText() pass (with their own finding wording, e.g. the
+// elicitation/sampling checks below) can still get the GhostSplice
+// opaque-param correlation without a second, differently-worded duplicate of
+// the same standalone finding.
+//
+// Does this text reference (by name, 2+ together — one coincidental word
+// match isn't enough signal) the opaque parameters of a DIFFERENT tool on
+// this server? If so this isn't an isolated hit — it's the second half of a
+// GhostSplice-style split instruction, confirmed by tying it back to the
+// specific tool it's instructing the operator to (mis)use.
+function _checkOpaqueCorrelation(srv, historyId, sourceDesc, itemKey, text) {
+  if (!text) return;
+  const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  const mkFinding = (item, severity, category, detail, remediation) => ({
+    severity, category, server: srvShort, item, detail, remediation,
+    source: 'auto', historyId, serverUrl: srv.url,
+  });
   for (const [otherTool, paramNames] of Object.entries(srv.opaqueParamTools || {})) {
     if (otherTool === itemKey) continue;
     const mentioned = paramNames.filter(p => new RegExp(`\\b${p}\\b`, 'i').test(text));
@@ -5961,6 +6052,70 @@ function _runPromptGetChecks(srv, promptName, body, historyId) {
       if (item?.type !== 'text' || typeof item.text !== 'string') continue;
       _scanForSplitting(srv, historyId, 'prompt-get', `Prompt "${promptName}" rendered message (${m.role || '?'})`, `prompt:${promptName}`, item.text);
     }
+  }
+}
+
+// completion/complete suggestions — autocomplete values are server-authored
+// text returned straight to the client, same untrusted status as any other
+// response content, but never scanned before this.
+function _runCompletionChecks(srv, refName, rpcResult, historyId) {
+  const values = rpcResult?.completion?.values;
+  if (!Array.isArray(values)) return;
+  const label = refName ? ` for "${refName}"` : '';
+  for (const v of values) {
+    if (typeof v !== 'string') continue;
+    _scanForSplitting(srv, historyId, 'completion', `completion/complete suggestion${label}`, `completion:${refName || ''}`, v);
+  }
+}
+
+// Recursively collects string leaf values from an arbitrary JSON value, for
+// locations whose shape isn't strictly pinned by the spec (tasks/*, generic
+// _meta extension fields below) rather than guessing specific field names
+// that may not match what a real server actually sends. Skips a "blob" key
+// specifically (base64 payload data, not readable text) and bounds recursion
+// depth so a deeply-nested or huge object can't cause runaway work.
+function _collectStrings(val, depth = 4, out = []) {
+  if (depth < 0 || val == null) return out;
+  if (typeof val === 'string') { out.push(val); return out; }
+  if (Array.isArray(val)) { for (const v of val) _collectStrings(v, depth - 1, out); return out; }
+  if (typeof val === 'object') {
+    for (const [k, v] of Object.entries(val)) {
+      if (k === 'blob') continue;
+      _collectStrings(v, depth - 1, out);
+    }
+  }
+  return out;
+}
+
+// tasks/get, tasks/list, tasks/result — the tasks capability's response
+// shapes for status/progress/result text aren't strictly pinned by the spec,
+// so rather than hand-picking field names that may not match a real server,
+// this scans every string value found anywhere in the result.
+function _runTasksChecks(srv, method, taskId, rpcResult, historyId) {
+  if (!rpcResult || typeof rpcResult !== 'object') return;
+  const label = taskId ? `Task "${taskId}" (${method})` : `${method} result`;
+  for (const s of _collectStrings(rpcResult)) {
+    _scanForSplitting(srv, historyId, 'tasks', label, `task:${taskId || method}`, s);
+  }
+}
+
+// Generic _meta extension fields — an open extension point on almost any
+// response per spec, so rather than guessing which method's _meta might
+// carry text, this hooks centrally in doSend() and scans whatever's
+// actually present whenever a response happens to include one.
+function _runMetaChecks(srv, originalPayload, rpcResult, historyId) {
+  const meta = rpcResult && typeof rpcResult === 'object' ? rpcResult._meta : null;
+  if (!meta || typeof meta !== 'object') return;
+  const toolName = originalPayload?.params?.name;
+  const label = toolName || originalPayload?.method || '(response)';
+  // itemKey deliberately left as the BARE tool name (not prefixed, unlike the
+  // resource/prompt/task/completion itemKeys above) when this _meta belongs
+  // to a tools/call response — so self-exclusion correctly matches against
+  // srv.opaqueParamTools the same way _runToolResultChecks's does, instead
+  // of a tool's own _meta wrongly "correlating" against its own params.
+  const itemKey = toolName || `meta:${label}`;
+  for (const s of _collectStrings(meta)) {
+    _scanForSplitting(srv, historyId, 'meta-field', `_meta extension field on "${label}" response`, itemKey, s);
   }
 }
 
@@ -7333,7 +7488,20 @@ function selectPrompt(idx) {
   document.getElementById('raw-editor').value = JSON.stringify(payload, null, 2);
   attachNotes('prompt', pmt.name);
   updateFuzzBtn();
-  setMode('raw');
+  // Set raw mode without calling setMode() — same reasoning as selectResource
+  // above: setMode('raw') triggers syncFormToRaw(), which reads S.selectedIdx
+  // as a TOOL index (srv.tools[S.selectedIdx]). Here S.selectedIdx is a
+  // PROMPT index, so calling setMode() would throw if the server has fewer
+  // tools than the selected prompt's index, or otherwise silently clobber
+  // the prompts/get JSON just written above with a bogus tools/call skeleton
+  // for an unrelated tool.
+  S.rawMode  = true;
+  S.httpMode = false;
+  document.getElementById('mode-form').classList.remove('active');
+  document.getElementById('mode-raw') .classList.add('active');
+  document.getElementById('mode-http').classList.remove('active');
+  document.getElementById('form-pane').style.display = 'none';
+  document.getElementById('raw-pane') .style.display = 'block';
 }
 
 function clearRequestPanel() {
@@ -7386,11 +7554,19 @@ function buildRawPayload() {
 }
 
 function syncFormToRaw() {
-  const payload = buildRawPayload();
-  if (payload) {
-    document.getElementById('raw-editor').value = JSON.stringify(payload, null, 2);
-    updateFuzzBtn();
-  }
+  const srv = S.servers[S.activeUrl];
+  if (!srv || S.selectedIdx < 0 || !srv.tools[S.selectedIdx]) return;
+  const tool = srv.tools[S.selectedIdx];
+  // Collect args from the form directly instead of via buildRawPayload() —
+  // by the time this runs (called from setMode('raw')), S.rawMode has
+  // already been set to true, so buildRawPayload()'s `S.rawMode ? {} :
+  // collectArgs()` guard always takes the empty-args branch and silently
+  // discards whatever was just typed into the form. Same fix already
+  // applied in syncFormToHttp() for the identical reason.
+  const args = collectArgs() || {};
+  const payload = {jsonrpc:'2.0', id:10, method:'tools/call', params:{name:tool.name, arguments:args}};
+  document.getElementById('raw-editor').value = JSON.stringify(payload, null, 2);
+  updateFuzzBtn();
 }
 
 function syncRawToForm() {
@@ -8212,8 +8388,23 @@ async function doSend() {
     if (!isErr && originalPayload?.method === 'prompts/get') {
       _runPromptGetChecks(srv, originalPayload?.params?.name, body, newHistId);
     }
+    // completion/complete suggestions — never scanned before; completion
+    // values are server-authored text returned straight to the client.
+    if (!isErr && originalPayload?.method === 'completion/complete') {
+      _runCompletionChecks(srv, originalPayload?.params?.ref?.name, body?.result?.result, newHistId);
+    }
+    // tasks/get, tasks/list, tasks/result — shape isn't strictly pinned by
+    // the spec, so this scans whatever free text a server actually included
+    // rather than guessing specific field names.
+    if (!isErr && ['tasks/get', 'tasks/list', 'tasks/result'].includes(originalPayload?.method)) {
+      _runTasksChecks(srv, originalPayload.method, originalPayload?.params?.taskId, body?.result?.result, newHistId);
+    }
     // CacheableResult (SEP-2549) — applies to any list/read result, not just tools/call
     if (!isErr) _runCacheableResultChecks(srv, body?.result?.result, newHistId);
+    // Generic _meta extension fields — an open extension point on almost any
+    // response, so rather than guessing which method's _meta might carry
+    // text, this scans whatever's actually present regardless of method.
+    if (!isErr) _runMetaChecks(srv, originalPayload, body?.result?.result, newHistId);
     // Elicitation (draft spec): server returned an InputRequiredResult with elicitation/create entries
     if (!isErr) {
       const elicit = extractElicitRequests(body);
@@ -8521,8 +8712,16 @@ async function sendElicitationRetry() {
     if (!isErr) {
       const nextElicit = extractElicitRequests(body);
       if (nextElicit) {
-        for (const [key, req] of nextElicit.entries) _runElicitationChecks(srv, key, req, retryPayload, newHistId);
-        if (srv.elicitationEnabled) {
+        // Same two guards as the doSend()/_autoDeclineElicitation call
+        // sites: only run elicitation-specific checks on elicitation/create
+        // entries (a roots/list entry has no mode/message/requestedSchema,
+        // so _runElicitationChecks would misparse it as a malformed
+        // elicitation and raise bogus findings), and never auto-decline a
+        // roots/list entry (it has no accept/decline shape — _hasRootsEntry
+        // must always route to the modal regardless of srv.elicitationEnabled).
+        for (const [key, req] of nextElicit.entries)
+          if (req.method === 'elicitation/create') _runElicitationChecks(srv, key, req, retryPayload, newHistId);
+        if (srv.elicitationEnabled || _hasRootsEntry(nextElicit)) {
           openElicitationModal(srv, retryPayload, nextElicit);
         } else {
           await _autoDeclineElicitation(srv, retryPayload, nextElicit, newHistId);
@@ -10489,7 +10688,7 @@ function exportHistory() {
     server:    e.url,
     tool:      e.tool,
     args:      e.args,
-    result:    e.result,
+    result:    e.result?.result ?? e.result,
     status:    e.isErr ? 'error' : 'ok',
     elapsed_ms: e.elapsed,
   }));
@@ -11279,10 +11478,26 @@ let _fuzzRows    = [];   // {n, pl, requestPayload, fullData, elapsed, size, isE
 let _fuzzSortCol = null;
 let _fuzzSortDir = 1;   // 1 = asc, -1 = desc
 
+// Multi-position fuzzing (Pitchfork / Cluster bomb) — active when 2+ §§ markers exist.
+// A single/zero-marker raw editor keeps using only the globals above; row.pl stays a
+// plain string in that case, and becomes an array of per-position values when multi.
+//
+// UI note: each position's picker is rendered as its own always-visible stacked row
+// (see _renderFuzzPositionBar below), so every _fuzzPositions[i] is live-bound directly
+// to its own row's inputs — there's no single "active" position anymore. An earlier
+// version (gitlab commit c156eeb) instead showed one shared picker swapped between
+// positions via tabs; revert to that commit if the stacked layout needs backing out.
+let _fuzzMarkers    = [];        // cached §...§ match texts for the currently-open modal
+let _fuzzPositions  = [];        // one entry per marker: {src, presetCat, presetText, pastedText, filePls, fileName, numFrom, numTo, numStep, numPad}
+let _fuzzAttackType = 'pitchfork';   // 'pitchfork' | 'clusterbomb'
+
 function openFuzzModal(preselectedCat) {
   const raw = document.getElementById('raw-editor').value;
   const srv = S.servers[S.activeUrl];
   if (!srv || srv.status !== 'connected') { showError('No active connected server'); return; }
+
+  _fuzzMarkers = raw.match(/§[^§]*§/g) || [];
+  _syncFuzzPositionsToMarkerCount();
 
   // If overlay already exists, just show it (preserve state)
   const existing = document.getElementById('fuzz-overlay');
@@ -11297,6 +11512,8 @@ function openFuzzModal(preselectedCat) {
     const preview = m ? '§' + (m[1]||'').slice(0, 35) + '§' : '(no §§ — use HTTP header mode)';
     const mi = document.querySelector('.fuzz-marker-info');
     if (mi) mi.textContent = preview;
+    _renderFuzzPositionBar();
+    _rebuildFuzzThead();
     return;
   }
 
@@ -11318,13 +11535,14 @@ function openFuzzModal(preselectedCat) {
       <div class="fuzz-body">
 
         <div class="fuzz-left">
-          <div class="fuzz-source-bar">
+          <div id="fuzz-multi-bar" style="display:none;flex-direction:column;gap:.3rem;padding:.3rem .4rem;border-bottom:1px solid var(--border)"></div>
+          <div class="fuzz-source-bar" id="fuzz-source-bar">
             <button class="tab-btn active" id="fsrc-presets" onclick="switchFuzzSrc('presets')">Presets</button>
             <button class="tab-btn"        id="fsrc-paste"   onclick="switchFuzzSrc('paste')">Paste</button>
             <button class="tab-btn"        id="fsrc-file"    onclick="switchFuzzSrc('file')">File</button>
             <button class="tab-btn"        id="fsrc-numbers" onclick="switchFuzzSrc('numbers')">Numbers</button>
           </div>
-          <div class="fuzz-payload-area">
+          <div class="fuzz-payload-area" id="fuzz-payload-area">
             <div id="fuzz-presets-pane" style="display:none">
               <div class="fuzz-cat-row">
                 <select id="fuzz-cat-select" onchange="loadFuzzPreset(this.value)">${catOpts}</select>
@@ -11385,14 +11603,7 @@ function openFuzzModal(preselectedCat) {
           </div>
           <div style="overflow-y:auto;flex:1" id="fuzz-results-scroll">
             <table id="fuzz-tbl">
-              <thead><tr id="fuzz-thead-row">
-                <th class="fuzz-sortable" data-col="n">#</th>
-                <th class="fuzz-sortable" data-col="pl">Payload</th>
-                <th class="fuzz-sortable" data-col="status">Status</th>
-                <th class="fuzz-sortable" data-col="elapsed">Time</th>
-                <th class="fuzz-sortable" data-col="size">Size</th>
-                <th>Response preview</th>
-              </tr></thead>
+              <thead><tr id="fuzz-thead-row">${_fuzzTheadHtml()}</tr></thead>
               <tbody id="fuzz-tbody"></tbody>
             </table>
           </div>
@@ -11427,6 +11638,7 @@ function openFuzzModal(preselectedCat) {
       document.getElementById('fuzz-file-info').textContent =
         `${_fuzzFilePls.length} payloads — "${file.name}"`;
       document.getElementById('fuzz-file-info').className = '';
+      _updateFuzzCountReadout();
     };
     r.readAsText(file);
   });
@@ -11442,6 +11654,7 @@ function openFuzzModal(preselectedCat) {
   if (prog) prog.textContent = `Ready — ${initialCat} loaded (${(PAYLOAD_PRESETS[initialCat]||[]).length} payloads)`;
 
   initFuzzPaneResizer();
+  _renderFuzzPositionBar();
 }
 
 function hideFuzzModal() {
@@ -11664,7 +11877,7 @@ async function runAuthTests(srv, payload) {
       tbody.querySelectorAll('tr').forEach(r => r.classList.remove('selected'));
       tr.classList.add('selected');
       const pane = document.getElementById('auth-response-pane');
-      if (pane) pane.textContent = JSON.stringify(data, null, 2);
+      if (pane) pane.textContent = JSON.stringify(data?.result ?? data, null, 2);
     });
     tbody.appendChild(tr);
     tr.scrollIntoView({block:'nearest'});
@@ -11825,6 +12038,242 @@ function toggleFuzzHeaderRow(val) {
   if (inp) inp.style.display = val === 'header' ? '' : 'none';
 }
 
+// ── Multi-position fuzzing (Pitchfork / Cluster bomb) ───────────────────────
+// Activates whenever the raw editor has 2+ §§ markers. The existing single
+// source-picker DOM (presets/paste/file/numbers panes) is reused as-is for
+// whichever position is currently selected; these functions save/restore
+// each position's picker state around that shared DOM.
+
+function _defaultFuzzPosition() {
+  const cat = Object.keys(PAYLOAD_PRESETS)[0];
+  return {src: 'presets', presetCat: cat, presetText: (PAYLOAD_PRESETS[cat]||[]).join('\n'),
+          pastedText: '', filePls: [], fileName: '', numFrom: 0, numTo: 100, numStep: 1, numPad: 0};
+}
+
+function _syncFuzzPositionsToMarkerCount() {
+  while (_fuzzPositions.length < _fuzzMarkers.length) _fuzzPositions.push(_defaultFuzzPosition());
+}
+
+// Results-table header: one "Payload" column normally, one "Position N"
+// column per marker once 2+ §§ markers are in play.
+function _fuzzTheadHtml() {
+  const plCols = _fuzzMarkers.length >= 2
+    ? _fuzzMarkers.map((_, i) => `<th class="fuzz-sortable" data-col="pl${i}">Position ${i + 1}</th>`).join('')
+    : `<th class="fuzz-sortable" data-col="pl">Payload</th>`;
+  return `
+    <th class="fuzz-sortable" data-col="n">#</th>
+    ${plCols}
+    <th class="fuzz-sortable" data-col="status">Status</th>
+    <th class="fuzz-sortable" data-col="elapsed">Time</th>
+    <th class="fuzz-sortable" data-col="size">Size</th>
+    <th>Response preview</th>`;
+}
+
+function _rebuildFuzzThead() {
+  const thead = document.getElementById('fuzz-thead-row');
+  if (!thead) return;
+  thead.innerHTML = _fuzzTheadHtml();
+  initFuzzSort();
+  if (_fuzzSortCol) {
+    const activeTh = thead.querySelector(`[data-col="${_fuzzSortCol}"]`);
+    if (activeTh) activeTh.classList.add(_fuzzSortDir === 1 ? 'sort-asc' : 'sort-desc');
+  }
+}
+
+// STACKED multi-position UI (2026-08-21) — every position's picker is its own
+// always-visible row (no tabs, no shared/swapped DOM), so all positions are
+// visible and editable at once instead of clicking back and forth. Each row's
+// inputs write directly into _fuzzPositions[i] as the single source of truth;
+// there's no separate "flush the active tab" step since nothing is ever hidden.
+// BACKOUT: the previous tab-based version (one shared picker swapped between
+// positions via _switchFuzzPosition/_flushActiveFuzzPosition/_restoreFuzzPosition)
+// is gitlab commit c156eeb — `git show c156eeb -- mcpoke.py` to see it, or revert
+// this commit to restore it. The single-position (0/1 marker) picker below this
+// block is untouched either way.
+
+function _renderFuzzPositionBar() {
+  const bar        = document.getElementById('fuzz-multi-bar');
+  const srcBar      = document.getElementById('fuzz-source-bar');
+  const payloadArea = document.getElementById('fuzz-payload-area');
+  if (!bar) return;
+  const multi = _fuzzMarkers.length >= 2;
+  // The single-position shared picker is irrelevant once every position gets
+  // its own row below — hide it rather than show both at once.
+  if (srcBar)      srcBar.style.display      = multi ? 'none' : '';
+  if (payloadArea) payloadArea.style.display = multi ? 'none' : '';
+  if (!multi) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
+
+  bar.style.display = 'flex';
+  bar.innerHTML = `
+    <div style="display:flex;align-items:center;gap:.4rem;font-size:11px;color:var(--muted)">
+      <label>Attack type:</label>
+      <select id="fuzz-attack-type" onchange="_fuzzAttackType=this.value;_updateFuzzCountReadout()"
+        style="font-size:11px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:3px;padding:.1rem .3rem">
+        <option value="pitchfork"${_fuzzAttackType === 'pitchfork' ? ' selected' : ''}>Pitchfork (parallel)</option>
+        <option value="clusterbomb"${_fuzzAttackType === 'clusterbomb' ? ' selected' : ''}>Cluster bomb (all combinations)</option>
+      </select>
+      <span id="fuzz-count-readout"></span>
+    </div>
+    <div id="fuzz-pos-rows" style="display:flex;flex-direction:column;gap:.3rem;max-height:230px;overflow-y:auto"></div>`;
+
+  const rowsEl = document.getElementById('fuzz-pos-rows');
+  _fuzzMarkers.forEach((m, i) => {
+    const row = document.createElement('div');
+    row.className = 'fuzz-pos-row';
+    row.style.cssText = 'border-bottom:1px solid var(--border);padding-bottom:.3rem';
+    row.innerHTML = _fuzzPosRowHtml(i, m);
+    rowsEl.appendChild(row);
+    _updateFuzzPosCount(i);
+  });
+  _updateFuzzCountReadout();
+}
+
+function _fuzzPosRowHtml(i, markerText) {
+  const pos   = _fuzzPositions[i] || (_fuzzPositions[i] = _defaultFuzzPosition());
+  const label = markerText.replace(/^§|§$/g, '').slice(0, 24) || `position ${i + 1}`;
+  return `
+    <div style="display:flex;align-items:center;gap:.4rem">
+      <span style="font-size:11px;font-weight:600;color:var(--text);min-width:6.5rem" title="${esc(markerText)}">Pos ${i + 1}: ${esc(label)}</span>
+      <select onchange="_setFuzzPosSrc(${i}, this.value)"
+        style="font-size:11px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:3px;padding:.1rem .3rem">
+        <option value="presets"${pos.src === 'presets' ? ' selected' : ''}>Presets</option>
+        <option value="paste"${pos.src === 'paste' ? ' selected' : ''}>Paste</option>
+        <option value="file"${pos.src === 'file' ? ' selected' : ''}>File</option>
+        <option value="numbers"${pos.src === 'numbers' ? ' selected' : ''}>Numbers</option>
+      </select>
+      <span id="fuzz-pos-${i}-count" style="font-size:10px;color:var(--muted);flex:1;text-align:right"></span>
+    </div>
+    <div id="fuzz-pos-${i}-body" style="padding:.25rem 0 0 6.9rem">${_fuzzPosBodyHtml(i)}</div>`;
+}
+
+function _fuzzPosBodyHtml(i) {
+  const pos = _fuzzPositions[i];
+  const smallInput = 'font-family:monospace;font-size:11px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:3px;padding:.1rem .3rem';
+  if (pos.src === 'presets') {
+    const catOpts = Object.keys(PAYLOAD_PRESETS).map(c =>
+      `<option value="${esc(c)}"${c === pos.presetCat ? ' selected' : ''}>${esc(c)}</option>`).join('');
+    return `
+      <select onchange="_loadFuzzPosPreset(${i}, this.value)" style="${smallInput};margin-bottom:.2rem;display:block">${catOpts}</select>
+      <textarea oninput="_fuzzPositions[${i}].presetText=this.value;_updateFuzzPosCount(${i})"
+        style="width:100%;height:56px;${smallInput}">${esc(pos.presetText)}</textarea>`;
+  }
+  if (pos.src === 'paste') {
+    return `<textarea placeholder="One payload per line…" oninput="_fuzzPositions[${i}].pastedText=this.value;_updateFuzzPosCount(${i})"
+      style="width:100%;height:56px;${smallInput}">${esc(pos.pastedText)}</textarea>`;
+  }
+  if (pos.src === 'file') {
+    return `
+      <button class="btn-sm" onclick="document.getElementById('fuzz-pos-${i}-file-inp').click()">Choose .txt file</button>
+      <input type="file" id="fuzz-pos-${i}-file-inp" accept=".txt" style="display:none" onchange="_handleFuzzPosFile(this, ${i})">
+      <div id="fuzz-pos-${i}-file-info" class="${pos.fileName ? '' : 'empty'}" style="font-size:10px;color:var(--muted);margin-top:.2rem">${esc(pos.fileName || 'No file loaded')}</div>`;
+  }
+  // numbers
+  return `
+    <div style="display:flex;gap:.3rem;align-items:center;flex-wrap:wrap">
+      <label style="font-size:10px;color:var(--muted)">From</label>
+      <input type="number" value="${esc(String(pos.numFrom))}" oninput="_fuzzPositions[${i}].numFrom=this.value;_updateFuzzPosCount(${i})" style="width:4.5rem;${smallInput}">
+      <label style="font-size:10px;color:var(--muted)">To</label>
+      <input type="number" value="${esc(String(pos.numTo))}" oninput="_fuzzPositions[${i}].numTo=this.value;_updateFuzzPosCount(${i})" style="width:4.5rem;${smallInput}">
+      <label style="font-size:10px;color:var(--muted)">Step</label>
+      <input type="number" value="${esc(String(pos.numStep))}" min="1" oninput="_fuzzPositions[${i}].numStep=this.value;_updateFuzzPosCount(${i})" style="width:4rem;${smallInput}">
+      <label style="font-size:10px;color:var(--muted)">Pad</label>
+      <input type="number" value="${esc(String(pos.numPad))}" min="0" max="20" oninput="_fuzzPositions[${i}].numPad=this.value;_updateFuzzPosCount(${i})" style="width:3.5rem;${smallInput}">
+    </div>`;
+}
+
+function _setFuzzPosSrc(i, src) {
+  _fuzzPositions[i].src = src;
+  const bodyEl = document.getElementById(`fuzz-pos-${i}-body`);
+  if (bodyEl) bodyEl.innerHTML = _fuzzPosBodyHtml(i);
+  _updateFuzzPosCount(i);
+}
+
+function _loadFuzzPosPreset(i, cat) {
+  _fuzzPositions[i].presetCat  = cat;
+  _fuzzPositions[i].presetText = (PAYLOAD_PRESETS[cat] || []).join('\n');
+  const bodyEl = document.getElementById(`fuzz-pos-${i}-body`);
+  if (bodyEl) bodyEl.innerHTML = _fuzzPosBodyHtml(i);
+  _updateFuzzPosCount(i);
+}
+
+function _handleFuzzPosFile(inputEl, i) {
+  const file = inputEl.files[0];
+  if (!file) return;
+  const r = new FileReader();
+  r.onload = ev => {
+    const pos = _fuzzPositions[i];
+    pos.filePls  = ev.target.result.split('\n').map(l => l.trim()).filter(Boolean);
+    pos.fileName = `${pos.filePls.length} payloads — "${file.name}"`;
+    const info = document.getElementById(`fuzz-pos-${i}-file-info`);
+    if (info) { info.textContent = pos.fileName; info.className = ''; }
+    _updateFuzzPosCount(i);
+  };
+  r.readAsText(file);
+}
+
+// Per-row "N payloads" label — the at-a-glance view that motivated this
+// rework (previously had to click a tab to see what was even configured).
+function _updateFuzzPosCount(i) {
+  const el = document.getElementById(`fuzz-pos-${i}-count`);
+  if (el) {
+    const n = _payloadsForPosition(_fuzzPositions[i]).length;
+    el.textContent = `${n} payload${n === 1 ? '' : 's'}`;
+  }
+  _updateFuzzCountReadout();
+}
+
+function _payloadsForPosition(pos) {
+  if (pos.src === 'file')    return pos.filePls || [];
+  if (pos.src === 'numbers') return _numberPayloadsFrom(pos.numFrom, pos.numTo, pos.numStep, pos.numPad);
+  if (pos.src === 'paste')   return (pos.pastedText || '').split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  const text = pos.presetText != null ? pos.presetText : (PAYLOAD_PRESETS[pos.presetCat]||[]).join('\n');
+  return text.split('\n').filter(l => l.length > 0);
+}
+
+function _resolvePositionPayloads() {
+  return _fuzzPositions.slice(0, _fuzzMarkers.length).map(_payloadsForPosition);
+}
+
+function _updateFuzzCountReadout() {
+  const el = document.getElementById('fuzz-count-readout');
+  if (!el) return;
+  const lens  = _resolvePositionPayloads().map(p => p.length);
+  const total = _fuzzAttackType === 'clusterbomb'
+    ? lens.reduce((a, b) => a * b, 1)
+    : (lens.length ? Math.min(...lens) : 0);
+  el.textContent = `${lens.join(' × ')} → ${total} request${total === 1 ? '' : 's'}`;
+  el.style.color = (total > 500 && _fuzzAttackType === 'clusterbomb') ? '#ffa657' : 'var(--muted)';
+}
+
+function _buildFuzzCombinations(attackType, perPositionPayloads) {
+  if (!perPositionPayloads.length) return [];
+  if (attackType === 'clusterbomb') {
+    let combos = [[]];
+    for (const list of perPositionPayloads) {
+      const next = [];
+      for (const combo of combos) for (const v of list) next.push([...combo, v]);
+      combos = next;
+    }
+    return combos;
+  }
+  const n = Math.min(...perPositionPayloads.map(p => p.length));
+  const combos = [];
+  for (let i = 0; i < n; i++) combos.push(perPositionPayloads.map(list => list[i]));
+  return combos;
+}
+
+function _fillMultiPositionTemplate(template, combo, escapeFn) {
+  let i = 0;
+  return template.replace(/§[^§]*§/g, () => escapeFn(combo[i++]));
+}
+
+function _jsonEscapeStr(pl) {
+  return pl.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+           .replace(/\n/g, '\\n').replace(/\r/g, '\\r')
+           .replace(/\t/g, '\\t')
+           .replace(/[\x00-\x1f\x7f]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4,'0')}`);
+}
+
 function switchFuzzSrc(src) {
   _fuzzSrc = src;
   ['presets','paste','file','numbers'].forEach(s => {
@@ -11833,13 +12282,11 @@ function switchFuzzSrc(src) {
     if (pane) pane.style.display = s === src ? 'flex' : 'none';
   });
   if (src === 'numbers') _updateNumPreview();
+  _updateFuzzCountReadout();
 }
 
-function _genNumberPayloads() {
-  const from = parseFloat(document.getElementById('fuzz-num-from')?.value ?? 0);
-  const to   = parseFloat(document.getElementById('fuzz-num-to')?.value   ?? 100);
-  const step = parseFloat(document.getElementById('fuzz-num-step')?.value ?? 1);
-  const pad  = parseInt(document.getElementById('fuzz-num-pad')?.value    ?? 0);
+function _numberPayloadsFrom(from, to, step, pad) {
+  from = parseFloat(from); to = parseFloat(to); step = parseFloat(step); pad = parseInt(pad);
   if (isNaN(from) || isNaN(to) || isNaN(step) || step <= 0) return [];
   const out = [];
   const limit = 100000;
@@ -11851,24 +12298,40 @@ function _genNumberPayloads() {
   return out;
 }
 
+function _genNumberPayloads() {
+  return _numberPayloadsFrom(
+    document.getElementById('fuzz-num-from')?.value ?? 0,
+    document.getElementById('fuzz-num-to')?.value   ?? 100,
+    document.getElementById('fuzz-num-step')?.value ?? 1,
+    document.getElementById('fuzz-num-pad')?.value  ?? 0,
+  );
+}
+
 function _updateNumPreview() {
   const pls = _genNumberPayloads();
   const el = document.getElementById('fuzz-num-preview');
-  if (!el) return;
-  if (!pls.length) { el.textContent = 'No payloads — check step > 0 and valid range'; return; }
-  const preview = pls.slice(0, 5).join(', ') + (pls.length > 5 ? ` … ${pls[pls.length-1]}` : '');
-  el.textContent = `${pls.length} payloads: ${preview}`;
+  if (el) {
+    if (!pls.length) el.textContent = 'No payloads — check step > 0 and valid range';
+    else {
+      const preview = pls.slice(0, 5).join(', ') + (pls.length > 5 ? ` … ${pls[pls.length-1]}` : '');
+      el.textContent = `${pls.length} payloads: ${preview}`;
+    }
+  }
+  _updateFuzzCountReadout();
 }
 
 // Live preview updates for number inputs
 document.addEventListener('input', e => {
   if (['fuzz-num-from','fuzz-num-to','fuzz-num-step','fuzz-num-pad'].includes(e.target.id))
     _updateNumPreview();
+  if (['fuzz-payload-ta','fuzz-paste-ta'].includes(e.target.id))
+    _updateFuzzCountReadout();
 });
 
 function loadFuzzPreset(cat) {
   const ta = document.getElementById('fuzz-payload-ta');
   if (ta) ta.value = (PAYLOAD_PRESETS[cat] || []).join('\n');
+  _updateFuzzCountReadout();
 }
 
 function getFuzzPayloads() {
@@ -11893,12 +12356,14 @@ function _buildFuzzTr(row) {
   const idx       = n - 1;
   const sizeStyle = sizeAnomaly ? 'color:#ffa657;font-weight:600' : 'color:var(--muted)';
   const sizeTip   = sizeAnomaly ? ` title="Size differs from baseline (${sizeAnomaly})"` : '';
+  const plCols    = (Array.isArray(pl) ? pl : [pl])
+    .map(v => `<td class="fuzz-pl" title="${esc(v)}">${esc(v.slice(0, 120))}</td>`).join('');
   const tr = document.createElement('tr');
   if (fullData) tr.className = 'clickable';
   tr.dataset.fuzzIdx = idx;
   tr.innerHTML = `
     <td style="color:var(--muted);white-space:nowrap">${n}</td>
-    <td class="fuzz-pl" title="${esc(pl)}">${esc(pl.slice(0, 120))}</td>
+    ${plCols}
     <td style="white-space:nowrap">${statusBadges(fullData, isErr)}</td>
     <td style="color:var(--muted);white-space:nowrap">${elapsed}ms</td>
     <td style="${sizeStyle};white-space:nowrap;font-family:monospace"${sizeTip}>${fmtBytes(size)}</td>
@@ -11933,7 +12398,11 @@ function renderFuzzTable() {
     rows.sort((a, b) => {
       let av, bv;
       if (_fuzzSortCol === 'n')       { av = a.n;       bv = b.n; }
-      else if (_fuzzSortCol === 'pl') { av = a.pl;      bv = b.pl; }
+      else if (_fuzzSortCol === 'pl' || /^pl\d+$/.test(_fuzzSortCol)) {
+        const idx = _fuzzSortCol === 'pl' ? 0 : parseInt(_fuzzSortCol.slice(2), 10);
+        av = Array.isArray(a.pl) ? a.pl[idx] : a.pl;
+        bv = Array.isArray(b.pl) ? b.pl[idx] : b.pl;
+      }
       else if (_fuzzSortCol === 'elapsed') { av = a.elapsed; bv = b.elapsed; }
       else if (_fuzzSortCol === 'size')    { av = a.size;    bv = b.size; }
       else if (_fuzzSortCol === 'status')  {
@@ -11985,7 +12454,7 @@ function showFuzzDetail(idx) {
     document.getElementById('fuzz-detail-req').textContent =
       r.requestPayload ? JSON.stringify(r.requestPayload, null, 2) : '(not available)';
     document.getElementById('fuzz-detail-resp').textContent =
-      JSON.stringify(r.fullData, null, 2);
+      JSON.stringify(r.fullData?.result ?? r.fullData, null, 2);
   }
   if (resizer) resizer.style.display = '';
 
@@ -12009,7 +12478,7 @@ function openFuzzDetailPopup(idx) {
   popup.innerHTML = `
     <div class="fuzz-detail-popup-hdr">
       <span style="color:var(--accent);font-weight:700;font-family:monospace;font-size:12px">
-        #${r.n} &nbsp;·&nbsp; ${esc(r.pl.slice(0, 80))}
+        #${r.n} &nbsp;·&nbsp; ${esc((Array.isArray(r.pl) ? r.pl.join(' | ') : r.pl).slice(0, 80))}
       </span>
       <span style="flex:1"></span>
       <button class="btn-sm" onclick="document.getElementById('fuzz-detail-popup').remove()">&#x2715; Close</button>
@@ -12023,7 +12492,7 @@ function openFuzzDetailPopup(idx) {
       <div style="flex:1;overflow:auto;display:flex;flex-direction:column">
         <div class="fuzz-detail-label">Response</div>
         <pre style="margin:0;padding:.4rem .5rem;font-family:monospace;font-size:11px;color:var(--text);
-          white-space:pre-wrap;word-break:break-all;flex:1;overflow:auto">${esc(JSON.stringify(r.fullData, null, 2))}</pre>
+          white-space:pre-wrap;word-break:break-all;flex:1;overflow:auto">${esc(JSON.stringify(r.fullData?.result ?? r.fullData, null, 2))}</pre>
       </div>
     </div>`;
   const modal = document.getElementById('fuzz-modal');
@@ -12071,6 +12540,12 @@ async function startFuzz() {
   }
   if (injectTarget === 'header' && !headerName) {
     showError('Enter a header name to inject into (e.g. X-Forwarded-For)'); return;
+  }
+
+  const markers = rawTemplate.match(/§[^§]*§/g) || [];
+  if (markers.length >= 2 && injectTarget !== 'header') {
+    await _startMultiFuzz(srv, rawTemplate);
+    return;
   }
 
   const payloads = getFuzzPayloads();
@@ -12239,6 +12714,162 @@ async function startFuzz() {
   const prog = document.getElementById('fuzz-prog-txt');
   if (prog) prog.textContent =
     _fuzzStop ? 'Stopped' : `Done — ${payloads.length} request${payloads.length>1?'s':''}`;
+}
+
+// Multi-position sibling of startFuzz() above — same request-sending/baseline/
+// timing-anomaly logic, but builds Pitchfork/Cluster-bomb combinations across
+// 2+ §§ positions instead of broadcasting one payload to every marker.
+// injectTarget === 'header' never reaches here (guarded in startFuzz — header
+// mode has no §§ markers to combine, stays single-target).
+async function _startMultiFuzz(srv, rawTemplate) {
+  const perPosition = _resolvePositionPayloads();
+  if (perPosition.some(p => !p.length)) {
+    showError('Every fuzz position needs at least one payload'); return;
+  }
+  const combos = _buildFuzzCombinations(_fuzzAttackType, perPosition);
+  if (!combos.length) { showError('No payload combinations to fuzz with'); return; }
+  if (_fuzzAttackType === 'clusterbomb' && combos.length > 500 &&
+      !confirm(`Cluster bomb will fire ${combos.length} requests (${perPosition.map(p => p.length).join(' × ')}). Continue?`)) {
+    return;
+  }
+
+  _fuzzStop = false;
+  _fuzzRows = [];
+  _fuzzSortCol = null;
+  _fuzzSortDir = 1;
+  document.querySelectorAll('#fuzz-thead-row .fuzz-sortable').forEach(h => h.classList.remove('sort-asc','sort-desc'));
+  document.getElementById('fuzz-start-btn').disabled = true;
+  document.getElementById('fuzz-stop-btn').disabled  = false;
+  document.getElementById('fuzz-tbody').innerHTML    = '';
+  const dp = document.getElementById('fuzz-detail-pane');
+  const dr = document.getElementById('fuzz-h-resizer');
+  if (dp) dp.style.display = 'none';
+  if (dr) { dr.style.display = 'none'; dr._wired = false; }
+  const delay = parseInt(document.getElementById('fuzz-delay').value) || 0;
+  const posCount = perPosition.length;
+  let baselineSize = null;
+
+  for (let i = 0; i < combos.length; i++) {
+    if (_fuzzStop) break;
+    const n     = i + 1;
+    const combo = combos[i];
+    document.getElementById('fuzz-prog-txt').textContent = `${n} / ${combos.length}`;
+
+    let parsed, requestOverride = null;
+
+    if (S.httpMode) {
+      // Same two-pass strategy as the single-position path: try a literal
+      // substitution first (for header-value markers), fall back to a
+      // JSON-escaped substitution if that breaks the body's JSON.
+      const filled = _fillMultiPositionTemplate(rawTemplate, combo, x => x);
+      const parsedHttp = parseHttpText(filled);
+      if (!parsedHttp) {
+        addFuzzRow(n, combo, true, 0, 'HTTP text parse failed — missing blank line', null, null, null, null);
+        continue;
+      }
+      try { parsed = JSON.parse(parsedHttp.body); }
+      catch {
+        const filled2 = _fillMultiPositionTemplate(rawTemplate, combo, _jsonEscapeStr);
+        const ph2 = parseHttpText(filled2);
+        if (!ph2) { addFuzzRow(n, combo, true, 0, 'HTTP body produced invalid JSON', null, null, null, null); continue; }
+        try { parsed = JSON.parse(ph2.body); }
+        catch { addFuzzRow(n, combo, true, 0, 'HTTP body produced invalid JSON — use §§ inside a JSON string value', null, null, null, null); continue; }
+      }
+      let authHdr = null;
+      const customHdrs = {};
+      for (const [k, v] of Object.entries(parsedHttp.headers)) {
+        const kl = k.toLowerCase();
+        if (kl === 'authorization') authHdr = v;
+        else if (!['content-type','host','content-length'].includes(kl)) customHdrs[k] = v;
+      }
+      requestOverride = {
+        httpMode: true,
+        custom_headers: Object.keys(customHdrs).length ? customHdrs : null,
+        auth_header: authHdr !== null ? authHdr : '',
+      };
+    } else {
+      const filled = _fillMultiPositionTemplate(rawTemplate, combo, _jsonEscapeStr);
+      try { parsed = JSON.parse(filled); }
+      catch {
+        addFuzzRow(n, combo, true, 0,
+          'Template produced invalid JSON — ensure §§ is inside a string value', null, null, null, null);
+        continue;
+      }
+    }
+
+    const t0 = Date.now();
+    try {
+      let res;
+      if (requestOverride?.httpMode) {
+        res = await fetch('/raw', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            url: srv.url, token: null, proxy: srv.proxy,
+            transport: srv.transport || 'http', payload: parsed,
+            custom_headers: requestOverride.custom_headers,
+            auth_header: requestOverride.auth_header,
+            protocol_version: srv.pinnedVersion || null,
+            elicitation: srv.elicitationEnabled || false,
+          }),
+        });
+      } else {
+        res = await rawFetch(srv, parsed);
+      }
+      const raw     = await res.text();
+      const data    = JSON.parse(raw);
+      const elapsed = Date.now() - t0;
+      const size    = new TextEncoder().encode(raw).length;
+      const isErr   = !!(data?.error || data?.result?.error || data?.result?.result?.isError);
+      const preview = JSON.stringify(data?.result ?? data).slice(0, 300);
+
+      if (baselineSize === null && !isErr) baselineSize = size;
+      let sizeAnomaly = null;
+      if (baselineSize !== null && size !== baselineSize) {
+        const delta = size - baselineSize;
+        const pct   = Math.round(Math.abs(delta) / baselineSize * 100);
+        if (pct >= 20) sizeAnomaly = `baseline ${fmtBytes(baselineSize)}, delta ${delta > 0 ? '+' : ''}${delta} B (${delta > 0 ? '+' : ''}${pct}%)`;
+      }
+
+      addFuzzRow(n, combo, isErr, elapsed, preview, data, size, sizeAnomaly, parsed);
+      addHistory(srv.url, `fuzz:${parsed?.method || '?'}`, {payload: combo}, data, isErr, elapsed);
+    } catch(e) {
+      addFuzzRow(n, combo, true, Date.now() - t0, e.message, null, null, null, null);
+    }
+
+    if (delay > 0 && !_fuzzStop && i < combos.length - 1)
+      await new Promise(r => setTimeout(r, delay));
+  }
+
+  // Post-loop timing anomaly detection — same as the single-position path,
+  // but the Time column has shifted right by (posCount - 1) since there's
+  // one <td> per position instead of a single Payload column.
+  const times = _fuzzRows.filter(r => r && r.elapsed > 0).map(r => r.elapsed).sort((a,b) => a-b);
+  if (times.length >= 3) {
+    const mid = Math.floor(times.length / 2);
+    const median = times.length % 2 ? times[mid] : (times[mid-1] + times[mid]) / 2;
+    const thresh = median * 2;
+    const timeColIdx = posCount + 2; // #, pos1..posN, Status, Time
+    for (let i = 0; i < _fuzzRows.length; i++) {
+      const row = _fuzzRows[i];
+      if (!row || row.elapsed < thresh) continue;
+      const tr = document.querySelector(`#fuzz-tbody tr[data-fuzz-idx="${i}"]`);
+      if (!tr) continue;
+      const elapsedCell = tr.children[timeColIdx];
+      if (elapsedCell) {
+        elapsedCell.style.color = '#ffa657';
+        elapsedCell.style.fontWeight = '600';
+        elapsedCell.title = `Slow response — ${row.elapsed}ms vs median ${Math.round(median)}ms (≥2×)`;
+      }
+    }
+  }
+
+  const s = document.getElementById('fuzz-start-btn');
+  const p = document.getElementById('fuzz-stop-btn');
+  if (s) s.disabled = false;
+  if (p) p.disabled = true;
+  const prog = document.getElementById('fuzz-prog-txt');
+  if (prog) prog.textContent =
+    _fuzzStop ? 'Stopped' : `Done — ${combos.length} request${combos.length > 1 ? 's' : ''}`;
 }
 
 function stopFuzz() { _fuzzStop = true; }
@@ -12931,7 +13562,7 @@ function openHfuzzDetailPopup(idx) {
         </div>
         <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
           <div style="font-size:10px;font-weight:700;color:var(--muted);padding:0.3rem 0.6rem;background:var(--bg)">Response</div>
-          <pre style="flex:1;overflow:auto;padding:0.6rem;margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all">${esc(JSON.stringify(r.res, null, 2))}</pre>
+          <pre style="flex:1;overflow:auto;padding:0.6rem;margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all">${esc(JSON.stringify(r.res.result || r.res.error, null, 2))}</pre>
         </div>
       </div>
     </div>`;
