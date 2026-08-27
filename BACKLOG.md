@@ -122,3 +122,16 @@ A malicious server can smuggle a split instruction through *any* channel that ca
   An open extension point on almost any response — `_runMetaChecks` hooks centrally in `doSend()` and scans whatever's actually present, regardless of method. `ghostsplice_server.py`: `project_scan_via_meta`.
 
 Thirteen locations closed as of 2026-08-23 (seven on 2026-08-19, six more here). Still open: MCP Apps UI fetched resource content (would require MCPoke to actually fetch/render the resource, not just add a scan hook to an existing response — see [GHOSTSPLICE_LOCATIONS.md](GHOSTSPLICE_LOCATIONS.md)).
+
+- [x] **Static `tools/list`/`resources/list`/`prompts/list`/`resources/templates/list` metadata correlation** (2026-08-27)
+  The above locations closed *runtime* response content; static declared metadata (a tool's own `description`, or a different tool/resource/prompt's) only ever got the generic injection-language scan, never checked against `srv.opaqueParamTools` — meaning the setup and mapping fragments could both live in the same `tools/list` response with zero runtime interaction, and the confirmed-correlation finding could never fire. New `_checkStaticMetadataCorrelation`, called after every (re)connect and after a list-changed re-fetch.
+- [x] **`resources/templates/list` tracking + scanning** (2026-08-27)
+  Previously exposed only as a manual "Enumerate" quick-action preset — results were never stored or scanned at all. Now fetched automatically at connect on every transport (`RESOURCE_TEMPLATES_LIST`) and run through both the generic scan and the correlation check.
+- [x] **Embedded resource content blocks** (`type:'resource'`, inline `.resource.text`) in tool results and `prompts/get` messages (2026-08-27)
+  Both checks only ever inspected `type:'text'` content items; a legal `type:'resource'` block was invisible to every scan.
+- [x] **Auto re-scan on `*_list_changed` notifications** (2026-08-27)
+  MCPoke only ever scanned the one static snapshot taken at connect. A server can declare an innocuous setup fragment at connect, then push `list_changed` later and swap in a description carrying the mapping fragment — previously invisible until a manual reconnect. `_rescanListOnChange` now re-fetches and re-scans automatically.
+- [x] **Opaque-param tracking robustness** (2026-08-27)
+  `_opaqueParamNames`'s all-or-nothing, generic-name-regex-gated check missed a tool that used plausible-sounding-but-undescribed names (`region`, `amount`) or only partially opaque schemas. New `_undescribedParamNames` populates `srv.opaqueParamTools` more broadly for correlation purposes (2+ undescribed params, any names) while the strict check still gates the standalone setup finding alone.
+
+Five more closed 2026-08-27, all Node-harness-verified (no live fixture changes this round) — see [GHOSTSPLICE_LOCATIONS.md](GHOSTSPLICE_LOCATIONS.md) for the full writeup. Still open: MCP Apps UI fetched resource content only.
