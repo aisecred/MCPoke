@@ -5261,6 +5261,23 @@ function scanResponse(data, requestArgs) {
       if (v != null) argValues.push(String(v));
     }
   }
+  // Client-declared roots (see setDeclaredRoots) are exactly as "already
+  // known to the operator" as a tool call's own arguments — a server
+  // confirming back the uri/name of a root the operator just handed it
+  // (e.g. "got 1 root(s): [...]") isn't disclosing anything, so it belongs
+  // in the same reflection-suppression bucket. Unlike requestArgs, which
+  // is threaded through per-call, declaredRoots isn't passed to every
+  // showResponse() call site (the live/MRTR roots-answer outcome handlers
+  // only ever had the ORIGINAL tool's args, never the roots answer itself)
+  // — read it directly off the active server instead of plumbing a new
+  // parameter through every caller for one field.
+  const declaredRoots = S.servers[S.activeUrl]?.declaredRoots;
+  if (Array.isArray(declaredRoots)) {
+    for (const r of declaredRoots) {
+      if (r?.uri)  argValues.push(String(r.uri));
+      if (r?.name) argValues.push(String(r.name));
+    }
+  }
   const hits = [];
   for (const p of SENSITIVE_PATTERNS) {
     const m = text.match(p.re);
@@ -9307,13 +9324,22 @@ async function _pollLiveRequest(pendingToken) {
 
 function _handleLiveRequestOutcome(srv, body, histId, toolName, args) {
   const isErr = !!(body?.error || body?.result?.error || body?.result?.result?.isError);
+  // Captured (not discarded) so sensitive-data hits in a live-resolved
+  // response — e.g. a roots/list answer's own path getting echoed back —
+  // make it into the persistent Findings table via buildFindings()'s
+  // history scan, not just the one-off warning banner showResponse()
+  // renders inline. Every other showResponse() call site already does
+  // this; this was the one that didn't.
+  const sensitiveHits = showResponse(body, 0, args || {});
   const histEntry = _histById(histId);
   if (histEntry) {
     histEntry.result = body;
     histEntry.isErr  = isErr;
+    histEntry.sensitiveHits = sensitiveHits;
     renderHistory();
+    if (sensitiveHits?.length) renderFindings();
+    debouncedSaveProject();
   }
-  showResponse(body, 0, args || {});
   document.getElementById('elicit-overlay')?.remove();
   if (body.status === 'pending_live_request' && body.live_request) {
     // Chained: the server pushed another live request instead of resolving.
