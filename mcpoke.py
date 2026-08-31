@@ -3194,6 +3194,11 @@ function customHeadersToText(hdrs) {
   return Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join('\n');
 }
 
+function envVarsToText(env) {
+  if (!env || typeof env !== 'object') return '';
+  return Object.entries(env).map(([k, v]) => `${k}=${v}`).join('\n');
+}
+
 // ── Utilities ─────────────────────────────────────────────────────────────
 
 function esc(s) {
@@ -3539,28 +3544,54 @@ function setActiveServer(url) {
   const srv = S.servers[url];
   if (!srv) return;
 
-  if (srv.status === 'disconnected') {
-    // Populate the add-server form so the user can fill in auth and reconnect
-    document.getElementById('add-url').value     = srv.url;
-    document.getElementById('add-tok').value     = srv.token || '';
-    document.getElementById('add-proxy').value   = srv.proxy || '';
-    const hText = customHeadersToText(srv.customHeaders);
-    document.getElementById('add-headers').value = hText;
-    if (hText) {
-      document.getElementById('add-headers').style.display = '';
-      document.getElementById('add-headers-hint').style.display = '';
-      document.getElementById('add-headers-toggle').textContent = '▾ Custom headers';
+  if (srv.status !== 'connected') {
+    // Populate the add-server form so the user can fill in auth and reconnect.
+    // Covers 'disconnected' AND 'error' (a failed connect attempt) — not just
+    // the former. A server that just failed to connect isn't 'disconnected'
+    // (connectServer/connectStdioServer set status to 'error' on failure), so
+    // gating on that one status left the form un-populated the moment a
+    // retry attempt failed, right when reviewing/editing the config to fix
+    // it is most needed.
+    // stdio servers keep their launch command in srv.command/srv.env, not
+    // srv.url (which is the synthetic 'stdio://<command>' identity) — putting
+    // that into add-url and leaving the transport toggle on HTTP left no way
+    // to actually see/reuse the command a cached stdio server was launched
+    // with.
+    if (srv.transport === 'stdio') {
+      setConnectTransport('stdio');
+      document.getElementById('add-command').value = srv.command || '';
+      const eText = envVarsToText(srv.env);
+      document.getElementById('add-env').value = eText;
+      if (eText) {
+        document.getElementById('add-env').style.display = '';
+        document.getElementById('add-env-toggle').textContent = '▾ Env vars';
+      }
+      document.getElementById('add-command').focus();
+    } else {
+      setConnectTransport('http');
+      document.getElementById('add-url').value     = srv.url;
+      document.getElementById('add-tok').value     = srv.token || '';
+      document.getElementById('add-proxy').value   = srv.proxy || '';
+      const hText = customHeadersToText(srv.customHeaders);
+      document.getElementById('add-headers').value = hText;
+      if (hText) {
+        document.getElementById('add-headers').style.display = '';
+        document.getElementById('add-headers-hint').style.display = '';
+        document.getElementById('add-headers-toggle').textContent = '▾ Custom headers';
+      }
+      document.getElementById('add-url').focus();
     }
-    document.getElementById('add-url').focus();
     // Still show cached tools/info as a preview
     S.activeUrl   = url;
     S.selectedIdx = -1;
     renderServers();
     renderTabContent(srv);
     clearRequestPanel();
+    const statusNote = srv.status === 'error' && srv.error
+      ? ` — connect failed: ${srv.error}` : ' — disconnected, fill token and click Connect';
     document.getElementById('req-server').textContent =
       (srv.serverInfo?.name || (function(){try{return new URL(url).host;}catch{return url;}})()) +
-      ' — disconnected, fill token and click Connect';
+      statusNote;
     return;
   }
 
@@ -3635,6 +3666,8 @@ function renderServers() {
       ? `<span class="badge" style="background:#2a2a1a;color:#e3b341" title="Protocol version pinned — all handshakes for this server force ${esc(srv.pinnedVersion)}">pin ${esc(srv.pinnedVersion)}</span>` : '';
     const eBadge   = srv.elicitationEnabled
       ? `<span class="badge" style="background:#2a1a2a;color:#e39ce3" title="Elicitation testing is ON — this server's elicitation/create requests are declared-supported and parked for live/manual answering instead of auto-rejected">elicit ON</span>` : '';
+    const rBadge   = (srv.declaredRoots || []).length
+      ? `<span class="badge" style="background:#1a2a2a;color:#7ee3d8" title="${srv.declaredRoots.length} root(s) declared — roots/list requests are auto-answered with them instead of prompting each time">roots (${srv.declaredRoots.length})</span>` : '';
     const errText  = srv.error
       ? `<span class="srv-err" title="${esc(srv.error)}">${esc(srv.error.slice(0,60))}</span>` : '';
     const lsText   = (!srv.error && srv.lastSeen && srv.fromCache)
@@ -3672,7 +3705,7 @@ function renderServers() {
         ${discBtn}
         <button class="srv-close btn-sm" data-close="${esc(srv.url)}">&#x2715;</button>
       </div>
-      <div class="srv-meta">${tBadge}${certBadge}${cBadge}${pBadge}${hBadge}${vBadge}${eBadge}${injText}${cveText}${fpText}${shadowText}${errText}${lsText}</div>
+      <div class="srv-meta">${tBadge}${certBadge}${cBadge}${pBadge}${hBadge}${vBadge}${eBadge}${rBadge}${injText}${cveText}${fpText}${shadowText}${errText}${lsText}</div>
       ${capBadgesHtml ? `<div class="srv-caps">${capBadgesHtml}</div>` : ''}
     </div>`;
   }).join('');
@@ -8126,6 +8159,7 @@ function setDeclaredRoots(url, jsonText) {
   srv.declaredRoots = roots;
   debouncedSaveProject();
   renderCapPanel(srv);
+  renderServers(); // sidebar's "roots (N)" badge lives in a separate render pass
 }
 
 // Adds the preset's roots to whatever's already declared, rather than
@@ -8144,6 +8178,7 @@ function loadRootAbusePreset(url, idx) {
   srv.declaredRoots = [...(srv.declaredRoots || []), ...newRoots];
   debouncedSaveProject();
   renderCapPanel(srv);
+  renderServers(); // sidebar's "roots (N)" badge lives in a separate render pass
 }
 
 function clearDeclaredRoots(url) {
@@ -8152,6 +8187,7 @@ function clearDeclaredRoots(url) {
   srv.declaredRoots = [];
   debouncedSaveProject();
   renderCapPanel(srv);
+  renderServers(); // sidebar's "roots (N)" badge lives in a separate render pass
 }
 
 // ── Protocol edge-case presets ─────────────────────────────────────────────
@@ -9229,9 +9265,17 @@ function openLiveElicitationModal(srv, pendingToken, liveRequest, histId, toolNa
   ov.addEventListener('click', e => { if (e.target === ov) cancelLiveRequest(); });
 
   // Poll in the background so a server that completes this out-of-band (url
-  // mode especially — notifications/elicitation/complete, no client answer
-  // required) still resolves the call without the user clicking anything.
-  window._livePollTimer = setInterval(() => _pollLiveRequest(pendingToken), 2000);
+  // mode — notifications/elicitation/complete, no client answer required)
+  // still resolves the call without the user clicking anything. url-mode
+  // ONLY: form mode has no legitimate out-of-band completion path per spec
+  // (the server is waiting on the client to POST an actual answer), so
+  // polling there only risked a modal the operator was still filling in
+  // getting yanked closed out from under them if a poll ever misfired —
+  // not a hypothetical the "url mode especially" wording above originally
+  // hedged on.
+  if (mode === 'url') {
+    window._livePollTimer = setInterval(() => _pollLiveRequest(pendingToken), 2000);
+  }
 }
 
 async function sendLiveElicitationResponse() {
@@ -10764,6 +10808,7 @@ function buildProjectData() {
   }
   const servers = Object.values(S.servers).map(srv => ({
     url: srv.url, token: srv.token, proxy: srv.proxy,
+    command: srv.command || null, env: srv.env || null,
     customHeaders: srv.customHeaders || null,
     transport: srv.transport, serverInfo: srv.serverInfo,
     tools: srv.tools, resources: srv.resources, prompts: srv.prompts,
@@ -11108,7 +11153,8 @@ function restoreSessionData(session) {
 
   S.servers = {};
   for (const s of (session.servers || [])) {
-    const srv        = mkServer(s.url, s.token, s.proxy, s.customHeaders || null);
+    const srv        = mkServer(s.url, s.token, s.proxy, s.customHeaders || null, s.command || null);
+    srv.env          = s.env          || null;
     srv.transport    = s.transport    || null;
     srv.serverInfo   = s.serverInfo   || {};
     srv.tools        = s.tools        || [];
