@@ -1,6 +1,6 @@
 # MCPoke
 
-A repeater-style exploration and security testing tool for [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers. Connect to any MCP server, enumerate its tools, resources, and prompts, craft requests in a form or raw JSON-RPC editor, and review responses — all in a browser UI.
+An exploration and security testing tool for [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) servers. Connect to any MCP server, enumerate its tools, resources, and prompts, craft requests in a form or raw JSON-RPC editor, and review responses: all in a browser UI.
 
 Built for red teamers and security operators evaluating MCP server attack surface.
 
@@ -10,7 +10,7 @@ Built for red teamers and security operators evaluating MCP server attack surfac
 
 ## Why MCP security matters
 
-MCP is a JSON-RPC 2.0 protocol that lets AI models call out to external servers that expose tools, resources, and prompts. A single AI assistant might connect to a dozen MCP servers simultaneously — one for reading files, one for running database queries, one for browsing the web.
+MCP is a JSON-RPC 2.0 protocol that lets AI models call out to external servers that expose tools, resources, and prompts. A single AI assistant might connect to a dozen MCP servers simultaneously: one for reading files, one for running database queries, one for browsing the web.
 
 Each of those servers is a trust boundary. They can execute code or shell commands on behalf of the AI, read and write files on the host system, query databases with user-supplied input, make outbound HTTP requests to internal or external endpoints, and store and retrieve secrets.
 
@@ -21,58 +21,61 @@ The MCP spec is young and implementations vary widely. Auth handling, input vali
 ## Features
 
 ### Enumeration and passive analysis
-- **Multi-server support** — connect to multiple MCP servers simultaneously, switch between them in a sidebar
-- **Auto transport detection** — tries HTTP then SSE automatically; works with both stateless HTTP and persistent SSE transports
-- **stdio transport** — connect to local MCP servers that communicate over stdin/stdout (subprocess); enter the launch command and optional env vars; covers filesystem, git, database, and other locally-installed servers
-- **Full enumeration** — calls `tools/list`, `resources/list`, and `prompts/list` on connect; surfaces results in tabbed panels with live item counts
-- **Attack surface dashboard** — Overview tab shows an instant risk summary after connect: findings by severity, dangerous tool breakdown by category, capability risk annotations, and transport/TLS status
-- **Dangerous tool flagging** — auto-scans tool names and descriptions for high-impact keywords (filesystem, code exec, network, database, secrets) and shows a ⚠ badge on flagged tools
-- **Capability analysis** — surfaces the `initialize` response capabilities with risk annotations: `sampling` (server can invoke AI models — critical), `roots` (filesystem access declared), `experimental` (undocumented features), `tasks` (2025-11-25 durable long-running operations — flags `tasks.list` enumeration and task-ID IDOR exposure)
-- **Icon URL SSRF scanner** — passive scan of `icons[].src` on every tool, resource, and prompt (2025-11-25 icons); the MCP client fetches these URLs to render them, so flags internal/loopback/metadata targets (client-side SSRF), off-host remote URLs (tracking beacon leaking user IP/timing), and plaintext HTTP (MITM)
-- **MCP Apps UI scanner** — passive scan for tools declaring `_meta.ui.resourceUri` (2026-07-28 `io.modelcontextprotocol/ui`); the host renders this server-supplied HTML in a sandboxed iframe with a tool-invocation bridge, so flags the confused-deputy / phishing surface (`ui://` scheme) and escalates when the UI resource is loaded from an external, internal, or `data:` URL (external HTML fetch / client-side SSRF)
-- **Prompt injection / tool poisoning scanner** — passive scan on connect of all tool names, descriptions, parameter descriptions, resource names/URIs, and prompt content; flags instruction overrides, template injection, hidden Unicode, CRLF injection, exfiltration indicators, and LLM-specific delimiters; shows ⚑ badge per item
-- **GhostSplice / instruction-splitting detection** — flags tools with opaquely-named parameters, scans tool results, resource reads, and error responses for language that maps sensitive data onto those parameters, and escalates to a confirmed finding when two fragments correlate — see [GhostSplice / instruction-splitting detection](#ghostsplice--instruction-splitting-detection) below
-- **Cross-server tool shadowing detection** — flags duplicate tool names across connected servers; a malicious server registering the same name as a legitimate one can intercept calls
-- **Transport security info** — TLS/plaintext indicator per server; fetches cert details (CN, expiry, self-signed flag) on hover
-- **SSE notification capture** — live feed of server-pushed `notifications/` events that most clients silently discard
-- **Server fingerprinting** — identifies server implementation from name, version, and protocol patterns
+- **Multi-server support**: connect to multiple MCP servers simultaneously, switch between them in a sidebar
+- **Auto transport detection**: tries HTTP then SSE automatically; works with both stateless HTTP and persistent SSE transports
+- **stdio transport**: connect to local MCP servers that communicate over stdin/stdout (subprocess); enter the launch command and optional env vars; covers filesystem, git, database, and other locally-installed servers
+- **Full enumeration**: calls `tools/list`, `resources/list`, and `prompts/list` on connect; surfaces results in tabbed panels with live item counts
+- **Attack surface dashboard**: Overview tab shows an instant risk summary after connect: findings by severity, dangerous tool breakdown by category, capability risk annotations, and transport/TLS status
+- **Dangerous tool flagging**: auto-scans tool names and descriptions for high-impact keywords (filesystem, code exec, network, database, secrets) and shows a ⚠ badge on flagged tools
+- **Capability analysis**, surfaces the `initialize` response capabilities with risk annotations: `sampling` (server can invoke AI models, critical), `roots` (filesystem access declared), `experimental` (undocumented features), `tasks` (2025-11-25 durable long-running operations, flags `tasks.list` enumeration and task-ID IDOR exposure)
+- **Icon URL SSRF scanner**: passive scan of `icons[].src` on every tool, resource, and prompt (2025-11-25 icons); the MCP client fetches these URLs to render them, so flags internal/loopback/metadata targets (client-side SSRF), off-host remote URLs (tracking beacon leaking user IP/timing), and plaintext HTTP (MITM)
+- **Origin validation (DNS rebinding)**: every HTTP connect sends one `initialize` with a foreign `Origin`. A server that accepts it instead of answering 403 is flagged (the streamable-HTTP transport requires rejection), and one that reflects the origin in `Access-Control-Allow-Origin` is flagged as a CORS misconfiguration (critical with `Allow-Credentials`)
+- **Paginated lists**: `tools/list`, `resources/list`, `prompts/list` and `resources/templates/list` are followed through `nextCursor` (up to 25 pages), so an entry on page 2 or later is scanned like any other
+- **MCP Apps UI scanner**: passive scan for tools declaring `_meta.ui.resourceUri` (2026-07-28 `io.modelcontextprotocol/ui`); the host renders this server-supplied HTML in a sandboxed iframe with a tool-invocation bridge, so flags the confused-deputy / phishing surface (`ui://` scheme) and escalates when the UI resource is loaded from an external, internal, or `data:` URL (external HTML fetch / client-side SSRF); the UI resource content itself is scanned too (`ui://` automatically, external URLs on demand via a guarded fetcher)
+- **Prompt injection / tool poisoning scanner**: passive scan on connect of all tool names, descriptions, parameter descriptions, resource names/URIs, and prompt content; flags instruction overrides, template injection, hidden Unicode, CRLF injection, exfiltration indicators, and LLM-specific delimiters; shows ⚑ badge per item
+- **GhostSplice / instruction-splitting detection**, flags tools with opaquely-named parameters, scans tool results, resource reads, and error responses for language that maps sensitive data onto those parameters, and escalates to a confirmed finding when two fragments correlate, see [GhostSplice / instruction-splitting detection](#ghostsplice--instruction-splitting-detection) below
+- **Cross-server tool shadowing detection**: flags duplicate tool names across connected servers; a malicious server registering the same name as a legitimate one can intercept calls
+- **Transport security info**: TLS/plaintext indicator per server; fetches cert details (CN, expiry, self-signed flag) on hover
+- **SSE notification capture**: live feed of server-pushed `notifications/` events that most clients silently discard
+- **Server fingerprinting**: identifies server implementation from name, version, and protocol patterns
 
 ### Request crafting
-- **Form + Raw editor** — build requests via generated form fields or edit the full JSON-RPC payload directly; sync between modes in either direction
-- **Payload library per parameter** — dropdown next to every string input injects a chosen test payload from preset categories: path traversal, SSRF, command injection, prompt injection, template injection, SQLi, CRLF, XXE, LDAP, and more
-- **Schema-aware type confusion payloads** — payload picker adds a "Type confusion" category based on each parameter's declared JSON schema type (e.g. integer fields get `"1"`, `null`, `[]`, `{}`, `true`)
-- **Protocol edge case presets** — dropdown in the raw editor injects MCP-specific malformed payloads (wrong `protocolVersion`, missing `jsonrpc`, `id: null`, batch requests, unknown methods) plus underexplored MCP methods (`ping`, `completion/complete`, `resources/subscribe`, `logging/setLevel`)
-- **Copy as cURL / Python** — one-click export of the current request as a `curl` command or Python `requests` snippet, including all auth and custom headers; copies to clipboard
-- **OOB callback URL** — set an OOB callback URL (e.g. interactsh) once in the header; payloads with placeholder domains are auto-substituted before sending
+- **Form + Raw editor**: build requests via generated form fields or edit the full JSON-RPC payload directly; sync between modes in either direction
+- **Payload library per parameter**: dropdown next to every string input injects a chosen test payload from preset categories: path traversal, SSRF, command injection, prompt injection, template injection, SQLi, CRLF, XXE, LDAP, and more
+- **Schema-aware type confusion payloads**: payload picker adds a "Type confusion" category based on each parameter's declared JSON schema type (e.g. integer fields get `"1"`, `null`, `[]`, `{}`, `true`)
+- **Protocol edge case presets**: dropdown in the raw editor injects MCP-specific malformed payloads (wrong `protocolVersion`, missing `jsonrpc`, `id: null`, batch requests, unknown methods) plus underexplored MCP methods (`ping`, `completion/complete`, `resources/subscribe`, `logging/setLevel`)
+- **Copy as cURL / Python**: one-click export of the current request as a `curl` command or Python `requests` snippet, including all auth and custom headers; copies to clipboard
+- **OOB callback URL**: set an OOB callback URL (e.g. interactsh) once in the header; payloads with placeholder domains are auto-substituted before sending
 
 ### Active testing
-- **Fuzzer** — mark a value in the raw editor with `§§`, open the Fuzzer, select payloads from presets / paste / file upload, fire sequentially with configurable delay; size anomaly detection flags responses deviating ≥20% from baseline; timing anomaly detection flags responses taking ≥2× the median elapsed time (surfaces blind time-based injection)
-  - **Resizable detail pane** — click any result row to open a split request/response pane at the bottom of the results table; drag the divider to resize
-  - **Double-click full view** — double-click a row for a full-screen popup showing the exact request payload sent and the complete response side by side
-- **Auth variation tester** — fires the same request with six auth variations automatically (current token, no auth, invalid token, empty bearer, `Authorization: null`, alg:none JWT); compares response bodies against the authenticated baseline and flags identical responses as confirmed bypass regardless of HTTP status
-  - **JWT claims tamper** — when the current token is a JWT, adds six additional mutations: `role=admin`, `role=superuser`, `sub=admin`, `sub=0` (IDOR), expired (`exp=1`), far-future expiry
-  - **Custom header probing** — when custom headers are configured (e.g. `X-API-Key`), adds variations that strip or invalidate each key; prevents false positives on servers that use custom headers instead of Bearer tokens for authentication
-- **Race condition tester** — fires N concurrent requests (5–50) via the **Race** button; results table flags outliers whose HTTP status or response size deviates from the majority
-- **History Fuzzer** — open from any history entry via the **⚡ Fuzz** button; select a parameter leaf as the fuzz target, choose preset categories or paste a wordlist, fire sequentially; size and timing anomaly detection; export as CSV
-- **Response diff viewer** — check any two history entries and click **Diff** to see a line-level diff
-- **MCP OAuth 2.0 / PKCE tester** — probes OAuth flows on connected servers: discovers `/.well-known/oauth-authorization-server`, tests PKCE enforcement, open redirect validation, token endpoint client auth, bogus `client_credentials`, and privileged scope acceptance; findings roll into the Findings panel
+- **Fuzzer**: mark a value in the raw editor with `§§`, open the Fuzzer, select payloads from presets / paste / file upload, fire sequentially with configurable delay; size anomaly detection flags responses deviating ≥20% from baseline; timing anomaly detection flags responses taking ≥2× the median elapsed time (surfaces blind time-based injection)
+  - **Resizable detail pane**: click any result row to open a split request/response pane at the bottom of the results table; drag the divider to resize
+  - **Double-click full view**: double-click a row for a full-screen popup showing the exact request payload sent and the complete response side by side
+- **Auth variation tester**: fires the same request with six auth variations automatically (current token, no auth, invalid token, empty bearer, `Authorization: null`, alg:none JWT); compares response bodies against the authenticated baseline and flags identical responses as confirmed bypass regardless of HTTP status
+  - **JWT claims tamper**: when the current token is a JWT, adds six additional mutations: `role=admin`, `role=superuser`, `sub=admin`, `sub=0` (IDOR), expired (`exp=1`), far-future expiry
+  - **Custom header probing**: when custom headers are configured (e.g. `X-API-Key`), adds variations that strip or invalidate each key; prevents false positives on servers that use custom headers instead of Bearer tokens for authentication
+- **Race condition tester**: fires N concurrent requests (5–50) via the **Race** button; results table flags outliers whose HTTP status or response size deviates from the majority
+- **History Fuzzer**: open from any history entry via the **⚡ Fuzz** button; select a parameter leaf as the fuzz target, choose preset categories or paste a wordlist, fire sequentially; size and timing anomaly detection; export as CSV
+- **Response diff viewer**: check any two history entries and click **Diff** to see a line-level diff
+- **MCP OAuth 2.0 / PKCE tester**: probes OAuth flows on connected servers: discovers `/.well-known/oauth-authorization-server`, tests PKCE enforcement, open redirect validation, token endpoint client auth, bogus `client_credentials`, and privileged scope acceptance; findings roll into the Findings panel
 
 ### Findings and reporting
-- **Findings panel** — aggregates all passive and active findings across all connected servers; double-click the panel header to expand full-screen
-- **Findings triage** — each finding has a status badge (open / confirmed / false positive / accepted risk) that cycles on click; status persists in localStorage across sessions
-- **Findings filter** — text filter bar above the findings table narrows rows by severity, category, server, item, or detail as you type; available in both the inline panel and full-screen modal
-- **Per-finding notes** — inline editable note field on each finding row; notes persist in localStorage, survive page reloads, and are included in all export formats
-- **Remediation guidance** — all auto-generated findings include actionable remediation text in a dedicated column
-- **Response sensitive data detection** — scans every response for AWS/GCP/Azure credential formats, JWTs, private key headers, internal file paths, RFC 1918 IPs, stack traces, Slack/GitHub tokens
-- **Notes per tool** — inline text field per tool for operator annotations during a session; included in JSON export
-- **Session export / import** — export the full session (servers, schemas, history, findings, notes, triage status) to JSON and reload it later; use **Export Session** / **Import Session** in the top toolbar
-- **Request history** — every call is logged with method, args, status, and elapsed time; filter by tool name, server, or args; replay any entry, export as JSON or Markdown
-- **Custom request headers** — set arbitrary headers per server (e.g. `X-API-Key`, `X-Tenant-ID`) sent on every request alongside the Bearer token; shown as a green **hdrs** badge in the sidebar
-- **HTTP/SOCKS proxy support** — route traffic per-server through any HTTP/SOCKS proxy (e.g. for traffic inspection)
+- **Findings panel**: aggregates all passive and active findings across all connected servers; double-click the panel header to expand full-screen
+- **Findings triage**: each finding has a status badge (open / confirmed / false positive / accepted risk) that cycles on click; status persists in localStorage across sessions
+- **Findings filter**: text filter bar above the findings table narrows rows by severity, category, server, item, or detail as you type; available in both the inline panel and full-screen modal
+- **Per-finding notes**: inline editable note field on each finding row; notes persist in localStorage, survive page reloads, and are included in all export formats
+- **Remediation guidance**: all auto-generated findings include actionable remediation text in a dedicated column
+- **Credentials in server metadata**: every text a server sends on connect is scanned for credential formats (API keys, tokens, private keys, connection strings): tool, resource, prompt and template names and descriptions, schema defaults, examples and enums, extra metadata fields, `serverInfo` and `instructions`. Obvious placeholders (`YOUR_API_KEY`, `sk-xxxx`, `<token>`) are skipped
+- **Response sensitive data detection**: scans every response for AWS/GCP/Azure credential formats, JWTs, private key headers, internal file paths, RFC 1918 IPs, stack traces, Slack/GitHub tokens
+- **Notes per tool**: inline text field per tool for operator annotations during a session; included in JSON export
+- **Session export / import**: export the full session (servers, schemas, history, findings, notes, triage status) to JSON and reload it later; use **Export Session** / **Import Session** in the top toolbar
+- **Request history**: every call is logged with method, args, status, and elapsed time; filter by tool name, server, or args; replay any entry, export as JSON or Markdown
+- **Custom request headers**: set arbitrary headers per server (e.g. `X-API-Key`, `X-Tenant-ID`) sent on every request alongside the Bearer token; shown as a green **hdrs** badge in the sidebar
+- **HTTP/SOCKS proxy support**: route traffic per-server through any HTTP/SOCKS proxy (e.g. for traffic inspection)
 
 ### UI
-- **Resizable panes** — all four column panels and the history row are drag-resizable; layout persists in localStorage
-- **Full-screen panel expansion** — double-click any panel header to expand it full-screen; press Escape or click Close to restore; works for Servers, Tools, Request, Response, History, Findings, and Notifications panels
+- **Resizable panes**: all four column panels and the history row are drag-resizable; layout persists in localStorage
+- **Full-screen panel expansion**: double-click any panel header to expand it full-screen; press Escape or click Close to restore; works for Servers, Tools, Request, Response, History, Findings, and Notifications panels
 
 ---
 
@@ -110,16 +113,16 @@ python3 mcpoke.py --project ~/engagements/client.mcpoke  # open existing project
 
 #### Network exposure and token auth
 
-By default MCPoke binds to `127.0.0.1` — only your local machine can reach it and no authentication is required.
+By default MCPoke binds to `127.0.0.1`: only your local machine can reach it and no authentication is required.
 
 When you bind to a non-loopback address (e.g. `--host 0.0.0.0`), MCPoke automatically generates a random session token and prints the full URL to the terminal:
 
 ```
-WARNING: MCPoke is binding to 0.0.0.0 — token auth is required.
+WARNING: MCPoke is binding to 0.0.0.0: token auth is required.
 MCPoke running at http://0.0.0.0:8000/?token=<generated-token>
 ```
 
-Open that URL in your browser. All API calls are authenticated automatically — the token is embedded in the page and sent with every request via a JS fetch interceptor. Requests without a valid token receive a `401` response. A new token is generated on every startup.
+Open that URL in your browser. All API calls are authenticated automatically: the token is embedded in the page and sent with every request via a JS fetch interceptor. Requests without a valid token receive a `401` response. A new token is generated on every startup.
 
 SOCKS proxy support (`aiohttp-socks`) is included in `requirements.txt` and installed automatically.
 
@@ -127,19 +130,19 @@ SOCKS proxy support (`aiohttp-socks`) is included in `requirements.txt` and inst
 
 ## Typical testing flow
 
-1. **Connect** — enter the server URL (or command for stdio), optional Bearer token, optional proxy. MCPoke auto-detects HTTP vs SSE.
+1. **Connect**: enter the server URL (or command for stdio), optional Bearer token, optional proxy. MCPoke auto-detects HTTP vs SSE.
 
-2. **Review the Overview tab** — passive scanning runs immediately on connect. Check for injection risks in tool descriptions, dangerous capability flags, and transport issues before touching anything.
+2. **Review the Overview tab**: passive scanning runs immediately on connect. Check for injection risks in tool descriptions, dangerous capability flags, and transport issues before touching anything.
 
-3. **Review tools, resources, and prompts** — look for anything that touches the filesystem, executes code, makes network requests, or handles credentials. ⚠ badges call out the highest-risk tools.
+3. **Review tools, resources, and prompts**: look for anything that touches the filesystem, executes code, makes network requests, or handles credentials. ⚠ badges call out the highest-risk tools.
 
-4. **Run the auth tester** — against every tool that accesses sensitive data. Look for the `≡ match` badge indicating an unauthenticated call returns identical content to the authenticated baseline.
+4. **Run the auth tester**: against every tool that accesses sensitive data. Look for the `≡ match` badge indicating an unauthenticated call returns identical content to the authenticated baseline.
 
-5. **Fuzz high-risk parameters** — use the payload picker to inject path traversal into file path parameters, SQL injection into query parameters, command injection into anything that looks like a shell argument. Watch for size and timing anomalies in the results.
+5. **Fuzz high-risk parameters**: use the payload picker to inject path traversal into file path parameters, SQL injection into query parameters, command injection into anything that looks like a shell argument. Watch for size and timing anomalies in the results.
 
-6. **Use the protocol presets** — send malformed payloads to understand how strictly the server validates the MCP spec. Servers that silently accept wrong protocol versions or batch requests may have other validation gaps.
+6. **Use the protocol presets**: send malformed payloads to understand how strictly the server validates the MCP spec. Servers that silently accept wrong protocol versions or batch requests may have other validation gaps.
 
-7. **Export** — export findings as CSV, JSON, or Markdown for your report. Export history as JSON or Markdown for evidence.
+7. **Export**: export findings as CSV, JSON, or Markdown for your report. Export history as JSON or Markdown for evidence.
 
 ---
 
@@ -150,18 +153,18 @@ SOCKS proxy support (`aiohttp-socks`) is included in `requirements.txt` and inst
 1. Make sure **HTTP/SSE** is selected at the top of the connect form (the default)
 2. Enter the MCP server URL (e.g. `http://localhost:9000/mcp`)
 3. Optionally fill in a Bearer token and proxy URL
-4. Click **+ Connect** — MCPoke auto-detects HTTP vs SSE transport
+4. Click **+ Connect**: MCPoke auto-detects HTTP vs SSE transport
 
 If the server was previously connected, it appears in the sidebar as a cached entry. Click it to pre-fill the form for quick reconnect.
 
 ### Connecting to a stdio server
 
-stdio MCP servers communicate over stdin/stdout — they run as a local subprocess rather than listening on a network port. Most CLI-installed MCP servers (filesystem, git, database tools) use this transport.
+stdio MCP servers communicate over stdin/stdout: they run as a local subprocess rather than listening on a network port. Most CLI-installed MCP servers (filesystem, git, database tools) use this transport.
 
 1. Click **stdio** in the transport toggle at the top of the connect form
 2. Enter the launch command (e.g. `node /path/to/server.js`, `python3 -m my_mcp_server`, `npx @modelcontextprotocol/server-filesystem /data`)
 3. Optionally click **▸ Env vars** to set environment variables for the subprocess (e.g. `DATABASE_URL=postgres://...`)
-4. Click **+ Connect** — MCPoke spawns the subprocess and communicates via JSON-RPC over stdin/stdout
+4. Click **+ Connect**: MCPoke spawns the subprocess and communicates via JSON-RPC over stdin/stdout
 
 **What works on stdio:** tool/resource/prompt enumeration, form and raw editor, fuzzer, History Fuzzer, response diff, session save/load.
 
@@ -171,10 +174,10 @@ stdio MCP servers communicate over stdin/stdout — they run as a local subproce
 
 After connecting, click the **Overview** tab in the enum panel for an instant risk summary:
 
-- **Findings by severity** — count of critical/high/medium/info findings for this server, broken down by category
-- **Dangerous tools** — how many tools are flagged and which risk categories they hit
-- **Capabilities** — same capability badges as the server info panel, with risk notes
-- **Transport** — TLS/plaintext status, cert CN and expiry if available
+- **Findings by severity**: count of critical/high/medium/info findings for this server, broken down by category
+- **Dangerous tools**: how many tools are flagged and which risk categories they hit
+- **Capabilities**: same capability badges as the server info panel, with risk notes
+- **Transport**: TLS/plaintext status, cert CN and expiry if available
 
 ### Exploring tools, resources, and prompts
 
@@ -186,26 +189,33 @@ Switch between **Overview**, **Tools**, **Resources**, and **Prompts** tabs in t
 
 ### GhostSplice / instruction-splitting detection
 
-**GhostSplice** (disclosed Aug 2026) is a technique for smuggling a harmful instruction past both a human reviewer and a single-message content scanner: a malicious server splits the instruction across two or more separate protocol messages, so that no individual message looks malicious on its own. The published proof of concept: a tool declares four parameters named `alpha`, `beta`, `gamma`, `delta` — generic, meaningless, gives nothing away. A *second, unrelated-looking* tool result (framed as a routine "project scan" or "hash verification") later tells the agent to populate those four fields with the contents of `~/.ssh/id_rsa`, proprietary source code, a customer data export, and a `.env` file. Read separately, neither message raises a flag. Reassembled in the agent's context, they instruct it to collect and exfiltrate secrets through the first tool.
+**GhostSplice** (disclosed Aug 2026) is a technique for smuggling a harmful instruction past both a human reviewer and a single-message content scanner: a malicious server splits the instruction across two or more separate protocol messages, so that no individual message looks malicious on its own. The published proof of concept: a tool declares four parameters named `alpha`, `beta`, `gamma`, `delta`: generic, meaningless, gives nothing away. A *second, unrelated-looking* tool result (framed as a routine "project scan" or "hash verification") later tells the agent to populate those four fields with the contents of `~/.ssh/id_rsa`, proprietary source code, a customer data export, and a `.env` file. Read separately, neither message raises a flag. Reassembled in the agent's context, they instruct it to collect and exfiltrate secrets through the first tool.
 
 MCPoke detects this by checking two things and connecting them, rather than scanning each message in isolation:
 
-1. **Opaque parameter naming** (static, at connect time) — a tool whose parameters are all generic, undescribed placeholders (`alpha`/`beta`/`param1`/`field_a`/bare letters, 2 or more of them) is flagged as a medium-severity **Instruction Splitting** finding, and its parameter names are remembered for the next step. A legitimate tool almost never names its own fields this vaguely.
-2. **Content scanning + correlation** (on every message that can carry server-controlled text back to the client) — every one of the following is scanned for language that maps sensitive file paths or data onto a tool's parameters, and specifically checked for whether it references *two or more* of an already-flagged tool's opaque parameter names together. A single coincidental word match isn't enough signal on its own; two or more named together is. When that correlation fires, MCPoke raises a **critical, confirmed** finding that names both tools explicitly, rather than leaving two disconnected low-confidence hits for the operator to piece together:
+1. **Opaque parameter naming** (static, at connect time): a tool whose parameters are all generic, undescribed placeholders (`alpha`/`beta`/`param1`/`field_a`/bare letters, 2 or more of them) is flagged as a medium-severity **Instruction Splitting** finding, and its parameter names are remembered for the next step. A legitimate tool almost never names its own fields this vaguely. A description that is blank or only invisible characters counts as no description. Tools with two or more undescribed parameters under ordinary names are tracked without a finding, and so is a tool with a single undescribed parameter that has a generic name (no finding of its own, because one-parameter tools with generic names are common and harmless).
+2. **Content scanning + correlation** (on every message that can carry server-controlled text back to the client): every one of the following is scanned for language that maps sensitive file paths or data onto a tool's parameters, and specifically checked for whether it references *two or more* of an already-flagged tool's opaque parameter names together. A single coincidental word match isn't enough signal on its own; two or more named together is, except for a tool tracked with only one generic undescribed parameter, where one mention counts if it sits next to an assignment cue and a strong sensitive source (high severity). In names and URIs, where ordinary words often sit together, three names are needed, or two when the same string also carries an assignment cue and a sensitive source. When that correlation fires, MCPoke raises a **critical, confirmed** finding that names both tools explicitly, rather than leaving two disconnected low-confidence hits for the operator to piece together:
    - Tool call **results** (`content[].text`) and **`structuredContent`** (any JSON value per 2026-07-28, stringified before scanning)
-   - Tool call **error responses** — both a JSON-RPC protocol error's `message` field and a spec-legitimate tool-execution error (`isError: true`, which still carries a normal `content[]` array); a server can smuggle the mapping fragment into error text exactly as easily as a success response, and error text tends to get scrutinized less closely
+   - Tool call **error responses**: both a JSON-RPC protocol error's `message` field and a spec-legitimate tool-execution error (`isError: true`, which still carries a normal `content[]` array); a server can smuggle the mapping fragment into error text exactly as easily as a success response, and error text tends to get scrutinized less closely
    - **`resource_link`** `name`/`description` text inside a tool result (the `uri` itself is separately checked for SSRF)
    - **`resources/read`** content (as opposed to a resource's `resources/list`-time name/title/description, which was already scanned)
    - **`prompts/get`** rendered messages (as opposed to a prompt's `prompts/list`-time metadata, which was already scanned)
-   - **`serverInfo.instructions`** — the free-text field a server can return at `initialize` specifically to steer the client/model; scanned at connect time
+   - **`serverInfo.instructions`**: the free-text field a server can return at `initialize` specifically to steer the client/model; scanned at connect time
    - **Notification `params`** (e.g. `notifications/message`'s log text), alongside the existing capability/spoofing checks on notifications
    - **Elicitation** form-mode `message`/schema text and url-mode `message` text (the url-mode target itself is separately checked for SSRF/homoglyph risk)
    - **Sampling** `messages[].content.text` and `systemPrompt`
+   - **Cumulative splitting**: a fragment that names only one tracked parameter per message is tracked in a per-tool ledger. A mention counts only next to an assignment cue (a verb such as fill, write, echo or read, a `name: source` form, or `name from/with/using source`) and a sensitive source (a path, key file, secret word, access or session token, kubeconfig, shell history, database dump; for generic names also weaker ones such as a customers file, a system prompt or chat history). The assignment cue must be within about 80 characters of the name; the source may be anywhere in the same paragraph, up to 400 characters either side. A negated phrase ("never", "not") doesn't count. Two names from separate messages raise a high finding, three raise critical, and the finding lists the messages in order. This narrows the one-name-per-message evasion; it does not close it (a cue placed in a different message from the name is still invisible)
+   - **Cross-message mapping**: one message tells the reader to fill two or more of a tool's undocumented parameters but names nothing sensitive, and a different message within three messages names a sensitive source. Neither alone is a mapping, so the single-message rules stay quiet. This raises a high finding (never critical, because the only link between the messages is that they are close together) and lists both. Generic names are skipped, since two of them in one message are already critical. On benign documentation text this fired in 0 of 1,090 twenty-message sessions, but a benign instruction followed by an unrelated mention of a key file or token nearby can trigger it
    - **`completion/complete`** suggestions (`completion.values[]`)
-   - **`tasks/get`**, **`tasks/list`**, **`tasks/result`** — the tasks capability's status/progress/result text isn't strictly pinned by spec, so every string value found anywhere in the response is scanned rather than guessing specific field names
-   - Generic **`_meta`** extension fields on any response — an open extension point by design, scanned wherever it's actually present regardless of method
+   - **`tasks/get`**, **`tasks/list`**, **`tasks/result`**: the tasks capability's status/progress/result text isn't strictly pinned by spec, so every string value found anywhere in the response is scanned rather than guessing specific field names
+   - Generic **`_meta`** extension fields on any response: an open extension point by design, scanned wherever it's actually present regardless of method
+   - **Nested and non-description schema text**: properties inside nested objects, array `items`, `oneOf`/`anyOf`/`allOf` branches and `$defs`, plus `title`, `default`, `examples`, `const` and `$comment`, on tool `inputSchema`/`outputSchema` (a recursive, size-capped walk)
+   - **Fields with no dedicated check**: `_meta`, `annotations` beyond `title`, icon alt text and vendor `x-*` extensions on tools, resources, templates, prompts and prompt arguments, plus every `capabilities` entry (not just `experimental`). Every string leaf is swept, so a field a future spec revision adds is covered too
+   - **Names**: tool, resource, template, prompt and argument names are correlated as well, and `snake_case` names no longer hide a tracked parameter name from the matcher
+   - **`serverInfo.name`, `title` and `description`** from the `initialize` response, alongside `instructions`
+   - **MCP Apps UI resource content**: a `ui://` URI is read from the connected server with a normal `resources/read` and scanned. A `data:` URI is decoded in the browser. An `http(s)` URI is fetched only when you click **fetch & scan** on its finding, through a guarded fetcher: https only (plaintext needs a second confirmation), public addresses only (resolved and validated server-side, then the connection is pinned to the checked IP), redirects re-checked on every hop, 1 MB / 10 s cap, no credentials sent, every attempt logged to History. If the target is on your own network, a per-fetch lab override relaxes the internal-address and TLS checks for that one host. Full guard list in [GHOSTSPLICE_LOCATIONS.md](GHOSTSPLICE_LOCATIONS.md)
 
-This closes what was, before it, a real gap in MCPoke's own scanning: prior to this detection, only *static* `tools/list`/`resources/list`/`prompts/list` metadata was ever scanned for injected instructions — the actual content returned by a tool call, a resource read, a prompt render, an error, or a notification was never inspected at all, which is exactly the blind spot this class of technique is built to exploit. See [MALICIOUS_SERVER_ATTACKS.md](MALICIOUS_SERVER_ATTACKS.md) for the full technique writeup, [GHOSTSPLICE_LOCATIONS.md](GHOSTSPLICE_LOCATIONS.md) for the full location-by-location coverage map, and [BACKLOG.md](BACKLOG.md) for the tracking history.
+This closes what was, before it, a real gap in MCPoke's own scanning: prior to this detection, only *static* `tools/list`/`resources/list`/`prompts/list` metadata was ever scanned for injected instructions: the actual content returned by a tool call, a resource read, a prompt render, an error, or a notification was never inspected at all, which is exactly the blind spot this class of technique is built to exploit. See [MALICIOUS_SERVER_ATTACKS.md](MALICIOUS_SERVER_ATTACKS.md) for the full technique writeup, [GHOSTSPLICE_LOCATIONS.md](GHOSTSPLICE_LOCATIONS.md) for the full location-by-location coverage map, and [BACKLOG.md](BACKLOG.md) for the tracking history.
 
 ### Sending requests
 
@@ -213,7 +223,7 @@ This closes what was, before it, a real gap in MCPoke's own scanning: prior to t
 
 Each string input has a payload picker button (▾) with preset injection categories. Fields with a declared JSON schema type also get a **Type confusion** category offering type-mismatch values.
 
-**Raw mode:** edit the full JSON-RPC payload directly. Change `method`, `id`, or any field freely — the payload is sent verbatim. Useful for:
+**Raw mode:** edit the full JSON-RPC payload directly. Change `method`, `id`, or any field freely: the payload is sent verbatim. Useful for:
 - Testing malformed payloads and type confusion
 - Calling methods not in the schema (`resources/list`, `prompts/list`, etc.)
 - Missing required fields, oversized values, injection payloads
@@ -222,7 +232,7 @@ Switch between modes with the **Form / Raw** toggle. Use **← Sync to form** to
 
 `Ctrl+Enter` sends the current request.
 
-Use the **↗ Copy** dropdown to export the current request as a `curl` command or Python `requests` snippet — useful for reproducing findings outside MCPoke or including in reports.
+Use the **↗ Copy** dropdown to export the current request as a `curl` command or Python `requests` snippet: useful for reproducing findings outside MCPoke or including in reports.
 
 ### Fuzzer
 
@@ -232,8 +242,8 @@ Use the **↗ Copy** dropdown to export the current request as a `curl` command 
 4. Set an optional inter-request **Delay** (ms) and click **▶ Start**
 
 Results table shows HTTP status, RPC status, elapsed time, response size, and a preview. After the run completes:
-- Rows with a **size anomaly** (≥20% from baseline) are highlighted in amber — common signal for successful injection
-- Rows with a **timing anomaly** (≥2× median elapsed) are highlighted in amber — surfaces blind time-based injection (SQL `SLEEP()`, shell `sleep`, etc.)
+- Rows with a **size anomaly** (≥20% from baseline) are highlighted in amber: common signal for successful injection
+- Rows with a **timing anomaly** (≥2× median elapsed) are highlighted in amber: surfaces blind time-based injection (SQL `SLEEP()`, shell `sleep`, etc.)
 
 **Viewing request/response detail:**
 - **Single-click** a result row → opens a split pane at the bottom of the results area showing the exact request sent on the left and the full response on the right; drag the horizontal divider to resize
@@ -254,7 +264,7 @@ Click **⚡ Auth** in the raw editor action bar to fire six auth variations agai
 
 If the current token is a JWT, six additional claim-mutation rows are added: `role=admin`, `role=superuser`, `sub=admin`, `sub=0` (IDOR probe), `exp=1` (expired), `exp=9999999999` (far future).
 
-If the server has **custom headers** configured (e.g. `X-API-Key`), additional rows are added for each key (up to 3): all custom headers removed, the specific key removed, and the key set to `invalid`. This covers servers that use a custom header instead of (or in addition to) Bearer tokens for authentication — preventing false positives when the Bearer token column is empty.
+If the server has **custom headers** configured (e.g. `X-API-Key`), additional rows are added for each key (up to 3): all custom headers removed, the specific key removed, and the key set to `invalid`. This covers servers that use a custom header instead of (or in addition to) Bearer tokens for authentication: preventing false positives when the Bearer token column is empty.
 
 Responses are compared body-to-body against the authenticated baseline. A `≡ match` badge on any unauthenticated row is a confirmed auth bypass.
 
@@ -263,7 +273,7 @@ Responses are compared body-to-body against the authenticated baseline. A `≡ m
 Click **△ Race** in the raw editor action bar to fire multiple concurrent requests:
 
 1. Choose a concurrency count (5, 10, 20, or 50)
-2. Click **▶ Run** — all requests fire simultaneously via `asyncio.gather`
+2. Click **▶ Run**: all requests fire simultaneously via `asyncio.gather`
 3. Results table shows HTTP status, RPC status, and elapsed time per request; rows whose status+size deviates from the majority are highlighted as outliers
 
 Useful for TOCTOU bugs, double-spend vulnerabilities, and state-corruption issues.
@@ -272,9 +282,9 @@ Useful for TOCTOU bugs, double-spend vulnerabilities, and state-corruption issue
 
 Click **⚡ Fuzz** on any history entry row to open the History Fuzzer:
 
-1. **Left panel** — flattened parameter tree from the original request; click a leaf value to mark it as the fuzz target (highlighted in amber)
-2. **Right panel** — choose payload source: **Presets** (same categories as the payload picker) or **Paste** (one per line)
-3. Click **▶ Run** — fires requests sequentially, substituting each payload for the marked value
+1. **Left panel**: flattened parameter tree from the original request; click a leaf value to mark it as the fuzz target (highlighted in amber)
+2. **Right panel**: choose payload source: **Presets** (same categories as the payload picker) or **Paste** (one per line)
+3. Click **▶ Run**: fires requests sequentially, substituting each payload for the marked value
 4. Results table shows payload, HTTP/RPC status, elapsed time, and a response preview; size anomalies (≥20% from baseline) and timing anomalies (≥2× median) are flagged
 5. Click **Export CSV** to download results
 
@@ -295,7 +305,7 @@ The Findings panel (bottom tabs, or double-click to expand full-screen) aggregat
 
 Click the badge to cycle through states. Status persists in `localStorage` across browser sessions and page reloads.
 
-Use the **filter bar** at the top of the findings table to narrow rows by any field as you type. Each finding row also has an inline **Notes** field — type to annotate (e.g. "confirmed via path param", "tested — benign"). Notes persist in localStorage and are included in CSV, JSON, and Markdown exports.
+Use the **filter bar** at the top of the findings table to narrow rows by any field as you type. Each finding row also has an inline **Notes** field, type to annotate (e.g. "confirmed via path param", "tested, benign"). Notes persist in localStorage and are included in CSV, JSON, and Markdown exports.
 
 ### Custom request headers
 
@@ -306,7 +316,7 @@ X-API-Key: abc123
 X-Tenant: myorg
 ```
 
-Headers are sent on every request to that server — connect, send, fuzz, auth test, race, and history fuzzer. If you also set a Bearer token, the `Authorization` header always takes priority. A green **hdrs** badge appears in the sidebar when headers are configured; hovering shows the header names. Custom headers are restored into the form when you click a cached server entry to reconnect.
+Headers are sent on every request to that server: connect, send, fuzz, auth test, race, and history fuzzer. If you also set a Bearer token, the `Authorization` header always takes priority. A green **hdrs** badge appears in the sidebar when headers are configured; hovering shows the header names. Custom headers are restored into the form when you click a cached server entry to reconnect.
 
 ### Proxy
 
@@ -321,7 +331,7 @@ MCPoke runs six checks automatically:
 | Check | What it tests |
 |---|---|
 | Discovery | Fetches `/.well-known/oauth-authorization-server` and `/.well-known/openid-configuration` |
-| No PKCE | Sends an authorization request without `code_challenge` — PKCE should be required |
+| No PKCE | Sends an authorization request without `code_challenge`: PKCE should be required |
 | Open redirect | Sends an authorization request with an unregistered `redirect_uri` (`evil.example.com`) |
 | Token: no client auth | Requests a token with no `client_id` or `client_secret` |
 | Token: bogus credentials | Attempts `client_credentials` grant with a fabricated client |
@@ -329,17 +339,17 @@ MCPoke runs six checks automatically:
 
 Results appear in a table inside the OAuth modal. Any confirmed issues are automatically added to the server's Findings panel with remediation guidance.
 
-If the server has no OAuth discovery endpoint, this is surfaced as an info finding — most stdio servers and simple HTTP servers will not have one.
+If the server has no OAuth discovery endpoint, this is surfaced as an info finding: most stdio servers and simple HTTP servers will not have one.
 
 ### History
 
-Every request is logged in the history panel at the bottom. Use the **filter bar** (click the 🔍 icon in the history panel header) to search by tool name, server, or arguments. Click **Replay** to restore a previous call to the editor. **Export JSON** and **Export MD** download the full history — useful for evidence and reports.
+Every request is logged in the history panel at the bottom. Use the **filter bar** (click the 🔍 icon in the history panel header) to search by tool name, server, or arguments. Click **Replay** to restore a previous call to the editor. **Export JSON** and **Export MD** download the full history: useful for evidence and reports.
 
 Double-click the **History** panel header to expand it full-screen for easier review.
 
 ### Session export / import
 
-Use **Export Session** in the top toolbar to export the full session — connected servers, tool/resource/prompt schemas, request history, findings, triage status, and notes — to a JSON file. Use **Import Session** to restore it later.
+Use **Export Session** in the top toolbar to export the full session, connected servers, tool/resource/prompt schemas, request history, findings, triage status, and notes, to a JSON file. Use **Import Session** to restore it later.
 
 Session files are versioned and restore all state including finding status badges and per-finding notes, so you can resume a multi-day engagement or share session state with a team.
 
@@ -365,9 +375,9 @@ Flagged tools show ⚠ in the tool list and a category summary in the request pa
 
 Single-file application (`mcpoke.py`):
 
-- **Backend** — FastAPI + aiohttp; handles MCP transport negotiation, probing, and proxying
-- **Frontend** — vanilla JS, no build step; inline HTML/CSS/JS served from the Python file
-- **Endpoints** — `POST /connect`, `POST /call`, `POST /raw`, `POST /race`, `GET|DELETE /cache`, `GET /cache/entry`, `GET /cert`, `POST /oauth-probe`, `POST /stdio/connect`, `POST /stdio/raw`, `DELETE /stdio/disconnect`
+- **Backend**: FastAPI + aiohttp; handles MCP transport negotiation, probing, and proxying
+- **Frontend**: vanilla JS, no build step; inline HTML/CSS/JS served from the Python file
+- **Endpoints**: `POST /connect`, `POST /call`, `POST /raw`, `POST /race`, `GET|DELETE /cache`, `GET /cache/entry`, `GET /cert`, `POST /oauth-probe`, `POST /stdio/connect`, `POST /stdio/raw`, `DELETE /stdio/disconnect`
 
 ### MCP transport support
 
@@ -377,7 +387,7 @@ Single-file application (`mcpoke.py`):
 | SSE | GET → `endpoint` event → POST to session URL; ephemeral session per call |
 | stdio | Spawns a local subprocess; JSON-RPC over stdin/stdout with per-request locking |
 
-WebSocket is not an official MCP transport — the spec defines stdio and HTTP+SSE (called Streamable HTTP in the 2025 revision). MCPoke does not support WebSocket transport.
+WebSocket is not an official MCP transport: the spec defines stdio and HTTP+SSE (called Streamable HTTP in the 2025 revision). MCPoke does not support WebSocket transport.
 
 ---
 
