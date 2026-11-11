@@ -1,5 +1,3 @@
 __pycache__/
 *.pyc
 .venv/
-.claude/
-MCPoke_claude_instructions.md
