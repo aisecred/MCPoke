@@ -297,6 +297,8 @@ The Findings panel (bottom tabs, or double-click to expand full-screen) aggregat
 
 Click the badge to cycle through states. Status persists in `localStorage` across browser sessions and page reloads.
 
+**Adjusting severity.** MCPoke's rating is a baseline. If your environment changes the risk (an internal-only server, a compensating control), click the severity badge, choose a new rating, and give a reason. A reason is required. The baseline is never overwritten: the row shows the adjusted rating with a pencil mark and "was high", every change is kept in a per-finding history (from, to, reason, time), and "Reset to baseline" returns to MCPoke's rating while keeping the history. If a later MCPoke version changes its own baseline for a finding you adjusted, the row is flagged so you re-check it. Use **Severity adjusted** in the triage bar to list only adjusted findings. Exports carry the baseline, the adjusted rating, and the reason, and the adjustments are saved in project and session files.
+
 Use the **filter bar** at the top of the findings table to narrow rows by any field as you type. Each finding row also has an inline **Notes** field, type to annotate (e.g. "confirmed via path param", "tested, benign"). Notes persist in localStorage and are included in CSV, JSON, and Markdown exports.
 
 ### Custom request headers
@@ -344,6 +346,8 @@ Double-click the **History** panel header to expand it full-screen for easier re
 Use **Export Session** in the top toolbar to export the full session, connected servers, tool/resource/prompt schemas, request history, findings, triage status, and notes, to a JSON file. Use **Import Session** to restore it later.
 
 Session files are versioned and restore all state including finding status badges and per-finding notes, so you can resume a multi-day engagement or share session state with a team.
+
+**Project and session files are sensitive.** They keep everything needed to resume a test: bearer tokens, custom headers, request history, and whatever servers returned. MCPoke does not redact them (reliable redaction across that much data is not possible), so treat them like credentials. Project files are written with owner-only permissions (0600), and MCPoke warns you in the save dialog and before an export. Do not share them or commit them to git. The `~/.mcpoke/cache.json` server cache holds no tokens or headers.
 
 ---
 

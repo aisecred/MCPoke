@@ -310,6 +310,16 @@ def _extract_resource_templates(body: Any) -> Optional[list]:
 
 
 _MAX_LIST_PAGES = 25
+
+
+class _PagedList(list):
+    """A list that remembers whether pagination stopped at the page cap with
+    the server still offering a next cursor (items past the cap go unscanned)."""
+    truncated = False
+
+
+def _truncated_names(**lists) -> list:
+    return [k for k, v in lists.items() if getattr(v, "truncated", False)]
 _STR_FIELDS = ("name", "title", "description", "uri", "uriTemplate")
 
 
@@ -345,17 +355,22 @@ async def _paged_list(send, base_payload: dict, extract, first_body: Any = None)
     result.nextCursor; reading only the first page lets a server hide a
     malicious tool/resource/prompt on page 2 or later, where no scanner ever
     looks. `send` takes a JSON-RPC payload and returns the response body.
-    Stops on a missing/repeated cursor or after _MAX_LIST_PAGES pages."""
+    Stops on a missing/repeated cursor or after _MAX_LIST_PAGES pages; hitting
+    the cap with a cursor still pending sets .truncated on the returned list."""
     body = first_body if first_body is not None else await send(base_payload)
     items = extract(body)
     if items is None:
         return None
     items = list(items)
     seen: set = set()
-    for _ in range(_MAX_LIST_PAGES - 1):
+    truncated = False
+    for n in range(_MAX_LIST_PAGES):
         res = body.get("result") if isinstance(body, dict) else None
         cursor = res.get("nextCursor") if isinstance(res, dict) else None
         if not isinstance(cursor, str) or not cursor or cursor in seen:
+            break
+        if n == _MAX_LIST_PAGES - 1:
+            truncated = True
             break
         seen.add(cursor)
         payload = dict(base_payload)
@@ -365,7 +380,9 @@ async def _paged_list(send, base_payload: dict, extract, first_body: Any = None)
         if page is None:
             break
         items.extend(page)
-    return _clean_items(items)
+    out = _PagedList(_clean_items(items))
+    out.truncated = truncated
+    return out
 
 
 def _extract_server_info(init_body: Any) -> dict:
@@ -1079,6 +1096,7 @@ async def _probe_http(session: aiohttp.ClientSession, url: str,
                         "resources": resources or [],
                         "prompts":   prompts or [],
                         "resource_templates": templates or [],
+                        "truncated_lists": _truncated_names(tools=tools, resources=resources, prompts=prompts, resource_templates=templates),
                         "no_init_probe": True,
                         "no_init_probe_evidence": no_init_probe_evidence,
                         "origin_probe": await _probe_origin(session, url, extra_headers, proxy, protocol_version),
@@ -1119,6 +1137,7 @@ async def _probe_http(session: aiohttp.ClientSession, url: str,
             "resources": res_l   or [],
             "prompts":   pmt_l   or [],
             "resource_templates": rt_l or [],
+            "truncated_lists": _truncated_names(tools=tools_l, resources=res_l, prompts=pmt_l, resource_templates=rt_l),
             "is_modern": is_modern,
             "response_headers": init_hdrs,
             "client_capabilities": init_payload["params"]["capabilities"],
@@ -1154,6 +1173,7 @@ async def _probe_sse(session: aiohttp.ClientSession, url: str,
             "resources": res_l   or [],
             "prompts":   pmt_l   or [],
             "resource_templates": rt_l or [],
+            "truncated_lists": _truncated_names(tools=tools_l, resources=res_l, prompts=pmt_l, resource_templates=rt_l),
             "is_modern": is_modern,
             "client_capabilities": make_initialize(protocol_version=protocol_version, elicitation=elicitation)["params"]["capabilities"]}
 
@@ -1184,6 +1204,22 @@ async def probe_target(url: str, auth_token: Optional[str] = None,
 
 # ── Cache ─────────────────────────────────────────────────────────────────────
 
+def _write_private(path: Path, text: str) -> None:
+    """Write a file readable by the owner only (0600). Project files hold
+    whatever the session held: tokens, headers, server responses. The mode is
+    applied on create and re-applied on every write, so files made earlier
+    with a looser mode are tightened on their next save."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+    finally:
+        try:
+            os.chmod(str(path), 0o600)
+        except OSError:
+            pass
+
+
 def _load_cache() -> dict:
     try:
         if CACHE_PATH.exists():
@@ -1196,7 +1232,7 @@ def _load_cache() -> dict:
 def _save_cache(cache: dict) -> None:
     try:
         CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CACHE_PATH.write_text(json.dumps(cache, indent=2))
+        _write_private(CACHE_PATH, json.dumps(cache, indent=2))
     except Exception:
         pass
 
@@ -1213,6 +1249,7 @@ def _update_cache(url: str, result: dict) -> None:
         "resources":   result.get("resources", []),
         "prompts":     result.get("prompts",   []),
         "resource_templates": result.get("resource_templates", []),
+        "truncated_lists": result.get("truncated_lists", []),
         "last_seen":   datetime.now(timezone.utc).isoformat(),
     }
     _save_cache(cache)
@@ -1853,6 +1890,144 @@ async def fetch_external_ui(req: ExtUiRequest):
         return {"ok": False, "refused": "network", "reason": f"{type(e).__name__}: {e}", "url": url, "chain": chain}
 
 
+# ── Endpoint discovery ────────────────────────────────────────────────────────
+# Servers don't always live at /mcp. Given only a host (or a wrong path), try the
+# usual Streamable HTTP paths with a real initialize POST and the usual legacy
+# SSE paths with a GET, and report what answers. Only the origin the user typed
+# is touched, the fixed path list is the only thing varied, redirects are not
+# followed, and nothing is connected: the UI fills the URL box and the user
+# presses Connect.
+
+_DISCOVER_HTTP_PATHS = ["/mcp", "/", "/rpc", "/api", "/v1"]
+_DISCOVER_SSE_PATHS  = ["/sse", "/events", "/stream"]
+
+
+def _first_jsonrpc(text: str) -> Optional[dict]:
+    """JSON body, or the first JSON-RPC object in an SSE-framed body."""
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except (json.JSONDecodeError, ValueError):
+        pass
+    for line in text.splitlines():
+        if line.startswith("data:"):
+            try:
+                obj = json.loads(line[5:].strip())
+                if isinstance(obj, dict):
+                    return obj
+            except (json.JSONDecodeError, ValueError):
+                continue
+    return None
+
+
+async def _discover_http(session, url: str, headers: dict, proxy: Optional[str]) -> dict:
+    row = {"url": url, "transport": "http", "verdict": "none", "status": 0, "detail": ""}
+    h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", **headers}
+    kw: dict = dict(json=make_initialize(), headers=h, allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(connect=CONNECT_TIMEOUT, total=8))
+    if _http_proxy(proxy):
+        kw["proxy"] = _http_proxy(proxy)
+    try:
+        async with session.post(url, **kw) as r:
+            row["status"] = r.status
+            raw = await r.content.read(65536)
+            text = raw.decode("utf-8", errors="replace")
+            if r.status in (401, 403):
+                www = r.headers.get("WWW-Authenticate", "")
+                row.update(verdict="auth", detail=("auth required" + (f" ({www[:80]})" if www else "")))
+            elif r.status in (301, 302, 303, 307, 308):
+                row["detail"] = f"redirects to {r.headers.get('Location', '?')[:120]} (not followed)"
+            elif r.status in (200, 201, 202):
+                obj = _first_jsonrpc(text)
+                if _is_jsonrpc(obj) and "result" in obj:
+                    info = _extract_server_info(obj) or {}
+                    row.update(verdict="mcp", detail="MCP initialize answered"
+                               + (f": {info.get('name')}" if info.get("name") else "")
+                               + (f" (protocol {info.get('protocolVersion')})" if info.get("protocolVersion") else ""))
+                elif _is_jsonrpc(obj):
+                    row.update(verdict="possible", detail=f"JSON-RPC endpoint but initialize was rejected: {str((obj.get('error') or {}).get('message', ''))[:80]}")
+            elif r.status in (405, 406, 415):
+                row.update(verdict="possible", detail=f"answers, but not to this POST ({r.status}; Allow: {r.headers.get('Allow', 'n/a')})")
+            elif r.status == 400 and _is_jsonrpc(_first_jsonrpc(text)):
+                row.update(verdict="possible", detail="JSON-RPC endpoint, rejected the request (400)")
+    except aiohttp.ClientConnectorSSLError:
+        row["detail"] = "TLS error"
+    except Exception as e:
+        row["detail"] = type(e).__name__
+    return row
+
+
+async def _discover_sse(session, url: str, headers: dict, proxy: Optional[str]) -> dict:
+    row = {"url": url, "transport": "sse", "verdict": "none", "status": 0, "detail": ""}
+    h = {"Accept": "text/event-stream", **headers}
+    kw: dict = dict(headers=h, allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=None, connect=CONNECT_TIMEOUT, sock_read=4))
+    if _http_proxy(proxy):
+        kw["proxy"] = _http_proxy(proxy)
+    try:
+        async with session.get(url, **kw) as r:
+            row["status"] = r.status
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if r.status in (401, 403):
+                row.update(verdict="auth", detail="auth required")
+            elif r.status == 200 and ctype.startswith("text/event-stream"):
+                try:
+                    buf = (await asyncio.wait_for(r.content.read(2048), 3)).decode("utf-8", errors="replace")
+                except asyncio.TimeoutError:
+                    buf = ""
+                if re.search(r"^event:\s*endpoint", buf, re.M):
+                    m = re.search(r"^data:\s*(\S+)", buf, re.M)
+                    row.update(verdict="sse", detail="legacy MCP SSE: endpoint event" + (f" -> {m.group(1)[:80]}" if m else ""))
+                elif buf.strip():
+                    row.update(verdict="possible", detail="event stream, but no MCP endpoint event")
+                else:
+                    row.update(verdict="possible", detail="event stream opened, nothing sent in 3 s")
+            elif r.status == 200:
+                row["detail"] = f"200 but content type is {ctype or 'none'}, not an event stream"
+    except aiohttp.ClientConnectorSSLError:
+        row["detail"] = "TLS error"
+    except Exception as e:
+        row["detail"] = type(e).__name__
+    return row
+
+
+class DiscoverRequest(BaseModel):
+    url:            str
+    token:          Optional[str]  = None
+    proxy:          Optional[str]  = None
+    custom_headers: Optional[dict] = None
+
+    @field_validator("url")
+    @classmethod
+    def url_scheme(cls, v: str) -> str:
+        return _validate_url(v)
+
+
+@app.post("/discover-endpoints")
+async def discover_endpoints(req: DiscoverRequest):
+    u = urllib.parse.urlsplit(req.url)
+    origin = f"{u.scheme}://{u.netloc}"
+    headers = dict(req.custom_headers or {})
+    if req.token:
+        headers["Authorization"] = f"Bearer {req.token}"
+    typed = u.path or "/"
+    http_paths = ([typed] if typed not in _DISCOVER_HTTP_PATHS + _DISCOVER_SSE_PATHS else []) + _DISCOVER_HTTP_PATHS
+    try:
+        session_ctx = _make_session(req.proxy)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    async with session_ctx as session:
+        jobs = [_discover_http(session, origin + pth, headers, req.proxy) for pth in http_paths]
+        jobs += [_discover_sse(session, origin + pth, headers, req.proxy) for pth in _DISCOVER_SSE_PATHS]
+        rows = await asyncio.gather(*jobs)
+    for r in rows:
+        r["path"] = urllib.parse.urlsplit(r["url"]).path or "/"
+        r["typed"] = r["path"] == typed
+    order = {"mcp": 0, "sse": 1, "auth": 2, "possible": 3, "none": 4}
+    rows.sort(key=lambda r: order[r["verdict"]])
+    return {"origin": origin, "results": rows}
+
+
 @app.post("/connect")
 async def connect(req: ConnectRequest):
     result = await probe_target(req.url, req.token, req.proxy, req.custom_headers,
@@ -2196,18 +2371,153 @@ async def cert_info(url: str):
 class OAuthProbeRequest(BaseModel):
     url:   str
     proxy: Optional[str] = None
+    # The MCP endpoint itself (path included). Needed for RFC 9728 discovery,
+    # which is keyed on the MCP server's own URL, and to keep the active tests
+    # inside the target's origin. Optional so older callers still work.
+    server_url: Optional[str] = None
 
     @field_validator("url")
     @classmethod
     def url_scheme(cls, v: str) -> str:
         return _validate_url(v)
 
+    @field_validator("server_url")
+    @classmethod
+    def server_url_scheme(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_url(v) if v else v
 
-async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None) -> dict:
+
+_OAUTH_INTERNAL_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".intranet", ".home.arpa")
+_OAUTH_LOOPBACK_DNS = ("localtest.me", "lvh.me", "vcap.me", "lacolhost.com")
+
+
+def _norm_host(host: str) -> Optional[str]:
+    """Host as the HTTP client will see it: lower-cased, brackets and trailing
+    dot dropped, and IDNA/nameprep-encoded so fullwidth digits, ideographic
+    dots and circled numbers ("１２７.０.０.１") collapse to ASCII before any
+    judgement. None when the host cannot be encoded."""
+    h = (host or "").strip("[]").lower().rstrip(".")
+    try:
+        return h.encode("idna").decode("ascii") if h else h
+    except UnicodeError:
+        return None
+
+
+def _oauth_host_internal(host: str) -> bool:
+    """True when a hostname is, or names, an internal/loopback/link-local target.
+    Judges IP literals in every spelling (decimal, hex, octal, IPv6 with an
+    embedded IPv4) the way the guarded fetcher does; names are judged by text
+    only here. This is a cheap pre-filter for findings: any URL MCPoke actually
+    fetches goes through _oauth_get, whose guarded path resolves the name and
+    checks the addresses at connect time."""
+    h = _norm_host(host)
+    if not h:
+        return True              # empty or not encodable: treat as hostile
+    ip = None
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        if re.fullmatch(r"[0-9a-fx.]+", h) and h[0].isdigit():
+            try:
+                ip = ipaddress.IPv4Address(socket.inet_aton(h))
+            except OSError:
+                ip = None
+    if ip is not None:
+        if isinstance(ip, ipaddress.IPv6Address) and ip.sixtofour:
+            ip = ip.sixtofour
+        return _ext_ip_is_internal(ip)
+    if h == "localhost" or h.endswith(_OAUTH_INTERNAL_SUFFIXES) or h.startswith("metadata."):
+        return True
+    if any(h == d or h.endswith("." + d) for d in _OAUTH_LOOPBACK_DNS):
+        return True
+    m = re.search(r"(\d{1,3})[.-](\d{1,3})[.-](\d{1,3})[.-](\d{1,3})\.(?:nip|sslip|xip)\.io$", h)
+    if m:
+        return _oauth_host_internal(".".join(m.groups()))
+    return "." not in h          # single-label names only resolve on an internal network
+
+
+def _origin_of(url: str):
+    """(scheme, host, port) with default ports filled in, or None."""
+    try:
+        p = urllib.parse.urlsplit(url)
+        if p.scheme.lower() not in ("http", "https") or not p.hostname:
+            return None
+        return (p.scheme.lower(), _norm_host(p.hostname) or p.hostname.lower().rstrip("."),
+                p.port or (443 if p.scheme.lower() == "https" else 80))
+    except ValueError:
+        return None
+
+
+def _oauth_url_risk(url: str, mcp_url: Optional[str]) -> Optional[str]:
+    """'scheme' | 'internal' | 'plaintext' | None for a URL a server hands to a
+    client. The MCP server's own origin is never a risk (the client already
+    talks to it)."""
+    o = _origin_of(url)
+    if o is None:
+        return "scheme"
+    if mcp_url and _origin_of(mcp_url) == o:
+        return None
+    if _oauth_host_internal(o[1]):
+        return "internal"
+    return "plaintext" if o[0] == "http" else None
+
+
+def _as_metadata_urls(issuer: str) -> list:
+    """Authorization-server metadata URLs in the order the MCP spec requires
+    clients to try them (RFC 8414 3.1 path insertion, then OIDC discovery)."""
+    p = urllib.parse.urlsplit(issuer)
+    root = f"{p.scheme}://{p.netloc}"
+    path = p.path.rstrip("/")
+    if path:
+        return [("OAuth AS metadata (path-inserted)", f"{root}/.well-known/oauth-authorization-server{path}"),
+                ("OIDC discovery (path-inserted)",    f"{root}/.well-known/openid-configuration{path}"),
+                ("OIDC discovery (path-appended)",    f"{root}{path}/.well-known/openid-configuration")]
+    return [("OAuth AS metadata", f"{root}/.well-known/oauth-authorization-server"),
+            ("OIDC discovery",    f"{root}/.well-known/openid-configuration")]
+
+
+async def _oauth_get(session, url: str, target_url: str, max_hops: int = 3):
+    """GET a discovery URL and return (status, text, final_url). The target's own
+    origin is fetched directly (the user pointed MCPoke at it). Every other
+    host, which a server can name through resource_metadata or
+    authorization_servers, goes through the guarded fetcher: the name is
+    resolved here, non-public addresses are refused at connect time, the
+    connection is pinned to the validated IP, https only, no credentials, and
+    redirects are re-checked hop by hop. Raises _ExtRefusal when refused."""
+    cur = url
+    for _ in range(max_hops + 1):
+        if _origin_of(cur) is not None and _origin_of(cur) == _origin_of(target_url):
+            async with session.get(cur, timeout=aiohttp.ClientTimeout(total=10),
+                                   allow_redirects=False) as r:
+                status, loc = r.status, r.headers.get("Location")
+                text = (await r.text()) if status == 200 else ""
+        else:
+            hop = await _ext_hop(cur, False, False)
+            status, loc, text = hop["status"], hop.get("redirect"), hop.get("text", "")
+        if 300 <= status < 400 and loc:
+            nxt = urllib.parse.urljoin(cur, loc)
+            if cur.lower().startswith("https:") and nxt.lower().startswith("http:"):
+                raise _ExtRefusal("downgrade", f"redirect from https to plaintext http ({nxt})")
+            cur = nxt
+            continue
+        return status, text, cur
+    raise _ExtRefusal("redirects", f"more than {max_hops} redirects")
+
+
+def _prm_resource_matches(resource: str, server_url: str) -> bool:
+    """RFC 9728 3.3: the resource must identify the server it was fetched for.
+    Accepts the exact MCP URL, its origin, or any path prefix of it."""
+    r, s = resource.rstrip("/"), server_url.rstrip("/")
+    return s == r or s.startswith(r + "/")
+
+
+async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None,
+                            server_url: Optional[str] = None) -> dict:
     base   = base_url.rstrip("/")
     meta   = {}
     tests  = []
     finds  = []
+    prm_doc, prm_url = None, None
 
     try:
         session_ctx = _make_session(proxy)
@@ -2215,29 +2525,156 @@ async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None) -> dict:
         return {"error": str(e)}
 
     async with session_ctx as session:
-        # 1: discovery
-        for path in ("/.well-known/oauth-authorization-server",
-                     "/.well-known/openid-configuration"):
+        # 0: Protected Resource Metadata (RFC 9728), the entry point MCP requires.
+        # Order per the MCP authorization spec: the resource_metadata URL from a
+        # 401 WWW-Authenticate header, else the path-inserted well-known URL,
+        # else the root one. Server-supplied URLs are only fetched when they are
+        # the target's own origin or a public https host, never an internal one.
+        sp = urllib.parse.urlsplit(server_url) if server_url else None
+        origin = f"{sp.scheme}://{sp.netloc}" if sp and sp.scheme in ("http", "https") and sp.netloc else base
+        mcp_path = sp.path.rstrip("/") if sp else ""
+        issuers = []
+        if server_url:
+            hdr_url = None
             try:
-                async with session.get(base + path,
-                                       timeout=aiohttp.ClientTimeout(total=10),
-                                       allow_redirects=True) as r:
-                    if r.status == 200:
-                        meta = await r.json(content_type=None)
-                        meta["_discovered_at"] = base + path
+                async with session.post(server_url,
+                                        json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                              "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                                         "clientInfo": {"name": "mcpoke-probe", "version": "1"}}},
+                                        headers={"Accept": "application/json, text/event-stream"},
+                                        timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    wa = r.headers.get("WWW-Authenticate", "")
+                    m = re.search(r'resource_metadata="([^"]+)"', wa)
+                    if m:
+                        hdr_url = urllib.parse.urljoin(server_url, m.group(1))
+                    tests.append({"name": "Unauthenticated MCP request", "status": r.status,
+                                  "body": wa[:200] or "(no WWW-Authenticate header)"})
+            except Exception as e:
+                tests.append({"name": "Unauthenticated MCP request", "error": str(e)})
+            cands = []
+            if hdr_url:
+                risk = _oauth_url_risk(hdr_url, server_url)
+                if risk == "internal":
+                    finds.append({"severity": "high", "category": "OAuth",
+                                  "detail": f"WWW-Authenticate resource_metadata points at an internal/loopback/link-local address ({hdr_url}): a client that follows it is coerced into a client-side SSRF request.",
+                                  "remediation": "Clients must refuse resource_metadata URLs that resolve to internal addresses; servers should only advertise their own public metadata URL."})
+                    tests.append({"name": "PRM (WWW-Authenticate)", "status": "skipped", "body": "not fetched: internal address"})
+                elif risk == "scheme":
+                    tests.append({"name": "PRM (WWW-Authenticate)", "status": "skipped", "body": "not fetched: non-HTTP(S) scheme"})
+                else:
+                    cands.append(("PRM (WWW-Authenticate header)", hdr_url))
+            if mcp_path:
+                cands.append(("PRM (path-inserted)", f"{origin}/.well-known/oauth-protected-resource{mcp_path}"))
+            cands.append(("PRM (root)", f"{origin}/.well-known/oauth-protected-resource"))
+            for label, u in cands:
+                try:
+                    status, text, _final = await _oauth_get(session, u, server_url)
+                    if status == 200:
+                        doc = json.loads(text)
+                        if isinstance(doc, dict):
+                            prm_doc, prm_url = doc, u
+                            tests.append({"name": label, "status": 200, "body": u})
+                            break
+                    elif label.startswith("PRM (WWW"):
+                        tests.append({"name": label, "status": status, "body": u})
+                except _ExtRefusal as e:
+                    tests.append({"name": label, "status": "skipped", "body": f"not fetched ({e.kind}): {e.msg}"})
+                    if e.kind == "internal":
+                        finds.append({"severity": "high", "category": "OAuth",
+                                      "detail": f"{label} URL {u} resolves to an internal/loopback/link-local address ({e.msg}): a client that follows it is coerced into a client-side SSRF request.",
+                                      "remediation": "Clients must resolve server-supplied metadata hosts and refuse non-public addresses at connect time."})
+                except Exception as e:
+                    tests.append({"name": label, "error": str(e)})
+            if prm_doc is not None:
+                servers = prm_doc.get("authorization_servers")
+                good = [x for x in (servers if isinstance(servers, list) else []) if isinstance(x, str) and x]
+                if not good:
+                    finds.append({"severity": "medium", "category": "OAuth",
+                                  "detail": f"Protected Resource Metadata ({prm_url}) has no authorization_servers: the MCP authorization spec requires at least one, so clients cannot discover where to authenticate.",
+                                  "remediation": "List at least one authorization server issuer URL in authorization_servers (RFC 9728)."})
+                res = prm_doc.get("resource")
+                if not isinstance(res, str) or not res:
+                    finds.append({"severity": "medium", "category": "OAuth",
+                                  "detail": f"Protected Resource Metadata ({prm_url}) has no resource identifier (RFC 9728 requires it).",
+                                  "remediation": "Set resource to the MCP server's canonical URI."})
+                elif not _prm_resource_matches(res, server_url):
+                    finds.append({"severity": "medium", "category": "OAuth",
+                                  "detail": f"Protected Resource Metadata resource ({res}) does not match this MCP server ({server_url}): a client must reject it (RFC 9728 3.3); one that does not can be steered into binding tokens to the wrong resource.",
+                                  "remediation": "Make resource equal the MCP server's canonical URI (or an origin/path prefix of it)."})
+                for u in good:
+                    risk = _oauth_url_risk(u, server_url)
+                    if risk == "internal":
+                        finds.append({"severity": "high", "category": "OAuth",
+                                      "detail": f"Authorization server {u} listed in Protected Resource Metadata is an internal/loopback/link-local address: a client that follows authorization_servers is coerced into a client-side SSRF request (including cloud metadata endpoints).",
+                                      "remediation": "Clients must refuse internal authorization-server URLs; servers should list only their real public issuer."})
+                        tests.append({"name": "AS from PRM", "status": "skipped", "body": f"not fetched: {u} is an internal address"})
+                    elif risk == "scheme":
+                        finds.append({"severity": "medium", "category": "OAuth",
+                                      "detail": f"Authorization server {u} listed in Protected Resource Metadata has a non-HTTP(S) scheme.",
+                                      "remediation": "Authorization server issuers must be https URLs."})
+                    else:
+                        if risk == "plaintext":
+                            finds.append({"severity": "medium", "category": "OAuth",
+                                          "detail": f"Authorization server {u} listed in Protected Resource Metadata is served over plaintext http: tokens and codes can be intercepted or the metadata substituted in transit.",
+                                          "remediation": "Serve the authorization server over https."})
+                        issuers.append(u)
+        # 1: authorization-server discovery: the issuers PRM named, then the
+        # target's own origin (and the legacy parent-path base) as fallbacks.
+        for fb in (origin, base):
+            if fb and fb not in issuers:
+                issuers.append(fb)
+        meta_issuer = None
+        for issuer in issuers:
+            for label, u in _as_metadata_urls(issuer):
+                try:
+                    status, text, _final = await _oauth_get(session, u, server_url or origin)
+                    if status == 200:
+                        doc = json.loads(text)
+                        if not isinstance(doc, dict):
+                            continue
+                        meta = doc
+                        meta["_discovered_at"] = u
+                        meta_issuer = issuer
+                        tests.append({"name": label, "status": 200, "body": u})
                         break
-            except Exception:
-                pass
+                except _ExtRefusal as e:
+                    tests.append({"name": label, "status": "skipped", "body": f"not fetched ({e.kind}): {e.msg}"})
+                    if e.kind == "internal":
+                        finds.append({"severity": "high", "category": "OAuth",
+                                      "detail": f"Authorization server {issuer} resolves to an internal/loopback/link-local address ({e.msg}): a client that follows it is coerced into a client-side SSRF request that a text check on the URL would not catch.",
+                                      "remediation": "Clients must resolve authorization-server hosts and refuse non-public addresses at connect time; servers should list only their real public issuer."})
+                    break            # the refusal is about the host, so its other URLs would fail the same way
+                except Exception:
+                    pass
+            if meta:
+                break
 
+        if meta and meta_issuer is not None:
+            claimed = meta.get("issuer")
+            if claimed != meta_issuer:
+                trailing = isinstance(claimed, str) and claimed.rstrip("/") == meta_issuer.rstrip("/")
+                finds.append({"severity": "low" if trailing else "medium", "category": "OAuth",
+                              "detail": f"Authorization server metadata issuer ({claimed!r}) is not identical to the issuer URL used to fetch it ({meta_issuer}): clients must reject such a document (RFC 8414 3.3); one that does not can be fed spoofed metadata.",
+                              "remediation": "Make the issuer value in the metadata identical to the issuer identifier the document is served under."})
         if not meta:
-            return {"metadata": None, "tests": [],
-                    "findings": [{"severity": "info",
-                                  "detail": "No OAuth discovery endpoint found "
-                                            "(/.well-known/oauth-authorization-server "
-                                            "and /.well-known/openid-configuration both absent)"}]}
+            attempted = ", ".join(u for i in issuers for _, u in _as_metadata_urls(i))
+            return {"metadata": None, "tests": tests, "prm": prm_doc, "prm_url": prm_url,
+                    "findings": finds + [{"severity": "info",
+                                  "detail": "No OAuth discovery endpoint found (tried: " + attempted + ")"}]}
 
-        auth_ep  = meta.get("authorization_endpoint")
-        token_ep = meta.get("token_endpoint")
+        def _in_scope(u):
+            """Active probes only hit the target's own origin: the metadata is
+            server-controlled and must not steer MCPoke at third parties or
+            internal hosts."""
+            if not u or not server_url:
+                return u
+            if _origin_of(u) == _origin_of(server_url):
+                return u
+            tests.append({"name": "Active tests", "status": "skipped", "body": f"endpoint outside the target origin: {u}"})
+            return None
+
+        auth_ep  = _in_scope(meta.get("authorization_endpoint"))
+        token_ep = _in_scope(meta.get("token_endpoint"))
 
         # 2: authorization endpoint: request without code_challenge (PKCE bypass)
         if auth_ep:
@@ -2377,7 +2814,7 @@ async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None) -> dict:
         # to the token endpoint) instead: it only probes, and only flags, when a registration
         # endpoint actually exists and accepts a new client with zero authentication, letting
         # any caller self-register an OAuth client against this server.
-        reg_ep = meta.get("registration_endpoint")
+        reg_ep = _in_scope(meta.get("registration_endpoint"))
         if reg_ep:
             try:
                 async with session.post(reg_ep,
@@ -2399,12 +2836,12 @@ async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None) -> dict:
             except Exception as e:
                 tests.append({"name": "DCR: unauthenticated registration", "error": str(e)})
 
-    return {"metadata": meta, "tests": tests, "findings": finds}
+    return {"metadata": meta, "tests": tests, "findings": finds, "prm": prm_doc, "prm_url": prm_url}
 
 
 @app.post("/oauth-probe")
 async def oauth_probe(req: OAuthProbeRequest):
-    return await _run_oauth_probes(req.url, req.proxy)
+    return await _run_oauth_probes(req.url, req.proxy, req.server_url)
 
 
 # ── stdio transport ───────────────────────────────────────────────────────────
@@ -2647,6 +3084,7 @@ async def _connect_stdio(command: str, env: Optional[dict] = None,
             "resources":   res_l     or [],
             "prompts":     prompts_l or [],
             "resource_templates": rt_l or [],
+            "truncated_lists": _truncated_names(tools=tools_l, resources=res_l, prompts=prompts_l, resource_templates=rt_l),
             # Version-only check: stdio always initializes before tools/list (no
             # cold-probe path exists here), so there's no discover-fallback need;
             # this just keeps srv.isModern populated consistently for any manual
@@ -2771,7 +3209,7 @@ async def save_project(request: Request):
     _assert_project_path(PROJECT_FILE)
     data = await request.json()
     PROJECT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PROJECT_FILE.write_text(json.dumps(data), encoding='utf-8')
+    _write_private(PROJECT_FILE, json.dumps(data))
     return {'ok': True, 'name': PROJECT_FILE.stem}
 
 
@@ -3205,9 +3643,11 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 .hist-tab:hover:not(.active) { color: var(--text); }
 .export-opt {
   padding: 5px 12px; font-size: 11px; cursor: pointer; color: var(--text);
-  white-space: nowrap;
+  white-space: nowrap; text-transform: none; letter-spacing: normal; font-weight: 400;
 }
 .export-opt:hover { background: var(--border); }
+.export-hdr { padding: 4px 12px 2px; font-size: 9px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); border-top: 1px solid var(--border); }
+.export-hdr:first-child { border-top: none; }
 .hist-run-select {
   max-width: 45%; background: var(--bg); color: var(--fg);
   border: 1px solid var(--border); border-radius: 4px;
@@ -3368,6 +3808,11 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
   display: inline-flex; align-items: center;
   font-size: 10px; font-weight: 700;
   color: var(--red); cursor: help; vertical-align: middle; margin-left: 3px;
+}
+.icon-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-size: 9px; font-weight: 700; cursor: pointer;
+  vertical-align: middle; margin-left: 4px;
 }
 .inj-findings {
   margin-top: 5px; display: flex; flex-direction: column; gap: 3px;
@@ -3760,6 +4205,20 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 .fb-entry.fb-dir { color:var(--yellow); }
 .fb-entry.fb-file { color:var(--text); }
 .fb-entry.fb-proj { color:var(--accent); }
+#sev-overlay { position:fixed;inset:0;z-index:5200;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center; }
+#sev-dialog { background:var(--surface);border:1px solid var(--border);border-radius:8px;width:480px;max-width:96vw;max-height:86vh;overflow:auto;padding:1rem;display:flex;flex-direction:column;gap:.6rem;font-size:12px; }
+#sev-dialog h3 { margin:0;font-size:14px; }
+#sev-dialog label { display:flex;flex-direction:column;gap:.25rem;color:var(--muted);font-size:11px; }
+#sev-dialog select, #sev-dialog textarea { background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:.3rem .4rem;font-size:12px;font-family:inherit; }
+.sev-sub { color:var(--muted);font-size:11px;word-break:break-word; }
+.sev-warn { color:#e3b341;font-size:11px; }
+#sev-err { color:var(--red);font-size:11px;min-height:1em; }
+.sev-btns { display:flex;gap:.4rem; }
+.sev-log { border-top:1px solid var(--border);padding-top:.5rem; }
+.sev-log-h { font-size:9px;letter-spacing:.06em;color:var(--muted);text-transform:uppercase;margin-bottom:.25rem; }
+.sev-log-row { font-size:11px;font-family:monospace;padding:.1rem 0;word-break:break-word; }
+.sev-was { font-size:9px;color:var(--muted); }
+#fb-warn { padding:.5rem .8rem;border-top:1px solid #5a4a1a;background:#2d2410;color:#e3b341;font-size:11px;line-height:1.4; }
 #fb-footer { padding:.6rem .8rem;border-top:1px solid var(--border);display:flex;gap:.4rem;align-items:center; }
 #fb-filename { flex:1;font-size:12px;padding:.3rem .5rem;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:monospace; }
 </style>
@@ -3848,6 +4307,8 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
         placeholder="DATABASE_URL=postgres://...&#10;API_KEY=secret"
         title="Environment variables injected into the subprocess (one per line, KEY=VALUE)"></textarea>
       <button class="btn-green" onclick="addServerFromForm()">+ Connect</button>
+      <button class="btn-sm" id="find-endpoint-btn" onclick="discoverEndpoints()" style="width:100%;margin-top:4px"
+        title="Try the usual MCP paths on this host (/mcp, /, /rpc, /api, /v1 for Streamable HTTP; /sse, /events, /stream for legacy SSE) and show which one answers. Nothing is connected.">Find endpoint</button>
     </div>
   </div>
 
@@ -3973,25 +4434,12 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
     <div style="display:flex;gap:0.4rem;align-items:center">
       <button class="btn-sm" id="hist-diff-btn" style="display:none;color:#58a6ff;border-color:#1a3a5c" onclick="openDiffModal()">&#8942; Diff (2)</button>
       <button class="btn-sm" id="hist-del-sel-btn" style="display:none;color:#f85149;border-color:#5a1a1a" onclick="deleteHistoryChecked()">&#x2715; Delete Selected</button>
-      <button class="btn-sm" id="hist-export-json" onclick="exportHistory()">Export JSON</button>
-      <button class="btn-sm" id="hist-export-md"   onclick="exportMarkdown()">Export MD</button>
-      <button class="btn-sm" id="hist-export-html"  onclick="exportHTML()">Export HTML</button>
       <button class="btn-sm" id="hist-clear"        onclick="clearHistory()">Clear History</button>
       <button class="btn-sm findings-show-suppressed-btn" id="findings-show-suppressed" style="display:none" onclick="toggleShowSuppressed()">Show Suppressed Finds (0)</button>
       <button class="btn-sm" id="findings-clear" style="display:none" onclick="clearFindings()">Clear Findings</button>
       <button class="btn-sm" id="findings-add" style="display:none" onclick="openAddFindingModal()">&#x2b; Add Finding</button>
       <button class="btn-sm" id="notif-clear" style="display:none" onclick="clearNotifications()">Clear Notifications</button>
-      <div id="findings-export-wrap" style="display:none;position:relative">
-        <button class="btn-sm" onclick="toggleFindingsExportMenu()">Export &#9662;</button>
-        <div id="findings-export-menu" style="display:none;position:absolute;right:0;top:100%;margin-top:2px;
-             background:var(--surface);border:1px solid var(--border);border-radius:4px;
-             z-index:100;min-width:110px;box-shadow:0 4px 12px rgba(0,0,0,.4)">
-          <div class="export-opt" onclick="exportFindings('csv')">CSV</div>
-          <div class="export-opt" onclick="exportFindings('json')">JSON</div>
-          <div class="export-opt" onclick="exportFindings('md')">Markdown</div>
-          <div class="export-opt" onclick="exportHTML()">Full HTML Report</div>
-        </div>
-      </div>
+      <span id="export-slot-main"></span>
     </div>
   </div>
   <div style="padding:.25rem .4rem;border-bottom:1px solid var(--border);display:flex;gap:.3rem" id="hist-filter-bar">
@@ -4073,8 +4521,9 @@ const S = {
   httpMode: false,
   findingStatus:    JSON.parse(localStorage.getItem('mcpoke-finding-status')    || '{}'),
   findingNotes:     JSON.parse(localStorage.getItem('mcpoke-finding-notes')     || '{}'),
+  findingSeverity:  JSON.parse(localStorage.getItem('mcpoke-finding-severity')  || '{}'),  // fp -> [{from,to,reason,at}], newest last
   findingDismissed: new Set(JSON.parse(localStorage.getItem('mcpoke-finding-dismissed') || '[]')),
-  fview: {sev: '', category: '', server: '', status: '', group: false, cross: false, grid: false},  // findings triage filters (not persisted)
+  fview: {sev: '', category: '', server: '', status: '', group: false, cross: false, grid: false, mod: false},  // findings triage filters (not persisted)
   showSuppressed: false,  // when true, dismissed findings render greyed-out with an Undismiss button
   histChecked: [],  // up to 2 history entry IDs selected for diff
   histSeq: 0,       // next history entry id; only ever increases, so an id is never reused
@@ -4210,6 +4659,7 @@ function showError(msg) {
   clearTimeout(b._t);
   b._t = setTimeout(() => b.style.display = 'none', 8000);
 }
+const SENSITIVE_FILE_NOTE = 'Project and session files can contain tokens, custom headers, and data returned by servers. Treat them like credentials: do not share them or commit them to git.';
 function hideError() { document.getElementById('err-banner').style.display = 'none'; }
 
 // ── JSON highlighting ──────────────────────────────────────────────────────
@@ -4249,6 +4699,7 @@ async function loadCache() {
         srv.resources  = _cleanListItems(entry.resources || []);
         srv.prompts    = _cleanListItems(entry.prompts   || []);
         srv.resourceTemplates = _cleanListItems(entry.resource_templates || []);
+        srv.truncatedLists = entry.truncated_lists || [];
         srv.transport  = entry.transport;
         srv.findings   = scanServerFindings(srv);
         _runServerInstructionsChecks(srv);
@@ -4291,6 +4742,67 @@ function addServerFromForm() {
   document.getElementById('add-proxy').value   = '';
   document.getElementById('add-headers').value = '';
   connectServer(url, token, proxy, hdrs);
+}
+
+
+// Try the usual MCP paths on the host in the URL box and let the user pick one.
+// Nothing is connected: "Use" only fills the URL box.
+const _DISC_BADGE = {mcp: ['MCP (HTTP)', '#3fb950'], sse: ['MCP (SSE)', '#3fb950'], auth: ['needs auth', '#e3b341'],
+                     possible: ['maybe', '#8b949e'], none: ['no', 'var(--muted)']};
+async function discoverEndpoints() {
+  const raw = document.getElementById('add-url').value.trim();
+  if (!raw) { showError('Enter a host or URL first (for example localhost:9000), then click Find endpoint.'); return; }
+  const url   = normalizeUrl(raw);
+  const token = document.getElementById('add-tok').value.trim() || null;
+  const proxy = document.getElementById('add-proxy').value.trim() || null;
+  const hdrs  = parseCustomHeaders(document.getElementById('add-headers').value);
+  document.getElementById('disc-overlay')?.remove();
+  const ov = document.createElement('div');
+  ov.id = 'disc-overlay';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:3000;display:flex;align-items:center;justify-content:center';
+  ov.innerHTML = `
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(820px,96vw);max-height:80vh;display:flex;flex-direction:column;overflow:hidden">
+      <div style="display:flex;align-items:center;gap:0.6rem;padding:0.7rem 1rem;border-bottom:1px solid var(--border);background:var(--bg)">
+        <span style="font-weight:700;font-size:13px">Find endpoint</span>
+        <span id="disc-prog" style="flex:1;color:var(--muted);font-size:11px">Probing…</span>
+        <button class="btn-sm" onclick="document.getElementById('disc-overlay').remove()">&#x2715; Close</button>
+      </div>
+      <div style="overflow-y:auto;padding:0.8rem 1rem">
+        <table style="width:100%;border-collapse:collapse;font-size:11px">
+          <thead><tr style="border-bottom:1px solid var(--border)">
+            <th style="text-align:left;padding:0.3rem 0.4rem">Path</th><th style="text-align:left;padding:0.3rem 0.4rem">Result</th>
+            <th style="text-align:left;padding:0.3rem 0.4rem;width:50px">HTTP</th><th style="text-align:left;padding:0.3rem 0.4rem">Detail</th><th></th></tr></thead>
+          <tbody id="disc-tbody"></tbody>
+        </table>
+        <div style="margin-top:0.6rem;color:var(--muted);font-size:10px">Streamable HTTP is tested with a real initialize POST, legacy SSE with a GET. Only this host is contacted, redirects are not followed, and your token and headers (if set) are sent to each path. Nothing connects until you click Use and then Connect.</div>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  ov.addEventListener('click', e => { if (e.target === ov) ov.remove(); });
+  const prog = document.getElementById('disc-prog'), tbody = document.getElementById('disc-tbody');
+  try {
+    const res = await fetch('/discover-endpoints', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url, token, proxy, custom_headers: hdrs && Object.keys(hdrs).length ? hdrs : null})});
+    const data = await res.json();
+    if (data.error || data.detail) { prog.textContent = '⚠ ' + (data.error || JSON.stringify(data.detail)); return; }
+    const hits = data.results.filter(r => r.verdict === 'mcp' || r.verdict === 'sse').length;
+    prog.textContent = `${data.origin}: ${hits ? hits + ' MCP endpoint' + (hits > 1 ? 's' : '') + ' found' : 'no MCP endpoint answered'}`;
+    tbody.innerHTML = data.results.map((r, i) => {
+      const [label, col] = _DISC_BADGE[r.verdict] || _DISC_BADGE.none;
+      const usable = r.verdict !== 'none';
+      return `<tr style="border-bottom:1px solid var(--border);${r.verdict === 'none' ? 'opacity:.55' : ''}">
+        <td style="padding:0.25rem 0.4rem;font-family:monospace">${esc(r.path)}${r.typed ? ' <span style="color:var(--muted)">(typed)</span>' : ''} <span style="color:var(--muted)">${esc(r.transport === 'sse' ? 'SSE' : 'HTTP')}</span></td>
+        <td style="padding:0.25rem 0.4rem"><span class="badge" style="background:${col};color:#fff">${esc(label)}</span></td>
+        <td style="padding:0.25rem 0.4rem">${esc(String(r.status || 'err'))}</td>
+        <td style="padding:0.25rem 0.4rem;color:var(--muted);word-break:break-all">${esc(r.detail)}</td>
+        <td style="padding:0.25rem 0.4rem">${usable ? `<button class="btn-sm" style="font-size:10px;padding:1px 6px" data-i="${i}">Use</button>` : ''}</td></tr>`;
+    }).join('');
+    tbody.querySelectorAll('button[data-i]').forEach(b => b.addEventListener('click', () => {
+      document.getElementById('add-url').value = data.results[Number(b.dataset.i)].url;
+      ov.remove();
+      document.getElementById('add-url').focus();
+    }));
+  } catch (e) { prog.textContent = '⚠ ' + e.message; }
 }
 
 document.getElementById('add-url').addEventListener('keydown', e => {
@@ -4339,6 +4851,7 @@ async function connectStdioServer(command, env) {
       srv.resources  = _cleanListItems(data.resources || []);
       srv.prompts    = _cleanListItems(data.prompts   || []);
       srv.resourceTemplates = _cleanListItems(data.resource_templates || []);
+      srv.truncatedLists = data.truncated_lists || [];
       srv.isModern   = data.is_modern || false;
       srv.discover   = null;
       srv.discoverEvidence = null;
@@ -4414,6 +4927,7 @@ async function connectServer(url, token, proxy, customHeaders) {
       srv.resources       = _cleanListItems(data.resources || []);
       srv.prompts         = _cleanListItems(data.prompts   || []);
       srv.resourceTemplates = _cleanListItems(data.resource_templates || []);
+      srv.truncatedLists  = data.truncated_lists || [];
       srv.responseHeaders = data.response_headers || null;
       srv.connectProbe    = data.connect_probe || null;
       srv.noInitProbe     = data.no_init_probe || false;
@@ -7071,13 +7585,11 @@ function switchHistTab(name) {
     document.getElementById('htab-' + t).classList.toggle('active', t === name);
     document.getElementById(t === 'history' ? 'hist-view' : t + '-view').style.display = t === name ? '' : 'none';
   });
-  document.getElementById('hist-export-json').style.display     = name === 'history'  ? '' : 'none';
-  document.getElementById('hist-export-md').style.display       = name === 'history'  ? '' : 'none';
   document.getElementById('hist-clear').style.display           = name === 'history'  ? '' : 'none';
   document.getElementById('findings-show-suppressed').style.display = name === 'findings' ? '' : 'none';
   document.getElementById('findings-clear').style.display       = name === 'findings' ? '' : 'none';
   document.getElementById('findings-add').style.display         = name === 'findings' ? '' : 'none';
-  document.getElementById('findings-export-wrap').style.display = name === 'findings' ? '' : 'none';
+  document.getElementById('export-slot-main').style.display     = name === 'notifications' ? 'none' : '';
   document.getElementById('hist-filter-bar').style.display      = name === 'history'  ? 'flex' : 'none';
   document.getElementById('findings-filter-bar').style.display  = name === 'findings' ? '' : 'none';
   document.getElementById('findings-triage').style.display      = name === 'findings' ? '' : 'none';
@@ -8242,13 +8754,15 @@ function _runToolResultChecks(srv, toolName, body, historyId) {
   const content = Array.isArray(rpcResult.content) ? rpcResult.content : [];
   for (const c of content) {
     if (!c || c.type !== 'resource_link' || typeof c.uri !== 'string') continue;
-    const risk = iconHostRisk(c.uri, srvShort);
+    const risk = iconHostRisk(c.uri, srv.url);
     if (risk) {
       const reason = risk === 'internal'
         ? 'points at an internal/loopback/link-local address: a client that auto-fetches resource_link targets is coerced into a client-side SSRF request, including cloud metadata endpoints'
-        : (risk === 'offhost'
+        : (risk === 'port'
+          ? 'targets a different port on the MCP server\'s own internal host: a client that auto-fetches resource_link targets is steered into probing another local service'
+          : (risk === 'offhost'
             ? 'is a remote URL on a host different from the MCP server: a tracking beacon or exfiltration channel if the client auto-fetches resource_link targets'
-            : 'is served over plaintext HTTP: content can be substituted in transit (MITM) if the client auto-fetches it');
+            : 'is served over plaintext HTTP while the MCP server uses HTTPS: content can be substituted in transit (MITM) if the client auto-fetches it'));
       _pushFindingDedup(srv, mkFinding('resource-link-unsafe', risk === 'internal' ? 'high' : 'medium', 'Client-Side SSRF',
         `Tool "${toolName}" returned a resource_link (${c.name || c.uri}) whose URI ${reason}: ${c.uri}`,
         'Never auto-fetch resource_link URIs without validating scheme/host first. Restrict to the MCP server\'s own origin or an explicit allowlist; block internal/loopback/link-local targets client-side.'));
@@ -8420,30 +8934,60 @@ function deleteManualFinding(id) {
   renderFindings();
 }
 
-function toggleFindingsExportMenu() {
-  const menu = document.getElementById('findings-export-menu');
-  menu.style.display = menu.style.display === 'none' ? '' : 'none';
+// One Export dropdown, used on the History and Findings tabs and in both
+// full-screen modals, with each choice labelled by what it exports.
+function exportDropdown(id, up) {
+  const opt = (fn, label, tip) => `<div class="export-opt" onclick="closeExportMenus();${fn}"${tip ? ` title="${tip}"` : ''}>${label}</div>`;
+  return `<div class="export-wrap" style="position:relative;display:inline-block">
+    <button class="btn-sm" onclick="toggleExportMenu('${id}')">Export &#9662;</button>
+    <div class="export-menu" id="${id}" style="display:none;position:absolute;right:0;${up ? 'bottom:100%;margin-bottom:2px' : 'top:100%;margin-top:2px'};
+         background:var(--surface);border:1px solid var(--border);border-radius:4px;
+         z-index:100;min-width:230px;box-shadow:0 4px 12px rgba(0,0,0,.4)">
+      <div class="export-hdr">Findings</div>
+      ${opt('exportHTML()', 'Report: HTML (servers + findings)', 'Servers and findings. Request history is exported separately below.')}
+      ${opt("exportFindings('csv')", 'Findings: CSV')}
+      ${opt("exportFindings('json')", 'Findings: JSON')}
+      ${opt("exportFindings('md')", 'Findings: Markdown')}
+      <div class="export-hdr">Request history</div>
+      ${opt('exportHistory()', 'History: JSON')}
+      ${opt('exportMarkdown()', 'History: Markdown')}
+      ${opt('exportHistoryHTML()', 'History: HTML', 'Request history only, as a standalone HTML file')}
+    </div>
+  </div>`;
+}
+
+document.getElementById('export-slot-main').innerHTML = exportDropdown('export-menu-main', true);
+
+function closeExportMenus() {
+  document.querySelectorAll('.export-menu').forEach(m => { m.style.display = 'none'; });
+}
+
+function toggleExportMenu(id) {
+  const menu = document.getElementById(id);
+  if (!menu) return;
+  const open = menu.style.display === 'none';
+  closeExportMenus();
+  menu.style.display = open ? '' : 'none';
 }
 
 document.addEventListener('click', e => {
-  const wrap = document.getElementById('findings-export-wrap');
-  const menu = document.getElementById('findings-export-menu');
-  if (menu && !wrap.contains(e.target)) menu.style.display = 'none';
+  if (!e.target.closest('.export-wrap')) closeExportMenus();
 });
 
 function exportFindings(fmt) {
-  document.getElementById('findings-export-menu').style.display = 'none';
+  closeExportMenus();
   const findings = buildFindings();
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   let content, mime, ext;
 
   if (fmt === 'csv') {
     const escape = v => '"' + String(v || '').replace(/"/g, '""') + '"';
-    const rows = [['Severity','Status','Category','Server','Item','Detail','Remediation','Notes','Source'].map(escape).join(',')];
+    const rows = [['Severity','Status','Category','Server','Item','Detail','Remediation','Notes','Source','Baseline Severity','Severity Adjusted','Severity Reason'].map(escape).join(',')];
     for (const f of findings) {
       const fp = findingFp(f);
       rows.push([f.severity, S.findingStatus[fp] || 'open', f.category, f.server, f.item, f.detail,
-                 f.remediation || '', S.findingNotes[fp] || '', f.source || 'auto'].map(escape).join(','));
+                 f.remediation || '', S.findingNotes[fp] || '', f.source || 'auto',
+                 f.baselineSeverity || f.severity, f.sevOverride ? 'yes' : 'no', f.sevOverride ? f.sevOverride.reason : ''].map(escape).join(','));
     }
     content = rows.join('\r\n');
     mime = 'text/csv'; ext = 'csv';
@@ -8451,7 +8995,11 @@ function exportFindings(fmt) {
   } else if (fmt === 'json') {
     const annotated = findings.map(f => {
       const fp = findingFp(f);
-      return {...f, status: S.findingStatus[fp] || 'open', notes: S.findingNotes[fp] || ''};
+      const {baselineSeverity, sevOverride, sevStale, ...rest} = f;
+      return {...rest, baselineSeverity: baselineSeverity || f.severity, severityAdjusted: !!sevOverride,
+              severityReason: sevOverride ? sevOverride.reason : '', severityBaselineChanged: !!sevStale,
+              severityLog: S.findingSeverity[fp] || [],
+              status: S.findingStatus[fp] || 'open', notes: S.findingNotes[fp] || ''};
     });
     content = JSON.stringify({exported: now, findings: annotated}, null, 2);
     mime = 'application/json'; ext = 'json';
@@ -8461,13 +9009,14 @@ function exportFindings(fmt) {
       `**Total:** ${findings.length}`, ''];
     const bySev = {};
     for (const f of findings) (bySev[f.severity] = bySev[f.severity] || []).push(f);
-    for (const sev of ['critical','high','medium','info']) {
+    for (const sev of ['critical','high','medium','low','info']) {
       if (!bySev[sev]) continue;
       lines.push(`## ${sev.charAt(0).toUpperCase() + sev.slice(1)}`, '');
       for (const f of bySev[sev]) {
         const fp = findingFp(f);
         lines.push(`### ${f.category}: ${f.item}`);
         lines.push(`**Server:** ${f.server}  `);
+        if (f.sevOverride) lines.push(`**Severity:** ${f.severity} (adjusted by tester from baseline ${f.baselineSeverity}; reason: ${f.sevOverride.reason})  `);
         lines.push(`**Detail:** ${f.detail}  `);
         if (f.remediation) lines.push(`**Remediation:** ${f.remediation}  `);
         if (S.findingNotes[fp]) lines.push(`**Notes:** ${S.findingNotes[fp]}  `);
@@ -8499,33 +9048,152 @@ function normalizeHomoglyphs(s) {
   return s.split('').map(c => _CONFUSABLE_MAP[c] || c).join('');
 }
 
+// Internal-address checks for IP literals. The URL parser has already
+// normalised decimal/hex/octal IPv4 ("2130706433", "0x7f.1") to dotted form
+// and IPv6 to compressed hex words, so these only see canonical text.
+function _v4Internal(o) {
+  const [a, b, c] = o;
+  return a === 0 || a === 10 || a === 127 || a >= 224 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 0 && c === 0) ||
+    (a === 192 && b === 168) ||
+    (a === 198 && (b === 18 || b === 19));
+}
+function _parseV6(h) {
+  const m = h.replace(/^\[|\]$/g, '').split('%')[0];
+  if (!/^[0-9a-f:]+$/i.test(m) || (m.match(/::/g) || []).length > 1) return null;
+  const [l, r] = m.split('::');
+  const L = l ? l.split(':') : [], R = r ? r.split(':') : [];
+  const fill = m.includes('::') ? 8 - L.length - R.length : 0;
+  if (fill < 0 || (!m.includes('::') && L.length !== 8)) return null;
+  const w = [...L, ...Array(fill).fill('0'), ...R].map(x => parseInt(x || '0', 16));
+  return (w.length === 8 && w.every(x => x >= 0 && x <= 0xffff)) ? w : null;
+}
+function _v6Internal(w) {
+  const v4 = (hi, lo) => _v4Internal([hi >> 8, hi & 255, lo >> 8, lo & 255]);
+  if (w.slice(0, 5).every(x => x === 0)) {                  // ::, ::1, ::ffff:a.b.c.d, ::a.b.c.d
+    if (w[5] === 0xffff || w[5] === 0) return (w[5] === 0 && w[6] === 0 && w[7] <= 1) || v4(w[6], w[7]);
+  }
+  if (w[0] === 0x64 && w[1] === 0xff9b && w.slice(2, 6).every(x => x === 0)) return v4(w[6], w[7]);  // NAT64
+  if (w[0] === 0x2002) return v4(w[1], w[2]);                // 6to4
+  return (w[0] & 0xfe00) === 0xfc00 || (w[0] & 0xffc0) === 0xfe80 ||
+         (w[0] & 0xffc0) === 0xfec0 || (w[0] & 0xff00) === 0xff00;
+}
+// Wildcard-DNS names that always embed their answer ("127.0.0.1.nip.io").
+const _ALWAYS_LOOPBACK = /(^|\.)(localtest\.me|lvh\.me|vcap\.me|lacolhost\.com)$/;
+const _EMBED_IP_DNS = /(^|\.)(nip\.io|sslip\.io|xip\.io)$/;
+
+// What we know about the connected MCP server: hostname, effective port and
+// whether it was reached over https. Accepts a full URL (preferred) or a bare
+// host[:port] (legacy callers; scheme then unknown, treated as https).
+function _srvInfo(serverRef) {
+  const ref = serverRef || '';
+  try {
+    const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(ref) ? ref : 'https://' + ref);
+    const https = /^https:/i.test(ref) || !/^[a-z][a-z0-9+.-]*:\/\//i.test(ref);
+    return {host: u.hostname.toLowerCase().replace(/\.$/, ''), port: u.port || (u.protocol === 'http:' ? '80' : '443'),
+            https, hasPort: !!u.port || /^[a-z][a-z0-9+.-]*:\/\//i.test(ref)};
+  } catch (e) { return {host: '', port: '', https: true, hasPort: false}; }
+}
+
 // Classify an icon URL as a client-side SSRF risk (MCP-056). Returns
-// 'internal' | 'offhost' | 'plaintext' | null. serverHost is host[:port] of
-// the connected MCP server (used to detect off-host/beacon fetches).
-function iconHostRisk(src, serverHost) {
+// 'internal' | 'port' | 'offhost' | 'plaintext' | null. serverRef is the MCP
+// server's URL (or host[:port]). An icon on the server's own host AND port is
+// the server's own content, not an SSRF; same host on another port is 'port'.
+function iconHostRisk(src, serverRef) {
   let u;
   try { u = new URL(src, 'http://placeholder.invalid'); } catch (e) { return null; }
   const scheme = (u.protocol || '').replace(':', '').toLowerCase();
   if (scheme !== 'http' && scheme !== 'https') return null;
-  const host = (u.hostname || '').toLowerCase();
+  let host = (u.hostname || '').toLowerCase().replace(/\.$/, '');
   if (!host || host === 'placeholder.invalid') return null;
-  // Internal / loopback / link-local / private / .internal / localhost
-  const internal =
-    host === 'localhost' || host.endsWith('.localhost') ||
-    host.endsWith('.internal') || host.endsWith('.local') ||
-    host === '169.254.169.254' || host.startsWith('169.254.') ||
-    host === '127.0.0.1' || host.startsWith('127.') ||
-    host === '::1' || host === '0.0.0.0' ||
-    /^10\./.test(host) || /^192\.168\./.test(host) ||
-    /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host) ||
-    /^metadata\./.test(host);
-  if (internal) return 'internal';
-  // Off-host remote fetch (host differs from the MCP server's own host)
-  const srvHost = (serverHost || '').split(':')[0].toLowerCase();
-  if (srvHost && host !== srvHost) return 'offhost';
-  // Same-host but plaintext
-  if (scheme === 'http') return 'plaintext';
+  let internal = false;
+  if (host.startsWith('[')) {
+    const w = _parseV6(host);
+    internal = !w || _v6Internal(w);                         // unparseable v6: treat as hostile
+  } else if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    internal = _v4Internal(host.split('.').map(Number));
+  } else {
+    const emb = _EMBED_IP_DNS.test(host) && host.match(/(\d{1,3})[.-](\d{1,3})[.-](\d{1,3})[.-](\d{1,3})\.(?:nip|sslip|xip)\.io$/);
+    internal =
+      host === 'localhost' || host.endsWith('.localhost') ||
+      host.endsWith('.internal') || host.endsWith('.local') ||
+      host.endsWith('.lan') || host.endsWith('.intranet') || host.endsWith('.home.arpa') ||
+      /^metadata\./.test(host) || _ALWAYS_LOOPBACK.test(host) ||
+      !host.includes('.') ||                                  // single-label name: only resolves on an internal network
+      (!!emb && _v4Internal(emb.slice(1, 5).map(Number)));
+  }
+  const srv = _srvInfo(serverRef);
+  const sameHost = !!srv.host && host === srv.host;
+  const iconPort = u.port || (scheme === 'https' ? '443' : '80');
+  if (internal) {
+    if (!sameHost) return 'internal';
+    // Same internal host as the server: a different port is a probe of another
+    // local service; the same port is just the server's own content.
+    if (srv.hasPort && iconPort !== srv.port) return 'port';
+  } else if (srv.host && !sameHost) {
+    return 'offhost';           // remote fetch to a host other than the MCP server's own
+  }
+  // Same host: plaintext only matters when the server itself is on https
+  if (scheme === 'http' && srv.https) return 'plaintext';
   return null;
+}
+
+// Every risky icons[] entry on one tool/resource/prompt, worst first.
+// Single source of truth for the findings rows, the list badge and the detail
+// pane. 'scheme' = file:/ftp:/javascript:/etc.; data: icons are inert.
+// iconHostRisk plus 'scheme' for non-HTTP(S), non-data URLs (file:, ftp:, javascript:...).
+function _urlRisk(src, serverRef) {
+  if (/^\s*data:/i.test(src)) return null;
+  const risk = iconHostRisk(src, serverRef);
+  if (risk) return risk;
+  const m = /^\s*([a-z][a-z0-9+.-]*):/i.exec(src);
+  return (m && !/^(https?|data)$/i.test(m[1])) ? 'scheme' : null;
+}
+const _ICON_RANK = {internal: 0, scheme: 1, port: 2, offhost: 3, plaintext: 4};
+function iconRisksFor(item, serverHost) {
+  const out = [];
+  for (const ic of (item && Array.isArray(item.icons) ? item.icons : [])) {
+    const src = ic && typeof ic.src === 'string' ? ic.src
+              : (ic && typeof ic.url === 'string' ? ic.url : '');
+    if (!src || /^data:/i.test(src)) continue;
+    const risk = _urlRisk(src, serverHost);
+    if (risk) out.push({src, risk});
+  }
+  return out.sort((x, y) => _ICON_RANK[x.risk] - _ICON_RANK[y.risk]);
+}
+function _iconServerHost() { return S.activeUrl || ''; }
+const _ICON_LABEL = {internal: 'internal', scheme: 'scheme', port: 'other port', offhost: 'offhost', plaintext: 'http'};
+const _ICON_COLOR = {internal: 'var(--red)', scheme: 'var(--red)', port: '#e3b341', offhost: '#e3b341', plaintext: '#8b949e'};
+const _ICON_TIP = {
+  internal: 'points at an internal/loopback/link-local address (client-side SSRF)',
+  scheme: 'uses a non-HTTP scheme the client may resolve locally',
+  port: 'targets a different port on the server\'s own internal host (probe of another local service)',
+  offhost: 'is a remote host different from the MCP server (tracking beacon)',
+  plaintext: 'is served over plaintext HTTP (MITM-substitutable)',
+};
+function iconBadge(item, kind) {
+  const r = iconRisksFor(item, _iconServerHost());
+  if (!r.length) return '';
+  const name = item.name || item.uri || '';
+  const tip = r.map(x => `icon ${_ICON_TIP[x.risk]}: ${x.src}`).join('\n') + '\n(click to see the finding)';
+  return `<span class="icon-badge" style="color:${_ICON_COLOR[r[0].risk]}" data-kind="${esc(kind)}" data-name="${esc(name)}" title="${esc(tip)}">&#128247; icon: ${_ICON_LABEL[r[0].risk]}${r.length > 1 ? ' +' + (r.length - 1) : ''}</span>`;
+}
+function iconDetailHtml(item) {
+  const r = iconRisksFor(item, _iconServerHost());
+  if (!r.length) return '';
+  return `<div class="inj-findings">${r.map(x =>
+    `<div class="inj-finding" style="color:${_ICON_COLOR[x.risk]}"><span class="inj-field">icon ${esc(_ICON_LABEL[x.risk])}</span>${esc(_ICON_TIP[x.risk])}: <em>${esc(x.src)}</em></div>`).join('')}</div>`;
+}
+function jumpToIconFinding(kind, name) {
+  switchHistTab('findings');
+  const inp = document.getElementById('findings-filter');
+  if (inp) inp.value = `${kind}:${name}`;
+  const mi = document.getElementById('findings-modal-filter');
+  if (mi) mi.value = `${kind}:${name}`;
+  renderFindings();
 }
 
 // Hoisted out of scanServerFindings (module scope, not function-local) so
@@ -8586,6 +9254,20 @@ function scanServerFindings(srv) {
   srv.opaqueParamTools = Object.create(null);
   srv.splitLedger = new Map();
   srv.recentMsgs = []; srv.msgSeq = 0;
+
+  // Pagination cap: the scan only saw the first MAX_LIST_PAGES pages of a list.
+  if (srv.truncatedLists?.length) {
+    const names = srv.truncatedLists.map(k => k === 'resource_templates' || k === 'resourceTemplates' ? 'resource templates' : k).join(', ');
+    rows.push({
+      severity: 'medium',
+      category: 'Protocol',
+      server: srvShort,
+      item: 'pagination-cap',
+      detail: `Pagination cap reached for ${names}: server was still returning nextCursor after ${MAX_LIST_PAGES} pages, so later items were never fetched or scanned. A malicious entry can hide past the cap.`,
+      remediation: 'Review the server directly and check the unfetched pages. A legitimate server rarely needs more than a few pages; endless cursors are a way to hide entries or stall a client.',
+      serverUrl: srv.url,
+    });
+  }
 
   // MCP-003: responds to tool calls without initialize handshake
   // Auto-detected at connect time (srv.noInitProbeEvidence): a manual re-fire of the
@@ -8959,25 +9641,30 @@ function scanServerFindings(srv) {
     ['resource', srv.resources],
     ['prompt',   srv.prompts],
   ];
+  const _ICON_CATEGORY = {
+    internal:  'Client-Side SSRF',
+    port:      'Client-Side SSRF',
+    scheme:    'Icon Scheme Abuse',
+    offhost:   'Icon Tracking Beacon',
+    plaintext: 'Insecure Icon Transport',
+  };
   for (const [kind, items] of _iconGroups) {
     for (const it of (items || [])) {
-      const icons = it && Array.isArray(it.icons) ? it.icons : [];
       const itemName = it.name || it.uri || '(unnamed)';
-      for (const ic of icons) {
-        const src = ic && typeof ic.src === 'string' ? ic.src
-                  : (ic && typeof ic.url === 'string' ? ic.url : '');
-        if (!src || /^data:/i.test(src)) continue;
-        const risk = iconHostRisk(src, srvShort);
-        if (!risk) continue;
-        const sev    = risk === 'internal' ? 'high' : (risk === 'offhost' ? 'medium' : 'low');
+      for (const {src, risk} of iconRisksFor(it, srv.url)) {
+        const sev    = risk === 'internal' ? 'high' : (risk === 'plaintext' ? 'low' : 'medium');
         const reason = risk === 'internal'
           ? 'points at an internal/loopback/link-local address: the client is coerced into a request an external attacker cannot make (client-side SSRF), including cloud metadata endpoints'
-          : (risk === 'offhost'
-              ? 'is a remote URL on a host different from the MCP server: a tracking beacon that leaks the operator\'s IP and activity timing on every render'
-              : 'is served over plaintext HTTP: the rendered icon can be substituted in transit (MITM)');
+          : (risk === 'port'
+            ? 'targets a different port on the MCP server\'s own internal host: the client is steered into probing another local service'
+          : (risk === 'scheme'
+              ? 'uses a non-HTTP(S) scheme (file:, ftp:, javascript:, ...): a client that resolves it locally can read local files or run unexpected handlers'
+              : (risk === 'offhost'
+                  ? 'is a remote URL on a host different from the MCP server: a tracking beacon that leaks the operator\'s IP and activity timing on every render'
+                  : 'is served over plaintext HTTP while the MCP server uses HTTPS: the rendered icon can be substituted in transit (MITM)')));
         rows.push({
           severity: sev,
-          category: 'Client-Side SSRF',
+          category: _ICON_CATEGORY[risk] || 'Client-Side SSRF',
           server: srvShort,
           item: `${kind}:${itemName}`,
           detail: `Icon src ${reason}: ${src}`,
@@ -9008,7 +9695,7 @@ function scanServerFindings(srv) {
         remediation: APPS_REMEDIATION,
       });
     } else {
-      const risk = (scheme === 'http' || scheme === 'https') ? iconHostRisk(uri, srvShort) : null;
+      const risk = (scheme === 'http' || scheme === 'https') ? iconHostRisk(uri, srv.url) : null;
       const extra = risk === 'internal'
         ? ' The target is an internal/loopback/metadata address: the host is coerced into a client-side SSRF request.'
         : (scheme === 'data' ? ' The UI is an inline data: URI: arbitrary HTML/JS embedded directly in tool metadata.' : '');
@@ -9079,8 +9766,11 @@ function buildFindings() {
     });
   }
 
-  rows.sort((a, b) => (SEV_ORD[a.severity] ?? 4) - (SEV_ORD[b.severity] ?? 4));
-  return rows.filter(f => S.showSuppressed || !S.findingDismissed.has(findingFp(f)));
+  // Tester severity overrides: the stored finding keeps our baseline rating;
+  // a display copy carries the effective one plus the record of the change.
+  const effective = rows.map(applySeverityOverride);
+  effective.sort((a, b) => (SEV_ORD[a.severity] ?? 4) - (SEV_ORD[b.severity] ?? 4));
+  return effective.filter(f => S.showSuppressed || !S.findingDismissed.has(findingFp(f)));
 }
 
 const FINDING_STATUS_CYCLE = ['open', 'confirmed', 'false_positive', 'accepted_risk'];
@@ -9089,6 +9779,88 @@ const FINDING_STATUS_COLOR = {open:'var(--muted)', confirmed:'#e85c5c', false_po
 
 function findingFp(f) {
   return `${f.category}|${f.server}|${f.item}|${(f.detail||'').slice(0,60)}`;
+}
+
+// ── Severity overrides ─────────────────────────────────────────────────────
+// Our rating is the baseline and is never edited. A tester can set a different
+// rating for their environment, but only with a written reason; each change is
+// appended to a per-finding log (from, to, reason, time), never overwritten.
+// Effective severity = newest log entry; setting it back to the baseline
+// counts as no override but stays in the log.
+const SEV_CHOICES = ['critical', 'high', 'medium', 'low', 'info'];
+
+function applySeverityOverride(f) {
+  const log = S.findingSeverity[findingFp(f)];
+  const last = Array.isArray(log) && log.length ? log[log.length - 1] : null;
+  if (!last || !SEV_CHOICES.includes(last.to) || last.to === f.severity) return f;
+  return {...f, severity: last.to, baselineSeverity: f.severity, sevOverride: last,
+          sevStale: (last.base || last.from) !== f.severity};
+}
+
+function _saveSeverityStore() {
+  localStorage.setItem('mcpoke-finding-severity', JSON.stringify(S.findingSeverity));
+  renderFindings();
+  debouncedSaveProject();
+}
+
+function sevOverrideText(f) {
+  if (!f.sevOverride) return '';
+  const o = f.sevOverride;
+  return `Baseline ${f.baselineSeverity}, set to ${o.to} by tester on ${o.at.slice(0, 10)}: ${o.reason}` +
+         (f.sevStale ? ` (baseline was ${o.base || o.from} when this was set; MCPoke's rating has since changed, re-check)` : '');
+}
+
+function openSevModal(fp) {
+  const f = buildFindings().find(x => findingFp(x) === fp);
+  if (!f) return;
+  const base = f.baselineSeverity || f.severity;
+  const log = S.findingSeverity[fp] || [];
+  document.getElementById('sev-overlay')?.remove();
+  const ov = document.createElement('div');
+  ov.id = 'sev-overlay';
+  ov.dataset.fp = fp; ov.dataset.base = base;
+  const hist = log.length
+    ? log.slice().reverse().map(o => `<div class="sev-log-row">${esc(o.at.slice(0, 16).replace('T', ' '))} &middot; ${esc(o.from)} &rarr; <b>${esc(o.to)}</b> &middot; ${esc(o.reason)}</div>`).join('')
+    : '<div class="sev-log-row" style="color:var(--muted)">No changes recorded</div>';
+  ov.innerHTML = `<div id="sev-dialog">
+    <h3>Adjust severity</h3>
+    <div class="sev-sub">${esc(f.category)}: ${esc(f.item)} on ${esc(f.server)}</div>
+    <div class="sev-row">MCPoke baseline: <span class="cap-${esc(base)}">${esc(base)}</span>
+      ${f.sevOverride ? `&nbsp; Current: <span class="cap-${esc(f.severity)}">${esc(f.severity)}</span>` : ''}</div>
+    ${f.sevStale ? '<div class="sev-warn">MCPoke\'s baseline for this finding has changed since you adjusted it. Re-check your rating.</div>' : ''}
+    <label>New severity
+      <select id="sev-new">${SEV_CHOICES.map(v => `<option value="${v}"${v === f.severity ? ' selected' : ''}>${v}${v === base ? ' (baseline)' : ''}</option>`).join('')}</select></label>
+    <label>Reason (required, kept in the record)
+      <textarea id="sev-reason" rows="3" placeholder="e.g. internal-only server behind VPN, no untrusted users"></textarea></label>
+    <div id="sev-err"></div>
+    <div class="sev-btns">
+      <button class="btn-sm" onclick="saveSevOverride()"><b>Save</b></button>
+      <button class="btn-sm" onclick="saveSevOverride(true)" title="Return to MCPoke's rating (the change stays in the log)"${f.sevOverride ? '' : ' disabled'}>Reset to baseline</button>
+      <button class="btn-sm" onclick="document.getElementById('sev-overlay').remove()">Cancel</button>
+    </div>
+    <div class="sev-log"><div class="sev-log-h">History</div>${hist}</div>
+  </div>`;
+  document.body.appendChild(ov);
+  document.getElementById('sev-reason').focus();
+}
+
+function saveSevOverride(reset) {
+  const ov = document.getElementById('sev-overlay');
+  if (!ov) return;
+  const fp = ov.dataset.fp, base = ov.dataset.base;
+  const reasonEl = document.getElementById('sev-reason');
+  const reason = reasonEl.value.trim();
+  const err = document.getElementById('sev-err');
+  const log = S.findingSeverity[fp] || [];
+  const cur = log.length ? log[log.length - 1].to : base;
+  const to = reset ? base : document.getElementById('sev-new').value;
+  if (!SEV_CHOICES.includes(to)) return;
+  if (to === cur && !(reset && cur !== base)) { err.textContent = 'Pick a severity different from the current one.'; return; }
+  if (!reason) { err.textContent = 'A reason is required so the change can be explained later.'; reasonEl.focus(); return; }
+  log.push({from: cur, to, base, reason, at: new Date().toISOString()});
+  S.findingSeverity[fp] = log;
+  ov.remove();
+  _saveSeverityStore();
 }
 
 function cycleFindingStatus(fp) {
@@ -9162,6 +9934,17 @@ async function fetchExternalUi(serverUrl, tool, uri) {
   if (scheme !== 'http' && scheme !== 'https') { alert(`Scheme "${scheme}" is never fetched.`); return; }
   if (!confirm(`Fetch this server-declared UI resource from MCPoke's own machine?\n\n${uri}\n\nGuards: public addresses only, https only, no credentials sent, 1 MB / 10 s cap, redirects re-checked. The content is scanned, never rendered.`)) return;
 
+  const data = await _guardedFetch(serverUrl, uri, 'ui-external-fetch');
+  if (!data) return;
+  const n = scan(data.text, data.final_url, data.histId);
+  alert(`Fetched ${data.text.length} characters${data.truncated ? ' (truncated at 1 MB)' : ''} from ${data.final_url} (${data.chain[data.chain.length - 1].ip}). ${n ? n + ' new finding(s) added.' : 'No new findings.'}`);
+}
+
+// One guarded fetch through the backend (/fetch-external-ui), with the
+// per-refusal override prompts. Returns the backend's ok response (plus histId)
+// or null when refused/failed (the user has already been told why). Every
+// attempt, refusal included, is written to History under histTool.
+async function _guardedFetch(serverUrl, uri, histTool) {
   const flags = {allow_http: false, allow_internal: false};
   for (let attempt = 0; attempt < 3; attempt++) {
     const t0 = Date.now();
@@ -9171,13 +9954,8 @@ async function fetchExternalUi(serverUrl, tool, uri) {
                                                      body: JSON.stringify({url: uri, ...flags})});
       data = await res.json();
     } catch (e) { data = {ok: false, refused: 'network', reason: String(e)}; }
-    addHistory(serverUrl, 'ui-external-fetch', {url: uri, ...flags}, data, !data.ok, Date.now() - t0, [], null);
-    const histId = S.history[S.history.length - 1].id;
-    if (data.ok) {
-      const n = scan(data.text, data.final_url, histId);
-      alert(`Fetched ${data.text.length} characters${data.truncated ? ' (truncated at 1 MB)' : ''} from ${data.final_url} (${data.chain[data.chain.length - 1].ip}). ${n ? n + ' new finding(s) added.' : 'No new findings.'}`);
-      return;
-    }
+    addHistory(serverUrl, histTool, {url: uri, ...flags}, data, !data.ok, Date.now() - t0, [], null);
+    if (data.ok) { data.histId = S.history[S.history.length - 1].id; return data; }
     if (data.refused === 'plaintext' && !flags.allow_http) {
       if (confirm(`Refused: ${data.reason}\n\nAllow plaintext http for this one fetch?`)) { flags.allow_http = true; continue; }
     } else if (data.refused === 'internal' && !flags.allow_internal) {
@@ -9185,8 +9963,9 @@ async function fetchExternalUi(serverUrl, tool, uri) {
     } else {
       alert(`Not fetched (${data.refused}): ${data.reason}`);
     }
-    return;
+    return null;
   }
+  return null;
 }
 
 // Triage filters shared by the dock and the modal. Severity/category/server
@@ -9203,6 +9982,7 @@ function applyFindingFilters(findings, filterQ, skipKey) {
     if (q && ![f.severity, f.category, f.server, f.item, f.detail, f.remediation]
           .some(v => (v||'').toLowerCase().includes(q))) return false;
     if (!skip.includes('sev') && fv.sev && f.severity !== fv.sev) return false;
+    if (!skip.includes('mod') && fv.mod && !f.sevOverride) return false;
     if (!skip.includes('category') && fv.category && f.category !== fv.category) return false;
     if (!skip.includes('server') && fv.server && f.server !== fv.server) return false;
     if (!skip.includes('status') && fv.status) {
@@ -9215,7 +9995,7 @@ function applyFindingFilters(findings, filterQ, skipKey) {
 
 function _fviewActive() {
   const fv = S.fview;
-  return !!(fv.sev || fv.category || fv.server || fv.status || fv.cross);
+  return !!(fv.sev || fv.category || fv.server || fv.status || fv.cross || fv.mod);
 }
 
 function setFview(key, value) {
@@ -9236,6 +10016,7 @@ function toggleFviewGroup() {
 function clearFview() {
   S.fview.sev = S.fview.category = S.fview.server = S.fview.status = '';
   S.fview.cross = false;
+  S.fview.mod = false;
   renderFindings();
 }
 
@@ -9334,6 +10115,7 @@ function buildTriageBar(findings, filterQ) {
     <select class="triage-sel" title="Status" onchange="setFview('status', this.value)">${stOpts}</select>
     <label class="triage-group"><input type="checkbox"${fv.group ? ' checked' : ''} onchange="toggleFviewGroup()"> Group by category</label>
     <label class="triage-group" title="Findings that involve more than one server: shadowed tools, or the same finding reported on 2+ servers"><input type="checkbox"${fv.cross ? ' checked' : ''} onchange="toggleFviewCross()"> Cross-server only (${applyFindingFilters(findings, filterQ, 'cross').filter(f => _crossIdx.has(findingFp(f))).length})</label>
+    <label class="triage-group" title="Only findings whose severity you changed from MCPoke's baseline"><input type="checkbox"${fv.mod ? ' checked' : ''} onchange="S.fview.mod=this.checked;renderFindings()"> Severity adjusted (${findings.filter(f => f.sevOverride).length})</label>
     <button class="btn-sm${fv.grid ? ' active' : ''}" onclick="toggleFviewGrid()">Server grid ${fv.grid ? '&#9652;' : '&#9662;'}</button>
     ${_fviewActive() ? `<button class="btn-sm" onclick="clearFview()">Clear filters</button>` : ''}
     <span class="triage-count${shown < findings.length ? ' filtered' : ''}"${shown < findings.length ? ' title="Some findings are hidden by the current filters"' : ''}>${shown} of ${findings.length}${shown < findings.length ? ' shown' : ''}</span>
@@ -9436,7 +10218,8 @@ function buildFindingRows(findings, filterQ, target) {
       ? ` style="cursor:pointer;color:var(--text)" title="Click to view request/response" ${reqAttrs} onclick="${reqHandler}"`
       : '';
     return `${groupHdr}<tr${rowStyle}>
-      <td><span class="cap-${esc(f.severity)}">${esc(f.severity)}</span></td>
+      <td><span class="cap-${esc(f.severity)}" style="cursor:pointer" data-fp="${safeFp}" onclick="openSevModal(this.dataset.fp)"
+          title="${esc(f.sevOverride ? sevOverrideText(f) : 'Click to adjust severity for your environment')}">${esc(f.severity)}${f.sevOverride ? ' &#9998;' : ''}</span>${f.sevOverride ? `<div class="sev-was" title="${esc(sevOverrideText(f))}">was ${esc(f.baselineSeverity)}${f.sevStale ? ' &#9888;' : ''}</div>` : ''}</td>
       <td><button class="btn-sm" style="font-size:9px;color:${FINDING_STATUS_COLOR[status]};white-space:nowrap"
           title="Click to cycle status" data-fp="${safeFp}" onclick="cycleFindingStatus(this.dataset.fp)">${FINDING_STATUS_LABEL[status]}</button></td>
       <td>${esc(f.category)}${isSuppressed ? ' <span style="font-size:9px;color:var(--muted);border:1px solid var(--border);border-radius:3px;padding:0 3px">SUPPRESSED</span>' : ''}</td>
@@ -9496,17 +10279,7 @@ function _hdrDblclickCloses(overlay, closeFn) {
 function openFindingsModal() {
   const existing = document.getElementById('findings-overlay');
   if (existing) { existing.style.display = ''; return; }
-  const exportMenu = `
-    <div style="position:relative">
-      <button class="btn-sm" onclick="document.getElementById('fm-exp-menu').style.display=document.getElementById('fm-exp-menu').style.display==='none'?'':'none'">Export &#9662;</button>
-      <div id="fm-exp-menu" style="display:none;position:absolute;right:0;top:100%;margin-top:2px;
-           background:var(--surface);border:1px solid var(--border);border-radius:4px;
-           z-index:100;min-width:110px;box-shadow:0 4px 12px rgba(0,0,0,.4)">
-        <div class="export-opt" onclick="exportFindings('csv')">CSV</div>
-        <div class="export-opt" onclick="exportFindings('json')">JSON</div>
-        <div class="export-opt" onclick="exportFindings('md')">Markdown</div>
-      </div>
-    </div>`;
+  const exportMenu = exportDropdown('fm-exp-menu');
   const ov = document.createElement('div');
   ov.id = 'findings-overlay';
   ov.innerHTML = `
@@ -9682,11 +10455,12 @@ function _runNotificationChecks(srv, notifs, historyId) {
 // Same pagination + sanitising the backend does at connect (see _paged_list /
 // _clean_items): follow result.nextCursor so a tool added on page 2 after a
 // list_changed push isn't invisible, and drop/coerce malformed entries.
+const MAX_LIST_PAGES = 25;  // keep equal to _MAX_LIST_PAGES in the backend
 async function _fetchAllPages(srv, method, resultKey) {
   const items = [];
   const seen = new Set();
   let cursor;
-  for (let page = 0; page < 25; page++) {
+  for (let page = 0; page < MAX_LIST_PAGES; page++) {
     const params = cursor ? {cursor} : {};
     const res  = await rawFetch(srv, {jsonrpc: '2.0', id: Date.now(), method, params});
     const body = await res.json();
@@ -9695,6 +10469,10 @@ async function _fetchAllPages(srv, method, resultKey) {
     items.push(...list);
     cursor = body?.result?.result?.nextCursor;
     if (typeof cursor !== 'string' || !cursor || seen.has(cursor)) break;
+    if (page === MAX_LIST_PAGES - 1) {
+      (srv.truncatedLists ||= []).includes(resultKey) || srv.truncatedLists.push(resultKey);
+      break;
+    }
     seen.add(cursor);
   }
   return _cleanListItems(items);
@@ -9788,9 +10566,10 @@ async function _rescanListOnChange(srv, kind) {
   } catch (_) { /* best-effort background refresh */ }
 }
 
-// serverInfo.instructions: a free-text field returned at initialize
-// specifically to steer the client/model. Captured into srv.serverInfo but
-// never scanned. Static/connect-time, so this must run AFTER
+// instructions: a free-text, top-level InitializeResult field returned at
+// initialize specifically to steer the client/model. Captured into
+// srv.serverInfo (this app's own bundled object) but never scanned.
+// Static/connect-time, so this must run AFTER
 // scanServerFindings() returns and srv.findings has been assigned from its
 // result: calling _pushFindingDedup (via _scanForSplitting) from inside
 // scanServerFindings itself would get silently discarded the moment the
@@ -10154,7 +10933,7 @@ function renderToolsList(tools) {
       ? `<span class="warn-badge" title="High-impact: ${esc(flags.join(', '))}">&#9888;</span>`
       : '';
     const injHits    = scanTool(t);
-    const iBadge     = injBadge(injHits);
+    const iBadge     = injBadge(injHits) + iconBadge(t, 'tool');
     const shadowUrls = shadows.get(t.name);
     const sBadge     = shadowUrls
       ? `<span class="shadow-badge" title="Also registered by: ${esc(shadowUrls.filter(u=>u!==S.activeUrl).join(', '))}">&#9651; shadow</span>`
@@ -10184,7 +10963,7 @@ function renderResourcesList(resources) {
   }
   list.innerHTML = shown.map(({r, i}) => {
     const injHits = scanResource(r);
-    const iBadge  = injBadge(injHits);
+    const iBadge  = injBadge(injHits) + iconBadge(r, 'resource');
     return `<div class="res-item${i===S.selectedIdx?' active':''}" data-res="${i}">
       <div class="rn">${esc(r.name || r.uri)}${iBadge}</div>
       <div class="ru">${esc(r.uri)}</div>
@@ -10210,7 +10989,7 @@ function renderPromptsList(prompts) {
   }
   list.innerHTML = shown.map(({p, i}) => {
     const injHits = scanPrompt(p);
-    const iBadge  = injBadge(injHits);
+    const iBadge  = injBadge(injHits) + iconBadge(p, 'prompt');
     return `<div class="pmt-item${i===S.selectedIdx?' active':''}" data-pmt="${i}">
       <div class="pn">${esc(p.name)}${iBadge}</div>
       ${p.description ? `<div class="td">${esc(p.description.slice(0,68))}</div>` : ''}
@@ -10231,6 +11010,8 @@ function switchTab(tab) {
 }
 
 document.getElementById('enum-list').addEventListener('click', e => {
+  const ib = e.target.closest('.icon-badge');
+  if (ib) { jumpToIconFinding(ib.dataset.kind, ib.dataset.name); return; }
   const toolItem = e.target.closest('[data-idx]');
   if (toolItem) { selectTool(parseInt(toolItem.dataset.idx)); return; }
   const resItem = e.target.closest('[data-res]');
@@ -10257,7 +11038,7 @@ function selectTool(idx) {
     (flags.length
       ? `<div class="warn-cats">&#9888; High-impact: ${esc(flags.join(', '))}</div>`
       : '') +
-    injFindingsHtml(injHits);
+    injFindingsHtml(injHits) + iconDetailHtml(tool);
   document.getElementById('params-form').innerHTML = generateForm(tool.inputSchema);
   document.getElementById('raw-schema').textContent =
     JSON.stringify(tool.inputSchema || {}, null, 2);
@@ -10290,7 +11071,7 @@ function selectResource(idx) {
   const injHits = scanResource(res);
   document.getElementById('tool-title').textContent    = res.name || res.uri;
   document.getElementById('tool-desc-text').innerHTML  =
-    esc(res.description || res.uri) + injFindingsHtml(injHits);
+    esc(res.description || res.uri) + injFindingsHtml(injHits) + iconDetailHtml(res);
   document.getElementById('params-form').innerHTML      = '';
   document.getElementById('raw-schema').style.display   = 'none';
   document.getElementById('schema-tog').style.display   = 'none';
@@ -10326,7 +11107,7 @@ function selectPrompt(idx) {
   const injHits = scanPrompt(pmt);
   document.getElementById('tool-title').textContent   = pmt.name;
   document.getElementById('tool-desc-text').innerHTML =
-    esc(pmt.description || '') + injFindingsHtml(injHits);
+    esc(pmt.description || '') + injFindingsHtml(injHits) + iconDetailHtml(pmt);
   document.getElementById('params-form').innerHTML      = '';
   document.getElementById('raw-schema').style.display   = 'none';
   document.getElementById('schema-tog').style.display   = 'none';
@@ -14559,9 +15340,7 @@ function openHistoryModal() {
         <span style="color:var(--accent);font-weight:700;font-family:monospace;font-size:13px">&#9654; History</span>
         <span id="hist-modal-count" style="color:var(--muted);font-size:11px;flex:1"></span>
         <button class="btn-sm" id="hist-modal-del-sel-btn" style="display:none;color:#f85149;border-color:#5a1a1a" onclick="deleteHistoryChecked()">&#x2715; Delete Selected</button>
-        <button class="btn-sm" onclick="exportHistory()">Export JSON</button>
-        <button class="btn-sm" onclick="exportMarkdown()">Export MD</button>
-        <button class="btn-sm" onclick="exportHTML()">Export HTML</button>
+        ${exportDropdown('hm-exp-menu')}
         <button class="btn-sm" onclick="clearHistory()">Clear History</button>
         <button class="btn-sm" onclick="closeHistoryModal()">&#x2715; Close</button>
       </div>
@@ -14684,6 +15463,7 @@ function buildProjectData() {
     notifications:    S.notifications,
     findingStatus:    S.findingStatus,
     findingNotes:     S.findingNotes,
+    findingSeverity:  S.findingSeverity,
     findingDismissed: [...S.findingDismissed],
     notes,
   };
@@ -14708,7 +15488,7 @@ async function saveProject() {
     _projectSaving = false;
     const ts  = new Date().toLocaleTimeString();
     const el  = document.getElementById('project-saved-ts');
-    if (el) { el.textContent = `Saved ${ts}`; el.style.color = 'var(--muted)'; }
+    if (el) { el.textContent = `Saved ${ts}`; el.style.color = 'var(--muted)'; el.title = SENSITIVE_FILE_NOTE; }
   } catch {
     _projectSaving = false;
     const el = document.getElementById('project-saved-ts');
@@ -14804,7 +15584,7 @@ function showProjectPicker(projects) {
   const existingHtml = projects.length
     ? projects.map(p => `
       <div class="proj-item" onclick="openProjectFile(${jsArg(p.path)}, this)">
-        <span class="proj-item-name">&#128196; ${esc(p.name)}.mcpoke</span>
+        <span class="proj-item-name" title="Project files can contain tokens and headers. Treat as sensitive.">&#128274; ${esc(p.name)}.mcpoke</span>
         <span class="proj-item-meta">${esc(p.modified)} &middot; ${(p.size/1024).toFixed(1)} KB</span>
       </div>`).join('')
     : `<div style="color:var(--muted);font-size:12px;padding:.25rem 0">No projects yet</div>`;
@@ -14814,6 +15594,7 @@ function showProjectPicker(projects) {
       <h2>&#128196; MCPoke &mdash; Select Project</h2>
       <div class="proj-section">
         <h3>New Project</h3>
+        <div style="font-size:10px;color:var(--muted);margin:-.25rem 0 .5rem">&#128274; Project files can hold tokens, headers and server data. Treat them like credentials.</div>
         <div class="proj-row">
           <input type="text" id="proj-new-name" placeholder="Project name (e.g. client-name-2026)" maxlength="80"
             onkeydown="if(event.key==='Enter') createNewProject()">
@@ -14994,6 +15775,7 @@ async function _fbRender(path) {
         <span id="fb-path" title="${esc(data.path)}">${esc(data.path)}</span>
       </div>
       <div id="fb-list">${rows}</div>
+      ${_fbMode === 'save' ? `<div id="fb-warn">&#128274; ${esc(SENSITIVE_FILE_NOTE)} Files are saved owner-only (0600).</div>` : ''}
       <div id="fb-footer">
         ${filenameRow}
         <button class="btn-sm" onclick="_fbConfirm()"><b>${actionLabel}</b></button>
@@ -15047,6 +15829,7 @@ function _fbCancel() {
 // ── Session export (manual, file download) ──────────────────────────────────
 
 function saveSession() {
+  if (!confirm('Export Session\n\n' + SENSITIVE_FILE_NOTE + '\n\nThe file is saved by your browser with whatever permissions it uses.\n\nExport anyway?')) return;
   const data = buildProjectData();
   const ts   = data.saved.replace(/[:.]/g, '-').slice(0, 19);
   const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
@@ -15100,6 +15883,10 @@ function restoreSessionData(session) {
   if (session.findingNotes) {
     S.findingNotes = session.findingNotes;
     localStorage.setItem('mcpoke-finding-notes', JSON.stringify(S.findingNotes));
+  }
+  if (session.findingSeverity) {
+    S.findingSeverity = session.findingSeverity;
+    localStorage.setItem('mcpoke-finding-severity', JSON.stringify(S.findingSeverity));
   }
   if (session.findingDismissed) {
     S.findingDismissed = new Set(session.findingDismissed);
@@ -15400,6 +16187,163 @@ function _reportStyleBlock() {
 </style>`;
 }
 
+// Request history as a standalone HTML export. Kept out of the findings report
+// because heavy fuzzing makes history very large.
+function exportHistoryHTML() {
+  const now = new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
+  function he(s) {
+    return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  let histHtml = '';
+  if (S.history.length) {
+    const hRows = S.history.map(e => {
+      let host = e.url; try { host = new URL(e.url).host; } catch {}
+      const statusCls = e.isErr ? 'status-error' : 'status-ok';
+      const statusTxt = e.isErr ? 'error' : 'ok';
+      const argsStr = JSON.stringify(e.args, null, 2);
+      // .result?.result, not .result: see the Markdown export's identical note.
+      const resStr  = e.result !== undefined ? (() => { try { return JSON.stringify(e.result?.result ?? e.result, null, 2); } catch { return String(e.result); } })() : '';
+      return `<tr class="hist-row" onclick="var d=this.nextElementSibling;d.style.display=d.style.display==='none'?'table-row':'none'">
+        <td class="sm muted">${he(e.time)}</td>
+        <td class="mono sm">${he(host)}</td>
+        <td class="mono sm bold">${he(e.tool)}</td>
+        <td><span class="${statusCls}">${statusTxt}</span></td>
+        <td class="sm muted">${he(e.elapsed)}ms</td>
+      </tr>
+      <tr class="detail-row"><td colspan="5">
+        <strong>Args:</strong><pre>${he(argsStr)}</pre>
+        ${resStr ? `<strong>Response:</strong><pre class="response-pre">${he(resStr)}</pre>` : ''}
+      </td></tr>`;
+    }).join('');
+    histHtml = `
+    <h2 id="history">Request History <span class="h2-n">${S.history.length}</span></h2>
+    <p class="sm muted">Click a row to expand args / response.</p>
+    <table>
+      <thead><tr><th>Time</th><th>Server</th><th>Tool</th><th>Status</th><th>Elapsed</th></tr></thead>
+      <tbody>${hRows}</tbody>
+    </table>`;
+  }
+  if (!histHtml) histHtml = '<h2>Request History</h2><p class="muted">No history.</p>';
+  const html = `<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MCPoke Request History: ${he(now)}</title>
+${_reportStyleBlock()}
+${_reportFindingsStyle()}
+</head>
+<body>
+<div class="header">
+  <h1>&#9741; MCPoke Request History</h1>
+  <span class="ts">Generated ${he(now)}</span>
+  <button class="theme-btn" id="tbtn" onclick="
+    var t=document.documentElement;
+    var next=t.getAttribute('data-theme')==='dark'?'light':'dark';
+    t.setAttribute('data-theme',next);
+    document.getElementById('tbtn').textContent=next==='dark'?'&#9728; Light':'&#9790; Dark';
+  ">&#9728; Light</button>
+</div>
+<div class="container">
+  ${histHtml}
+</div>
+</body>
+</html>`;
+  const blob = new Blob([html], {type: 'text/html'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'mcpoke-history-' + new Date().toISOString().slice(0, 19).replace(/:/g, '-') + '.html';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// Extra styles for the main report only (the Compare export shares
+// _reportStyleBlock but not these): summary cards, server cards, finding cards.
+function _reportFindingsStyle() {
+  return `<style>
+  html { scroll-behavior: smooth; scroll-padding-top: 4rem; }
+  .header { position: sticky; top: 0; z-index: 10; }
+  .rnav { display: flex; gap: .3rem; }
+  .rnav a { color: var(--text); text-decoration: none; font-size: 12px; padding: .2rem .6rem; border-radius: 4px; border: 1px solid transparent; }
+  .rnav a:hover { border-color: var(--border); background: var(--surface); }
+  .h2-n { font-size: 11px; font-weight: 600; color: var(--muted); background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 0 .5rem; margin-left: .3rem; vertical-align: middle; }
+  .summary { display: flex; flex-wrap: wrap; gap: .6rem; margin: .2rem 0 .6rem; }
+  .sum-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: .6rem 1rem; min-width: 110px; text-decoration: none; color: var(--text); }
+  .sum-n { font-size: 1.6rem; font-weight: 700; line-height: 1.1; }
+  .sum-l { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-top: .15rem; }
+  a.sum-sev { cursor: pointer; border-left-width: 4px; }
+  a.sum-sev:hover { border-color: var(--accent); }
+  .sum-sev.sev-critical { border-left-color: var(--sev-critical-fg); } .sum-sev.sev-high { border-left-color: var(--sev-high-fg); }
+  .sum-sev.sev-medium { border-left-color: var(--sev-medium-fg); } .sum-sev.sev-low { border-left-color: var(--sev-low-fg); }
+  .sum-sev.sev-info { border-left-color: var(--sev-info-fg); }
+  .sum-sev.sev-critical .sum-n { color: var(--sev-critical-fg); } .sum-sev.sev-high .sum-n { color: var(--sev-high-fg); }
+  .sum-sev.sev-medium .sum-n { color: var(--sev-medium-fg); } .sum-sev.sev-low .sum-n { color: var(--sev-low-fg); }
+  .sum-sev.sev-info .sum-n { color: var(--sev-info-fg); }
+  .srv-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.2rem; margin-bottom: 1rem; }
+  .srv-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
+  .srv-head h3 { margin: 0; font-size: 1.05rem; color: var(--text); }
+  .srv-url { font-size: 11px; color: var(--muted); word-break: break-all; margin-top: .15rem; }
+  .srv-sev { margin: .6rem 0; display: flex; gap: .35rem; flex-wrap: wrap; }
+  .risk { display: inline-block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; padding: 2px 10px; border-radius: 4px; margin-left: .5rem; vertical-align: middle; }
+  .risk-critical { color: var(--sev-critical-fg); background: var(--sev-critical-bg); } .risk-high { color: var(--sev-high-fg); background: var(--sev-high-bg); }
+  .risk-medium { color: var(--sev-medium-fg); background: var(--sev-medium-bg); } .risk-low { color: var(--sev-low-fg); background: var(--sev-low-bg); }
+  .risk-info { color: var(--sev-info-fg); background: var(--sev-info-bg); } .risk-none { color: var(--muted); background: var(--bg); border: 1px solid var(--border); font-weight: 400; }
+  .sfind .fcard { margin-top: .5rem; }
+  .chip-server { color: var(--text); }
+  .chip { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--muted); white-space: nowrap; }
+  .chip-srv.srv-ok { color: var(--green); border-color: var(--green); } .chip-srv.srv-err { color: var(--red); border-color: var(--red); }
+  .chip-adj { color: var(--yellow); border-color: var(--yellow); }
+  .chip-st.st-confirmed { color: var(--status-confirmed); border-color: var(--status-confirmed); }
+  .chip-st.st-accepted-risk { color: var(--status-ar); border-color: var(--status-ar); }
+  .chip-st.st-false-positive { text-decoration: line-through; }
+  table.kv td:first-child { width: 150px; color: var(--muted); background: var(--th-bg); font-size: 11px; }
+  table.kv { margin: .4rem 0 .8rem; }
+  .sfold { border-top: 1px solid var(--border); padding: .4rem 0; }
+  .sfold > summary { cursor: pointer; font-size: 12px; font-weight: 600; padding: .2rem 0; }
+  .sfold table { margin-top: .5rem; }
+  .ftoolbar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .4rem 0 1rem; padding: .6rem; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+  .fchips { display: flex; gap: .3rem; flex-wrap: wrap; }
+  .fchip { cursor: pointer; font: inherit; font-size: 11px; border-radius: 12px; padding: .15rem .7rem; border: 1px solid var(--border); background: var(--bg); color: var(--text); text-transform: capitalize; }
+  .fchip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .fchip.sev-critical:not(.on) { color: var(--sev-critical-fg); } .fchip.sev-high:not(.on) { color: var(--sev-high-fg); }
+  .fchip.sev-medium:not(.on) { color: var(--sev-medium-fg); } .fchip.sev-low:not(.on) { color: var(--sev-low-fg); } .fchip.sev-info:not(.on) { color: var(--sev-info-fg); }
+  #fq, #fst, #fsrv { font: inherit; font-size: 12px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: .25rem .5rem; }
+  #fq { min-width: 200px; flex: 1; }
+  .tbtn { font: inherit; font-size: 11px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: .25rem .6rem; cursor: pointer; }
+  .tbtn:hover { border-color: var(--accent); }
+  .fcount { font-size: 11px; color: var(--muted); margin-left: auto; }
+  .fgroup { margin-bottom: 1.2rem; }
+  .fgroup-h { display: flex; align-items: center; gap: .5rem; margin: 1rem 0 .5rem; font-size: .9rem; }
+  .fgroup-n { font-size: 12px; font-weight: 400; color: var(--muted); }
+  .fcard { background: var(--surface); border: 1px solid var(--border); border-left-width: 4px; border-radius: 6px; margin-bottom: .5rem; }
+  .fc-critical { border-left-color: var(--sev-critical-fg); } .fc-high { border-left-color: var(--sev-high-fg); }
+  .fc-medium { border-left-color: var(--sev-medium-fg); } .fc-low { border-left-color: var(--sev-low-fg); } .fc-info { border-left-color: var(--sev-info-fg); }
+  .fcard > summary { display: flex; align-items: center; gap: .6rem; padding: .6rem .8rem; cursor: pointer; list-style: none; flex-wrap: wrap; }
+  .fcard > summary::-webkit-details-marker { display: none; }
+  .fcard > summary::before { content: "\\25B8"; color: var(--muted); font-size: 11px; }
+  .fcard[open] > summary::before { content: "\\25BE"; }
+  .fcard > summary:hover { background: var(--hover); }
+  .f-title { font-weight: 600; font-size: 13px; flex: 1; min-width: 200px; }
+  .f-item { font-family: monospace; font-weight: 400; font-size: 12px; color: var(--accent); margin-left: .5rem; }
+  .f-prev { flex-basis: 100%; font-size: 12px; color: var(--muted); padding-left: 1.1rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fcard[open] .f-prev { display: none; }
+  .fix-more > summary { cursor: pointer; font-size: 11px; color: var(--muted); margin-top: .6rem; }
+  .f-body { padding: .2rem 1rem 1rem 1.6rem; }
+  .f-label { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: .7rem 0 .2rem; }
+  .f-detail, .f-note { margin: 0; font-size: 13px; line-height: 1.5; word-break: break-word; }
+  .f-fix { margin: 0; font-size: 13px; line-height: 1.5; padding: .5rem .7rem; border-left: 3px solid var(--green); background: var(--bg); border-radius: 0 4px 4px 0; word-break: break-word; }
+  .f-adj { margin-top: .8rem; font-size: 12px; padding: .5rem .7rem; border: 1px solid var(--yellow); border-radius: 4px; }
+  .f-stale { color: var(--yellow); margin-top: .2rem; }
+  .empty { color: var(--muted); padding: 1rem; text-align: center; }
+  @media (max-width: 700px) { .container { padding: 1rem; } .header { flex-wrap: wrap; padding: .6rem 1rem; } .fcount { margin-left: 0; } }
+  @media print {
+    .header, .ftoolbar, .theme-btn { position: static; }
+    .ftoolbar, .rnav { display: none; }
+    .fcard, .srv-card { break-inside: avoid; }
+  }
+</style>`;
+}
+
 function exportHTML() {
   const now      = new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
   const srvs     = Object.values(S.servers);
@@ -15409,37 +16353,82 @@ function exportHTML() {
     return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  // ── Findings table ─────────────────────────────────────────────────────────
-  let findingsHtml = '';
+  // ── Findings (grouped by severity, one expandable card each) ───────────────
+  const SEVS = ['critical', 'high', 'medium', 'low', 'info'];
+  const sevCounts = Object.fromEntries(SEVS.map(k => [k, 0]));
+  for (const f of findings) sevCounts[SEVS.includes(f.severity) ? f.severity : 'info']++;
+  const adjustedCount = findings.filter(f => f.sevOverride).length;
+  const stLabel = st => st.replace(/_/g, ' ');
+  const srvTokens = f => String(f.server || '').split(' / ').map(x => x.trim()).filter(Boolean);
+  const findingCard = (f, fixSeen) => {
+    const fp     = findingFp(f);
+    const status = S.findingStatus[fp] || 'open';
+    const note   = S.findingNotes[fp] || '';
+    const sev    = SEVS.includes(f.severity) ? f.severity : 'info';
+    const log    = S.findingSeverity[fp] || [];
+    const text   = [f.category, f.item, f.server, f.detail, f.remediation, note].join(' ').toLowerCase();
+    const adj = f.sevOverride ? `
+        <div class="f-adj"><b>Severity adjusted by tester:</b> baseline ${he(f.baselineSeverity)} &rarr; ${he(f.severity)}.
+          <div>Reason: ${he(f.sevOverride.reason)}</div>
+          ${f.sevStale ? '<div class="f-stale">MCPoke\'s baseline for this finding has changed since the adjustment. Re-check the rating.</div>' : ''}
+          ${log.length > 1 ? `<div class="sm muted">History: ${log.map(o => `${he(o.at.slice(0, 10))} ${he(o.from)} &rarr; ${he(o.to)} (${he(o.reason)})`).join('; ')}</div>` : ''}
+        </div>` : '';
+    return `<details class="fcard fc-${sev}" data-sev="${sev}" data-servers="${he(srvTokens(f).join('|'))}" data-status="${he(status)}" data-text="${he(text)}"${(findings.length <= 12 && (sev === 'critical' || sev === 'high')) ? ' open' : ''}>
+      <summary>
+        <span class="sev sev-${sev}">${sev}</span>
+        <span class="f-title">${he(f.category)}<span class="f-item">${he(f.item)}</span></span>
+        <span class="chip chip-server mono" title="Server this finding was reported on">${he(f.server)}</span>
+        ${f.sevOverride ? `<span class="chip chip-adj" title="Severity adjusted from ${he(f.baselineSeverity)}">adjusted</span>` : ''}
+        <span class="chip chip-st st-${he(status.replace(/_/g, '-'))}">${he(stLabel(status))}</span>
+        <span class="f-prev">${he(f.detail)}</span>
+      </summary>
+      <div class="f-body">
+        <div class="f-label">What was found</div>
+        <p class="f-detail">${he(f.detail)}</p>
+        ${f.remediation ? (fixSeen.has(f.remediation)
+          ? `<details class="fix-more"><summary>How to fix it (same advice as an earlier finding)</summary><p class="f-fix">${he(f.remediation)}</p></details>`
+          : (fixSeen.add(f.remediation), `<div class="f-label">How to fix it</div><p class="f-fix">${he(f.remediation)}</p>`)) : ''}
+        ${adj}
+        ${note ? `<div class="f-label">Tester notes</div><p class="f-note">${he(note)}</p>` : ''}
+      </div>
+    </details>`;
+  };
+  const allFixSeen = new Set();   // repeated remediation text is collapsed after its first appearance
+  let findingsHtml;
   if (findings.length) {
-    const rows = findings.map(f => {
-      const fp     = findingFp(f);
-      const status = S.findingStatus[fp] || 'open';
-      const note   = S.findingNotes[fp] || '';
-      const sev    = f.severity || 'info';
-      return `<tr>
-        <td><span class="sev sev-${he(sev)}">${he(sev)}</span></td>
-        <td><span class="status status-${he(status.replace(/_/g,'-'))}">${he(status.replace(/_/g,' '))}</span></td>
-        <td>${he(f.category)}</td>
-        <td class="mono muted">${he(f.server)}</td>
-        <td class="mono">${he(f.item)}</td>
-        <td class="wrap">${he(f.detail)}</td>
-        <td class="sm">${he(f.remediation||'')}</td>
-        <td class="sm muted italic">${he(note)}</td>
-      </tr>`;
-    }).join('');
+    const srvCount = new Map();
+    for (const f of findings) for (const t of srvTokens(f)) srvCount.set(t, (srvCount.get(t) || 0) + 1);
+    const srvOpts = [...srvCount.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([t, n]) => `<option value="${he(t)}">${he(t)} (${n})</option>`).join('');
+    const groups = SEVS.filter(k => sevCounts[k]).map(k => `
+      <section class="fgroup" data-sev="${k}">
+        <h3 class="fgroup-h"><span class="sev sev-${k}">${k}</span> <span class="fgroup-n">${sevCounts[k]} finding${sevCounts[k] === 1 ? '' : 's'}</span></h3>
+        ${findings.filter(f => (SEVS.includes(f.severity) ? f.severity : 'info') === k).map(f => findingCard(f, allFixSeen)).join('')}
+      </section>`).join('');
+    const chips = SEVS.filter(k => sevCounts[k]).map(k =>
+      `<button type="button" class="fchip sev-${k}" data-sev="${k}" aria-pressed="false">${k} <b>${sevCounts[k]}</b></button>`).join('');
     findingsHtml = `
-    <h2>Findings (${findings.length})</h2>
-    <table>
-      <thead><tr><th>Sev</th><th>Status</th><th>Category</th><th>Server</th><th>Item</th><th>Detail</th><th>Remediation</th><th>Notes</th></tr></thead>
-      <tbody>${rows}</tbody>
-    </table>`;
+    <h2 id="findings">All findings <span class="h2-n">${findings.length}</span></h2>
+    <div class="ftoolbar">
+      <div class="fchips">${chips}</div>
+      <select id="fsrv" aria-label="Filter by server"><option value="">All servers</option>${srvOpts}</select>
+      <input type="search" id="fq" placeholder="Search findings…" aria-label="Search findings">
+      <select id="fst" aria-label="Filter by status">
+        <option value="">Any status</option><option value="open">Open</option><option value="confirmed">Confirmed</option>
+        <option value="false-positive">False positive</option><option value="accepted-risk">Accepted risk</option>
+      </select>
+      <button type="button" class="tbtn" onclick="document.querySelectorAll('#fall .fcard').forEach(function(d){d.open=true})">Expand all</button>
+      <button type="button" class="tbtn" onclick="document.querySelectorAll('#fall .fcard').forEach(function(d){d.open=false})">Collapse all</button>
+      <span class="fcount" id="fcount"></span>
+    </div>
+    <div id="fall">${groups}</div>
+    <p class="empty" id="fempty" style="display:none">No findings match the current filters.</p>`;
   } else {
-    findingsHtml = '<h2>Findings</h2><p class="muted">No findings.</p>';
+    findingsHtml = '<h2 id="findings">Findings</h2><p class="muted">No findings.</p>';
   }
 
   // ── Per-server sections ────────────────────────────────────────────────────
-  let serversHtml = '<h2>Servers</h2>';
+  let serversHtml = `<h2 id="servers">Servers <span class="h2-n">${srvs.length}</span></h2>`;
   for (const srv of srvs) {
     const si    = srv.serverInfo || {};
     const fp    = fingerprintServer(srv);
@@ -15504,46 +16493,47 @@ function exportHTML() {
       pmtHtml = `<h4>Prompts (${srv.prompts.length})</h4><table><thead><tr><th>Name</th><th>Notes</th></tr></thead><tbody>${pRows}</tbody></table>`;
     }
 
+    const sf = findings.filter(f => srvTokens(f).some(t => t === host || t === srv.url || (si.name && t === si.name)));
+    const sc = Object.fromEntries(SEVS.map(k => [k, sf.filter(f => f.severity === k).length]));
+    const scHtml = sf.length
+      ? SEVS.filter(k => sc[k]).map(k => `<span class="sev sev-${k}">${sc[k]} ${k}</span>`).join(' ')
+      : '<span class="chip">no findings</span>';
+    const topSev = SEVS.find(k => sc[k]);
+    const riskHtml = topSev
+      ? `<span class="risk risk-${topSev}" title="Highest severity among this server's findings">${topSev} risk</span>`
+      : '<span class="risk risk-none" title="No findings recorded for this server">no findings</span>';
+    const srvFixSeen = new Set();
+    const findingsFold = sf.length ? `<details class="sfold sfind"><summary>Findings for this server <span class="h2-n">${sf.length}</span></summary>${sf.map(f => findingCard(f, srvFixSeen)).join('')}</details>` : '';
+    const fold = (title, n, inner) => inner ? `<details class="sfold"><summary>${title} <span class="h2-n">${n}</span></summary>${inner}</details>` : '';
+    const statusCls = srv.status === 'connected' ? 'ok' : (srv.status === 'error' ? 'err' : 'off');
     serversHtml += `
-    <div class="srv-section">
-      <h3>${he(label)} <span class="host-sub">${he(host)}</span></h3>
-      <table><tbody>${infoRows}</tbody></table>
-      ${capsHtml}${vulnsHtml}${toolsHtml}${resHtml}${pmtHtml}
-    </div>`;
-  }
-
-  // ── History table ──────────────────────────────────────────────────────────
-  let histHtml = '';
-  if (S.history.length) {
-    const hRows = S.history.map(e => {
-      let host = e.url; try { host = new URL(e.url).host; } catch {}
-      const statusCls = e.isErr ? 'status-error' : 'status-ok';
-      const statusTxt = e.isErr ? 'error' : 'ok';
-      const argsStr = JSON.stringify(e.args, null, 2);
-      // .result?.result, not .result: see the Markdown export's identical note.
-      const resStr  = e.result !== undefined ? (() => { try { return JSON.stringify(e.result?.result ?? e.result, null, 2); } catch { return String(e.result); } })() : '';
-      return `<tr class="hist-row" onclick="var d=this.nextElementSibling;d.style.display=d.style.display==='none'?'table-row':'none'">
-        <td class="sm muted">${he(e.time)}</td>
-        <td class="mono sm">${he(host)}</td>
-        <td class="mono sm bold">${he(e.tool)}</td>
-        <td><span class="${statusCls}">${statusTxt}</span></td>
-        <td class="sm muted">${he(e.elapsed)}ms</td>
-      </tr>
-      <tr class="detail-row"><td colspan="5">
-        <strong>Args:</strong><pre>${he(argsStr)}</pre>
-        ${resStr ? `<strong>Response:</strong><pre class="response-pre">${he(resStr)}</pre>` : ''}
-      </td></tr>`;
-    }).join('');
-    histHtml = `
-    <h2>Request History (${S.history.length})</h2>
-    <p class="sm muted">Click a row to expand args / response.</p>
-    <table>
-      <thead><tr><th>Time</th><th>Server</th><th>Tool</th><th>Status</th><th>Elapsed</th></tr></thead>
-      <tbody>${hRows}</tbody>
-    </table>`;
+    <article class="srv-card">
+      <header class="srv-head">
+        <div>
+          <h3>${he(label)} ${riskHtml}</h3>
+          <div class="srv-url mono">${he(srv.url || srv.command || '')}</div>
+        </div>
+        <span class="chip chip-srv srv-${statusCls}">${he(srv.status || 'unknown')}</span>
+      </header>
+      <div class="srv-sev">${scHtml}</div>
+      <table class="kv"><tbody>${infoRows}</tbody></table>
+      ${findingsFold}
+      ${fold('Capabilities', capKeys.length, capsHtml.replace(/<h4>.*?<\/h4>/, ''))}
+      ${fold('Known vulnerabilities', vulns.length, vulnsHtml.replace(/<h4>.*?<\/h4>/, ''))}
+      ${fold('Tools', (srv.tools || []).length, toolsHtml.replace(/<h4>.*?<\/h4>/, ''))}
+      ${fold('Resources', (srv.resources || []).length, resHtml.replace(/<h4>.*?<\/h4>/, ''))}
+      ${fold('Prompts', (srv.prompts || []).length, pmtHtml.replace(/<h4>.*?<\/h4>/, ''))}
+    </article>`;
   }
 
   // ── Assemble document ──────────────────────────────────────────────────────
+  const summaryHtml = `
+  <section class="summary">
+    <div class="sum-card"><div class="sum-n">${srvs.length}</div><div class="sum-l">Server${srvs.length === 1 ? '' : 's'} scanned</div></div>
+    <div class="sum-card"><div class="sum-n">${findings.length}</div><div class="sum-l">Finding${findings.length === 1 ? '' : 's'}</div></div>
+    ${SEVS.filter(k => sevCounts[k]).map(k => `<a class="sum-card sum-sev sev-${k}" href="#findings" data-jump="${k}"><div class="sum-n">${sevCounts[k]}</div><div class="sum-l">${k}</div></a>`).join('')}
+    ${adjustedCount ? `<div class="sum-card"><div class="sum-n">${adjustedCount}</div><div class="sum-l">Severity adjusted by tester</div></div>` : ''}
+  </section>`;
   const html = `<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
@@ -15551,10 +16541,12 @@ function exportHTML() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MCPoke Report: ${he(now)}</title>
 ${_reportStyleBlock()}
+${_reportFindingsStyle()}
 </head>
 <body>
 <div class="header">
   <h1>&#9741; MCPoke Report</h1>
+  <nav class="rnav"><a href="#servers">Servers</a><a href="#findings">Findings</a></nav>
   <span class="ts">Generated ${he(now)}</span>
   <button class="theme-btn" id="tbtn" onclick="
     var t=document.documentElement;
@@ -15564,10 +16556,53 @@ ${_reportStyleBlock()}
   ">&#9728; Light</button>
 </div>
 <div class="container">
-  ${findingsHtml}
+  ${summaryHtml}
   ${serversHtml}
-  ${histHtml}
+  ${findingsHtml}
 </div>
+<script>
+(function () {
+  var cards = [].slice.call(document.querySelectorAll('#fall .fcard'));
+  var sevOn = {};
+  var q = document.getElementById('fq'), st = document.getElementById('fst'), sv = document.getElementById('fsrv');
+  function apply() {
+    var text = q ? q.value.trim().toLowerCase() : '', stat = st ? st.value : '', srv = sv ? sv.value : '';
+    var any = Object.keys(sevOn).some(function (k) { return sevOn[k]; });
+    var shown = 0;
+    cards.forEach(function (c) {
+      var ok = (!any || sevOn[c.dataset.sev]) && (!stat || c.dataset.status === stat) && (!srv || ('|' + c.dataset.servers + '|').indexOf('|' + srv + '|') >= 0) && (!text || c.dataset.text.indexOf(text) >= 0);
+      c.style.display = ok ? '' : 'none';
+      if (ok) shown++;
+    });
+    [].forEach.call(document.querySelectorAll('#fall .fgroup'), function (g) {
+      g.style.display = g.querySelector('.fcard:not([style*="display: none"])') ? '' : 'none';
+    });
+    var c = document.getElementById('fcount'); if (c) c.textContent = shown + ' of ' + cards.length + ' shown';
+    var e = document.getElementById('fempty'); if (e) e.style.display = shown ? 'none' : '';
+  }
+  [].forEach.call(document.querySelectorAll('.fchip'), function (b) {
+    b.addEventListener('click', function () {
+      sevOn[b.dataset.sev] = !sevOn[b.dataset.sev];
+      b.setAttribute('aria-pressed', sevOn[b.dataset.sev] ? 'true' : 'false');
+      b.classList.toggle('on', !!sevOn[b.dataset.sev]); apply();
+    });
+  });
+  [].forEach.call(document.querySelectorAll('.sum-sev'), function (a) {
+    a.addEventListener('click', function () {
+      sevOn = {}; sevOn[a.dataset.jump] = true;
+      [].forEach.call(document.querySelectorAll('.fchip'), function (b) {
+        var on = b.dataset.sev === a.dataset.jump; b.classList.toggle('on', on); b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+      apply();
+    });
+  });
+  if (q) q.addEventListener('input', apply);
+  if (st) st.addEventListener('change', apply);
+  if (sv) sv.addEventListener('change', apply);
+  apply();
+  window.addEventListener('beforeprint', function () { [].forEach.call(document.querySelectorAll('details'), function (d) { d.open = true; }); });
+})();
+<\/script>
 </body>
 </html>`;
 
@@ -18200,7 +19235,7 @@ async function runOAuthProbe(srv, baseUrl) {
   try {
     const res  = await fetch('/oauth-probe', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url: baseUrl, proxy: srv.proxy || null}),
+      body: JSON.stringify({url: baseUrl, proxy: srv.proxy || null, server_url: srv.url}),
     });
     const data = await res.json();
 
@@ -18209,7 +19244,10 @@ async function runOAuthProbe(srv, baseUrl) {
 
     if (data.metadata) {
       const m = data.metadata;
+      const prmAs = data.prm && Array.isArray(data.prm.authorization_servers) ? data.prm.authorization_servers.join(', ') : '';
       const rows = [
+        ['Protected resource (RFC 9728)', data.prm_url || 'not found'],
+        ['Authorization servers (PRM)',   prmAs || 'none'],
         ['Discovery URL',          m._discovered_at || '—'],
         ['Authorization endpoint', m.authorization_endpoint || '—'],
         ['Token endpoint',         m.token_endpoint || '—'],
@@ -18862,11 +19900,205 @@ window.addEventListener('DOMContentLoaded', () => {
   initProject();  // loads project / shows picker; calls loadCache() after session restore
 });
 
+// ── AI Catalog (/.well-known/ai-catalog.json) ─────────────────────────────
+// Spec: https://ai-catalog.io/spec/. A JSON index (media type
+// application/ai-catalog+json) with required specVersion + entries[]; each entry
+// needs identifier, type and exactly one of url / data. MCP servers appear as
+// type application/mcp-server-card+json. Everything in it is server-controlled:
+// entry URLs are SSRF/beacon targets for any consumer that follows them, and the
+// text fields (displayName, description, tags) land in an agent's context.
+const AI_CATALOG_PATH = '/.well-known/ai-catalog.json';
+const AI_CATALOG_MAX_ENTRIES = 200;
+
+function _parseAiCatalog(text) {
+  let j; try { j = JSON.parse(text); } catch (e) { return null; }
+  return (j && typeof j === 'object' && !Array.isArray(j)) ? j : null;
+}
+// Endpoint URLs a server card names (server.json style remotes[].url, or a
+// top-level url/endpoint), http(s) only.
+function _catalogEndpoints(card) {
+  const out = [];
+  if (!card || typeof card !== 'object') return out;
+  for (const r of (Array.isArray(card.remotes) ? card.remotes : []))
+    if (r && typeof r.url === 'string') out.push(r.url);
+  for (const k of ['url', 'endpoint']) if (typeof card[k] === 'string') out.push(card[k]);
+  return out.filter(u => /^https?:\/\//i.test(u));
+}
+
+const CATALOG_REMEDIATION = 'Treat every AI Catalog entry as untrusted server input. Do not auto-fetch entry URLs: validate scheme and resolved address first, restrict to the publisher\'s own origin or an allowlist, and block internal, loopback and link-local targets. Do not put free text from displayName/description/tags in front of a model without review.';
+const _CATALOG_RISK_TEXT = {
+  internal: 'points at an internal/loopback/link-local address: a consumer that follows it is coerced into a client-side SSRF request, including cloud metadata endpoints',
+  port: 'targets a different port on the catalog host\'s own internal address: a consumer that follows it probes another local service',
+  offhost: 'is a remote URL on a host different from the one serving the catalog: a consumer that follows it leaks its IP and timing to that host',
+  scheme: 'uses a non-HTTP(S) scheme (file:, ftp:, javascript:, ...) a consumer may resolve locally',
+  plaintext: 'is plaintext HTTP while the catalog was served over HTTPS: content can be substituted in transit',
+};
+function analyzeAiCatalog(srv, text) {
+  const cat = _parseAiCatalog(text);
+  if (!cat || (!('entries' in cat) && !('specVersion' in cat))) return {valid: false};
+  const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  const push = (item, severity, category, detail) => _pushFindingDedup(srv, {
+    severity, category, server: srvShort, item, detail, remediation: CATALOG_REMEDIATION,
+    source: 'auto', serverUrl: srv.url});
+  const problems = [];
+  if (typeof cat.specVersion !== 'string') problems.push('missing specVersion');
+  if (!Array.isArray(cat.entries)) problems.push('missing entries array');
+  const entries = Array.isArray(cat.entries) ? cat.entries : [];
+  if (entries.length > AI_CATALOG_MAX_ENTRIES) problems.push(`${entries.length} entries (only the first ${AI_CATALOG_MAX_ENTRIES} analysed)`);
+  const scan = (where, itemKey, t) => { if (typeof t === 'string' && t) _scanForSplitting(srv, undefined, 'ai-catalog', where, itemKey, t); };
+  if (cat.host !== undefined) scan('AI Catalog host object', 'ai-catalog:host', JSON.stringify(cat.host).slice(0, 100000));
+  entries.slice(0, AI_CATALOG_MAX_ENTRIES).forEach((e, i) => {
+    if (!e || typeof e !== 'object') { problems.push(`entry ${i} is not an object`); return; }
+    const id = String(e.identifier ?? e.displayName ?? ('#' + i)).slice(0, 80);
+    const item = `ai-catalog:${id}`;
+    if (typeof e.identifier !== 'string') problems.push(`entry ${i} missing identifier`);
+    if (typeof e.type !== 'string') problems.push(`entry "${id}" missing type`);
+    const hasUrl = typeof e.url === 'string', hasData = e.data !== undefined;
+    if (hasUrl === hasData) problems.push(`entry "${id}" must have exactly one of url or data`);
+    const textFields = {identifier: e.identifier, displayName: e.displayName, description: e.description,
+      tags: Array.isArray(e.tags) ? e.tags.join(' ') : e.tags, version: e.version,
+      publisher: (e.publisher && typeof e.publisher === 'object') ? JSON.stringify(e.publisher) : e.publisher};
+    for (const [f, v] of Object.entries(textFields)) scan(`AI Catalog entry "${id}" ${f}`, item, v);
+    if (hasData) scan(`AI Catalog entry "${id}" inline data`, item, JSON.stringify(e.data).slice(0, 100000));
+    const urls = [];
+    if (hasUrl) urls.push(['url', e.url]);
+    if (hasData && /server-card/i.test(String(e.type || ''))) for (const u of _catalogEndpoints(e.data)) urls.push(['inline card endpoint', u]);
+    for (const [label, u] of urls) {
+      const risk = _urlRisk(u, srv.url);
+      if (!risk) continue;
+      push(item, risk === 'internal' ? 'high' : (risk === 'plaintext' ? 'low' : 'medium'), 'Client-Side SSRF',
+        `AI Catalog entry "${id}" ${label} ${_CATALOG_RISK_TEXT[risk]}: ${u}`);
+    }
+  });
+  if (problems.length) push('ai-catalog:structure', 'low', 'AI Catalog',
+    `The catalog does not follow the AI Catalog spec: ${problems.slice(0, 8).join('; ')}${problems.length > 8 ? '; ...' : ''}`);
+  return {valid: true, entries: entries.length, problems};
+}
+
+// Entry list + "Connect" buttons under the probe response viewer. Built from the
+// response text each time (works for live and saved results). Server data goes
+// in via esc()/dataset only, never into an inline handler.
+let _catalogEntries = [];
+function _renderCatalogActions(path, text) {
+  const box = document.getElementById('probe-detail-actions');
+  if (!box) return;
+  box.innerHTML = ''; _catalogEntries = [];
+  if (path !== AI_CATALOG_PATH) return;
+  const cat = _parseAiCatalog(text);
+  if (!cat || !Array.isArray(cat.entries)) return;
+  const srv = S.servers[S.activeUrl];
+  const rows = [];
+  cat.entries.slice(0, AI_CATALOG_MAX_ENTRIES).forEach(e => {
+    if (!e || typeof e !== 'object') return;
+    const type = String(e.type || '');
+    const url = typeof e.url === 'string' ? e.url : '';
+    const risk = url ? _urlRisk(url, srv && srv.url) : null;
+    let httpish = false;
+    try { httpish = /^https?:$/.test(new URL(url, srv.url).protocol); } catch (_) {}
+    const canConnect = /mcp/i.test(type) && ((e.data !== undefined && /server-card/i.test(type)) || httpish) && risk !== 'scheme';
+    const idx = canConnect ? _catalogEntries.push(e) - 1 : -1;
+    rows.push(`<tr style="border-top:1px solid var(--border)">
+      <td style="padding:2px 6px 2px 0">${esc(String(e.displayName || e.identifier || '(unnamed)').slice(0, 60))}</td>
+      <td style="padding:2px 6px;color:var(--muted)">${esc(type.slice(0, 48))}</td>
+      <td style="padding:2px 6px;word-break:break-all">${esc(url.slice(0, 90)) || `<span style="color:var(--muted)">${e.data !== undefined ? 'inline data' : '(no url or data)'}</span>`}${risk ? ` <span style="color:${_ICON_COLOR[risk] || 'var(--red)'};font-weight:700" title="${esc(_CATALOG_RISK_TEXT[risk] || '')}">[${esc(_ICON_LABEL[risk] || risk)}]</span>` : ''}</td>
+      <td style="padding:2px 0">${canConnect ? `<button class="btn-sm" style="font-size:10px;padding:1px 6px" data-i="${idx}" onclick="catalogConnect(this.dataset.i)" title="Resolve this entry to an MCP endpoint and connect (asks first, sends no credentials)">Connect</button>` : ''}</td></tr>`);
+  });
+  if (rows.length) box.innerHTML = `<div style="margin:0 0 6px;font-size:10px;color:var(--muted)">CATALOG ENTRIES (${rows.length})</div>
+    <table style="width:100%;font-size:11px;font-family:monospace;border-collapse:collapse">${rows.join('')}</table>`;
+}
+
+// Resolve a catalog entry to an MCP endpoint and connect to it. Server-card
+// URLs are fetched through the guarded fetcher (never a raw fetch), the card is
+// scanned like any other server text, and the final connect is confirmed with
+// the endpoint and its risk spelled out. No token or custom headers are sent.
+async function catalogConnect(i) {
+  const e = _catalogEntries[Number(i)];
+  const srv = S.servers[S.activeUrl];
+  if (!e || !srv) return;
+  const isCard = /server-card/i.test(String(e.type || ''));
+  let endpoint = null;
+  if (e.data !== undefined && isCard) {
+    endpoint = _catalogEndpoints(e.data)[0];
+  } else if (typeof e.url === 'string') {
+    let abs;
+    try { abs = new URL(e.url, srv.url).href; } catch (_) { alert('The entry URL is not valid.'); return; }
+    if (!isCard) endpoint = abs;
+    else {
+      if (!confirm(`Fetch this server card from MCPoke's own machine to find its MCP endpoint?\n\n${abs}\n\nGuards: public addresses only, https only, no credentials sent, 1 MB / 10 s cap. The card is scanned, never rendered.`)) return;
+      const data = await _guardedFetch(srv.url, abs, 'ai-catalog-fetch');
+      if (!data) return;
+      _scanForSplitting(srv, data.histId, 'ai-catalog-card', `AI Catalog server card (${data.final_url})`, 'ai-catalog:card', data.text);
+      let card;
+      try { card = JSON.parse(data.text); } catch (_) { alert('The server card is not valid JSON.'); return; }
+      endpoint = _catalogEndpoints(card)[0];
+    }
+  }
+  if (!endpoint) { alert('No http(s) MCP endpoint found in this entry.'); return; }
+  const risk = _urlRisk(endpoint, srv.url);
+  const note = risk ? `\n\nWarning: this endpoint ${_CATALOG_RISK_TEXT[risk]}.` : '';
+  if (!confirm(`Connect MCPoke to the server this catalog entry names?\n\n${endpoint}${note}\n\nNo token or custom headers are sent.`)) return;
+  if (S.servers[normalizeUrl(endpoint)]) await connectServer(endpoint);
+  else await connectServer(endpoint, '', null, null);
+}
+
+// Other discovery documents under /.well-known/ (server cards, A2A agent cards,
+// the legacy ai-plugin manifest, RFC 9727 api-catalog linksets, MCP manifests and
+// OAuth protected-resource metadata). Their schemas are young or loose, so this
+// reads them generically: every http(s) URL is judged for SSRF (internal,
+// other-port and non-HTTP schemes; off-host is normal for these, a card's
+// endpoint is usually elsewhere) and every other string is scanned for injection
+// and GhostSplice text, since all of it is server-controlled content an agent or
+// client will read.
+const _DISCOVERY_DOC_RE = /^\/\.well-known\/(mcp(\/server-cards?\.json)?|agent-card\.json|agent\.json|ai-plugin\.json|api-catalog|oauth-protected-resource(\{mcp\})?)$/;
+const _DANGEROUS_SCHEME_RE = /^(file|ftp|ftps|sftp|gopher|javascript|vbscript|jar|ldap|dict|smb|tftp):/i;
+function analyzeDiscoveryDoc(srv, path, text) {
+  let doc; try { doc = JSON.parse(text); } catch (e) { return {valid: false}; }
+  if (!doc || typeof doc !== 'object') return {valid: false};
+  const label = path.replace('/.well-known/', '');
+  const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  const strings = [];
+  (function walk(v, key, depth) {
+    if (strings.length >= 2000 || depth > 8) return;
+    if (typeof v === 'string') strings.push([key, v]);
+    else if (Array.isArray(v)) v.slice(0, 200).forEach(x => walk(x, key, depth + 1));
+    else if (v && typeof v === 'object') for (const [k, x] of Object.entries(v).slice(0, 200)) walk(x, k, depth + 1);
+  })(doc, '', 0);
+  let urls = 0, texts = 0;
+  const seen = new Set();
+  for (const [key, v] of strings) {
+    if (/^[a-z][a-z0-9+.-]*:\S*$/i.test(v)) {
+      let risk = null;
+      if (/^https?:/i.test(v)) { risk = _urlRisk(v, srv.url); if (risk === 'offhost') risk = null; }
+      else if (_DANGEROUS_SCHEME_RE.test(v)) risk = 'scheme';
+      if (!risk || seen.has(v)) continue;
+      seen.add(v); urls++;
+      _pushFindingDedup(srv, {
+        severity: risk === 'internal' ? 'high' : (risk === 'plaintext' ? 'low' : 'medium'),
+        category: 'Client-Side SSRF', server: srvShort, item: `well-known:${label}`,
+        detail: `${label} "${key}" = ${v} ${_CATALOG_RISK_TEXT[risk]}`,
+        remediation: CATALOG_REMEDIATION, source: 'auto', serverUrl: srv.url});
+    } else if (v.length >= 3 && !/^\S*\/\S*$/.test(v)) {
+      texts++;
+      _scanForSplitting(srv, undefined, 'well-known', `${label} field "${key}"`, `well-known:${label}`, v);
+    }
+  }
+  return {valid: true, strings: strings.length, urls, texts};
+}
+
 // ── Path Probe ─────────────────────────────────────────────────────────────
 
 const PROBE_PATHS = [
   // MCP / API spec
   {path:'/.well-known/mcp.json',             cat:'MCP',       desc:'MCP server capability manifest'},
+  {path:'/.well-known/ai-catalog.json',      cat:'MCP',       desc:'AI Catalog (agent / MCP server discovery index)'},
+  {path:'/.well-known/mcp/server-card.json', cat:'MCP',       desc:'MCP Server Card (SEP-1649 draft path)'},
+  {path:'/.well-known/mcp/server-cards.json', cat:'MCP',      desc:'MCP Server Cards index (SEP-2127 draft, path unconfirmed)'},
+  {path:'/.well-known/mcp',                  cat:'MCP',       desc:'MCP discovery manifest (SEP-1960 draft)'},
+  {path:'/.well-known/agent-card.json',      cat:'MCP',       desc:'A2A agent card'},
+  {path:'/.well-known/agent.json',           cat:'MCP',       desc:'A2A agent card (legacy path)'},
+  {path:'/.well-known/ai-plugin.json',       cat:'MCP',       desc:'Legacy ChatGPT plugin manifest (description_for_model is model-facing text)'},
+  {path:'/.well-known/api-catalog',          cat:'API Spec',  desc:'API catalog linkset (RFC 9727)'},
+  {path:'/.well-known/security.txt',          cat:'Info',      desc:'security.txt (RFC 9116)'},
   {path:'/openapi.json',                     cat:'API Spec',  desc:'OpenAPI spec (JSON)'},
   {path:'/openapi.yaml',                     cat:'API Spec',  desc:'OpenAPI spec (YAML)'},
   {path:'/docs',                             cat:'API Spec',  desc:'Swagger UI (FastAPI default)'},
@@ -18921,6 +20153,10 @@ const PROBE_PATHS = [
   {path:'/.well-known/openid-configuration', cat:'Auth',      desc:'OIDC discovery document'},
   {path:'/.well-known/jwks.json',            cat:'Auth',      desc:'JWKS public signing keys'},
   {path:'/.well-known/oauth-authorization-server', cat:'Auth', desc:'OAuth 2.0 server metadata'},
+  {path:'/.well-known/oauth-protected-resource', cat:'Auth', desc:'Protected resource metadata (RFC 9728, required by MCP)'},
+  {path:'/.well-known/oauth-protected-resource{mcp}', cat:'Auth', desc:'Protected resource metadata, path-inserted for this server\'s MCP path'},
+  {path:'/.well-known/oauth-authorization-server{mcp}', cat:'Auth', desc:'OAuth server metadata, path-inserted (RFC 8414)'},
+  {path:'/.well-known/openid-configuration{mcp}', cat:'Auth', desc:'OIDC discovery, path-inserted'},
 ];
 
 // Per-category severity for the auto-finding a successful probe generates:
@@ -19038,6 +20274,7 @@ function openProbeModal() {
       <span id="probe-detail-title" style="font-size:11px;color:var(--muted);font-family:monospace"></span>
       <button class="btn-sm" onclick="document.getElementById('probe-detail').style.display='none';document.getElementById('probe-detail-resizer').style.display='none'" style="font-size:10px;padding:1px 5px">&#10005;</button>
     </div>
+    <div id="probe-detail-actions" style="margin-bottom:8px"></div>
     <pre id="probe-detail-body" style="margin:0;font-size:11px;white-space:pre-wrap;word-break:break-all;color:var(--fg)"></pre>
   </div>
 </div>`;
@@ -19061,11 +20298,18 @@ async function runOneProbe(idx) {
   const p = _probePathAt(idx);
   if (!p) return;
   const origin = (() => { try { return new URL(srv.url).origin; } catch { return srv.url; } })();
-  const url = origin + p.path;
-
+  // {mcp} in a path stands for the MCP endpoint's own path (RFC 8414/9728 path
+  // insertion); a server at the origin root has nothing to insert.
+  const mcpPath = (() => { try { return new URL(srv.url).pathname.replace(/\/+$/, ''); } catch { return ''; } })();
   const iconEl   = document.getElementById(`probe-icon-${idx}`);
   const statusEl = document.getElementById(`probe-status-${idx}`);
   const sizeEl   = document.getElementById(`probe-size-${idx}`);
+  if (p.path.includes('{mcp}') && !mcpPath) {
+    if (statusEl) statusEl.innerHTML = '<span style="color:var(--muted)" title="This server is at the origin root, so there is no path to insert">n/a</span>';
+    if (iconEl) iconEl.textContent = '○';
+    return;
+  }
+  const url = origin + p.path.replace('{mcp}', mcpPath);
   if (iconEl) iconEl.textContent = '⏳';
 
   let authHdr = srv.token ? `Bearer ${srv.token}` : null;
@@ -19120,6 +20364,8 @@ async function runOneProbe(idx) {
           });
           renderFindings();
         }
+        if (p.path === AI_CATALOG_PATH) analyzeAiCatalog(activeSrv, rawText);
+        else if (_DISCOVERY_DOC_RE.test(p.path)) analyzeDiscoveryDoc(activeSrv, p.path, rawText);
       }
     }
   } catch(e) {
@@ -19140,6 +20386,7 @@ function _showProbeDetail(path, text) {
   let display = text;
   try { display = JSON.stringify(JSON.parse(text), null, 2); } catch {}
   b.textContent = display.slice(0, 8000);
+  _renderCatalogActions(path, text);
   d.style.display = 'block';
   if (r) r.style.display = 'block';
 }

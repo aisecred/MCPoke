@@ -107,7 +107,7 @@ A malicious server can smuggle a split instruction through *any* channel that ca
   A prompt's list-time metadata was already scanned; the actual messages a prompt renders when invoked now are too (`_runPromptGetChecks`).
 - [x] **`structuredContent`**
   Now scanned for injection language (stringified as a whole, since it can be any JSON value per 2026-07-28), in addition to the existing `outputSchema` shape check.
-- [x] **`serverInfo.instructions`** (returned at `initialize`)
+- [x] **`instructions`** (top-level field of `InitializeResult`, returned at `initialize`)
   Now scanned at connect time (`_runServerInstructionsChecks`), across all three connect paths (HTTP, SSE, stdio).
 - [x] **`resource_link.name` / `.description`** (inside tool results)
   The `uri` was already checked for SSRF; the accompanying display text is now scanned for injection too.
