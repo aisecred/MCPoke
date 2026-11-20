@@ -30,10 +30,11 @@ The MCP spec is young and implementations vary widely. Auth handling, input vali
 - **Capability analysis**, surfaces the `initialize` response capabilities with risk annotations: `sampling` (server can invoke AI models, critical), `roots` (filesystem access declared), `experimental` (undocumented features), `tasks` (2025-11-25 durable long-running operations, flags `tasks.list` enumeration and task-ID IDOR exposure)
 - **Icon URL SSRF scanner**: passive scan of `icons[].src` on every tool, resource, and prompt (2025-11-25 icons); the MCP client fetches these URLs to render them, so flags internal/loopback/metadata targets (client-side SSRF), off-host remote URLs (tracking beacon leaking user IP/timing), and plaintext HTTP (MITM)
 - **Origin validation (DNS rebinding)**: every HTTP connect sends one `initialize` with a foreign `Origin`. A server that accepts it instead of answering 403 is flagged (the streamable-HTTP transport requires rejection), and one that reflects the origin in `Access-Control-Allow-Origin` is flagged as a CORS misconfiguration (critical with `Allow-Credentials`)
-- **Paginated lists**: `tools/list`, `resources/list`, `prompts/list` and `resources/templates/list` are followed through `nextCursor` (up to 25 pages), so an entry on page 2 or later is scanned like any other
+- **Paginated lists**: `tools/list`, `resources/list`, `prompts/list` and `resources/templates/list` are followed through `nextCursor` (up to 25 pages), so an entry on page 2 or later is scanned like any other; a server that is still returning pages at the cap raises a `pagination-cap` finding so the truncation is never silent
 - **MCP Apps UI scanner**: passive scan for tools declaring `_meta.ui.resourceUri` (2026-07-28 `io.modelcontextprotocol/ui`); the host renders this server-supplied HTML in a sandboxed iframe with a tool-invocation bridge, so flags the confused-deputy / phishing surface (`ui://` scheme) and escalates when the UI resource is loaded from an external, internal, or `data:` URL (external HTML fetch / client-side SSRF); the UI resource content itself is scanned too (`ui://` automatically, external URLs on demand via a guarded fetcher)
 - **Prompt injection / tool poisoning scanner**: passive scan on connect of all tool names, descriptions, parameter descriptions, resource names/URIs, and prompt content; flags instruction overrides, template injection, hidden Unicode, CRLF injection, exfiltration indicators, and LLM-specific delimiters; shows ⚑ badge per item
 - **GhostSplice / instruction-splitting detection**, flags tools with opaquely-named parameters, scans tool results, resource reads, and error responses for language that maps sensitive data onto those parameters, and escalates to a confirmed finding when two fragments correlate, see [GhostSplice / instruction-splitting detection](#ghostsplice--instruction-splitting-detection) below
+- **Server compare**: diff two servers' tools, resources and prompts (only in A, only in B, shared and changed), or view a presence matrix across every connected server. Export HTML writes a standalone report with the same layout as the findings report: sticky header, summary counts, one page per section, and an All view for printing
 - **Cross-server tool shadowing detection**: flags duplicate tool names across connected servers; a malicious server registering the same name as a legitimate one can intercept calls
 - **Transport security info**: TLS/plaintext indicator per server; fetches cert details (CN, expiry, self-signed flag) on hover
 - **SSE notification capture**: live feed of server-pushed `notifications/` events that most clients silently discard
@@ -44,20 +45,20 @@ The MCP spec is young and implementations vary widely. Auth handling, input vali
 - **Payload library per parameter**: dropdown next to every string input injects a chosen test payload from preset categories: path traversal, SSRF, command injection, prompt injection, template injection, SQLi, CRLF, XXE, LDAP, and more
 - **Schema-aware type confusion payloads**: payload picker adds a "Type confusion" category based on each parameter's declared JSON schema type (e.g. integer fields get `"1"`, `null`, `[]`, `{}`, `true`)
 - **Protocol edge case presets**: dropdown in the raw editor injects MCP-specific malformed payloads (wrong `protocolVersion`, missing `jsonrpc`, `id: null`, batch requests, unknown methods) plus underexplored MCP methods (`ping`, `completion/complete`, `resources/subscribe`, `logging/setLevel`)
-- **Copy as cURL / Python**: one-click export of the current request as a `curl` command or Python `requests` snippet, including all auth and custom headers; copies to clipboard
+- **Copy as cURL / Python**: one-click export of the current request as a `curl` command or Python `requests` snippet, including all auth and custom headers; copies to clipboard. Each history row also has a **Copy cURL** button that copies that entry exactly as it was sent, including the headers and token it used
 - **OOB callback URL**: set an OOB callback URL (e.g. interactsh) once in the header; payloads with placeholder domains are auto-substituted before sending
 
 ### Active testing
 - **Fuzzer**: mark a value in the raw editor with `§§`, open the Fuzzer, select payloads from presets / paste / file upload, fire sequentially with configurable delay; size anomaly detection flags responses deviating ≥20% from baseline; timing anomaly detection flags responses taking ≥2× the median elapsed time (surfaces blind time-based injection)
   - **Resizable detail pane**: click any result row to open a split request/response pane at the bottom of the results table; drag the divider to resize
   - **Double-click full view**: double-click a row for a full-screen popup showing the exact request payload sent and the complete response side by side
-- **Auth variation tester**: fires the same request with six auth variations automatically (current token, no auth, invalid token, empty bearer, `Authorization: null`, alg:none JWT); compares response bodies against the authenticated baseline and flags identical responses as confirmed bypass regardless of HTTP status
+- **Auth variation tester**: fires the same request with six auth variations when you click **Run** (current token, no auth, invalid token, empty bearer, `Authorization: null`, alg:none JWT); compares response bodies against the authenticated baseline and flags identical responses as confirmed bypass regardless of HTTP status; an optional endpoint check also compares authentication across the host's other MCP paths and transports
   - **JWT claims tamper**: when the current token is a JWT, adds six additional mutations: `role=admin`, `role=superuser`, `sub=admin`, `sub=0` (IDOR), expired (`exp=1`), far-future expiry
   - **Custom header probing**: when custom headers are configured (e.g. `X-API-Key`), adds variations that strip or invalidate each key; prevents false positives on servers that use custom headers instead of Bearer tokens for authentication
 - **Race condition tester**: fires N concurrent requests (5–50) via the **Race** button; results table flags outliers whose HTTP status or response size deviates from the majority
 - **History Fuzzer**: open from any history entry via the **⚡ Fuzz** button; select a parameter leaf as the fuzz target, choose preset categories or paste a wordlist, fire sequentially; size and timing anomaly detection; export as CSV
 - **Response diff viewer**: check any two history entries and click **Diff** to see a line-level diff
-- **MCP OAuth 2.0 / PKCE tester**: probes OAuth flows on connected servers: discovers `/.well-known/oauth-authorization-server`, tests PKCE enforcement, open redirect validation, token endpoint client auth, bogus `client_credentials`, and privileged scope acceptance; findings roll into the Findings panel
+- **MCP OAuth 2.0 / PKCE tester**: probes OAuth flows on connected servers: discovers `/.well-known/oauth-authorization-server`, checks Protected Resource Metadata (RFC 9728) and authorization server metadata (RFC 8414), tests PKCE enforcement and advertisement, open redirect validation, token endpoint client auth, bogus `client_credentials`, privileged scope acceptance, open Dynamic Client Registration, token audience binding, and the `insufficient_scope` challenge; findings roll into the Findings panel
 
 ### Findings and reporting
 - **Findings panel**: aggregates all passive and active findings across all connected servers; double-click the panel header to expand full-screen
@@ -69,7 +70,7 @@ The MCP spec is young and implementations vary widely. Auth handling, input vali
 - **Response sensitive data detection**: scans every response for AWS/GCP/Azure credential formats, JWTs, private key headers, internal file paths, RFC 1918 IPs, stack traces, Slack/GitHub tokens
 - **Notes per tool**: inline text field per tool for operator annotations during a session; included in JSON export
 - **Session export / import**: export the full session (servers, schemas, history, findings, notes, triage status) to JSON and reload it later; use **Export Session** / **Import Session** in the top toolbar
-- **Request history**: every call is logged with method, args, status, and elapsed time; filter by tool name, server, or args; replay any entry, export as JSON or Markdown
+- **Request history**: every call is logged with method, args, status, and elapsed time; filter by tool name, server, or args; replay any entry, copy it as cURL, export as JSON, Markdown or HTML
 - **Custom request headers**: set arbitrary headers per server (e.g. `X-API-Key`, `X-Tenant-ID`) sent on every request alongside the Bearer token; shown as a green **hdrs** badge in the sidebar
 - **HTTP/SOCKS proxy support**: route traffic per-server through any HTTP/SOCKS proxy (e.g. for traffic inspection)
 
@@ -142,7 +143,7 @@ SOCKS proxy support (`aiohttp-socks`) is included in `requirements.txt` and inst
 
 6. **Use the protocol presets**: send malformed payloads to understand how strictly the server validates the MCP spec. Servers that silently accept wrong protocol versions or batch requests may have other validation gaps.
 
-7. **Export**: export findings as CSV, JSON, or Markdown for your report. Export history as JSON or Markdown for evidence.
+7. **Export**: use the **Export** dropdown. Findings export as an HTML report (servers first, then findings with per-server risk and a server filter), CSV, JSON or Markdown. Request history exports separately as JSON, Markdown or HTML, so a large fuzzing run never bloats the report.
 
 ---
 
@@ -220,7 +221,7 @@ Each string input has a payload picker button (▾) with preset injection catego
 - Calling methods not in the schema (`resources/list`, `prompts/list`, etc.)
 - Missing required fields, oversized values, injection payloads
 
-Switch between modes with the **Form / Raw** toggle. Use **← Sync to form** to pull raw edits back into the form fields.
+Switch between modes with the **Form / Raw** toggle. Use **← Sync to form** to pull raw edits back into the form fields. If the raw request names a different tool, MCPoke switches to that tool first, and any argument with no matching form field is listed in a banner instead of being dropped silently.
 
 `Ctrl+Enter` sends the current request.
 
@@ -243,7 +244,7 @@ Results table shows HTTP status, RPC status, elapsed time, response size, and a 
 
 ### Auth variation tester
 
-Click **⚡ Auth** in the raw editor action bar to fire six auth variations against the current request simultaneously:
+Click **⚡ Auth** in the raw editor action bar. The panel opens showing what it will send and **sends nothing until you click Run**, because every variation carries the request in the editor (including a destructive tool call). Run fires six auth variations against it:
 
 | # | Variation |
 |---|---|
@@ -259,6 +260,8 @@ If the current token is a JWT, six additional claim-mutation rows are added: `ro
 If the server has **custom headers** configured (e.g. `X-API-Key`), additional rows are added for each key (up to 3): all custom headers removed, the specific key removed, and the key set to `invalid`. This covers servers that use a custom header instead of (or in addition to) Bearer tokens for authentication: preventing false positives when the Bearer token column is empty.
 
 Responses are compared body-to-body against the authenticated baseline. A `≡ match` badge on any unauthenticated row is a confirmed auth bypass.
+
+**Also check other endpoints on this host** (on by default, HTTP servers only). After the variations, MCPoke probes the usual MCP paths on the same host (`/mcp`, `/`, `/rpc`, `/api`, `/v1`, `/sse`, `/events`, `/stream`, plus the message endpoint an SSE server advertises) with no credentials, and with yours if you set any. The **Endpoint parity** table shows which ones answer and which demand auth. If some answer without credentials while others require them, MCPoke raises a **high** Auth Bypass finding naming both sets: the usual leftover when a server moved from SSE to Streamable HTTP and only secured one. Only paths MCPoke guesses are tested; a transport on an unusual path will not be found.
 
 ### Race condition tester
 
@@ -318,26 +321,40 @@ Set the proxy field per-server to route all traffic for that server through an H
 
 ### OAuth 2.0 / PKCE probe
 
-MCP servers that require authentication may implement an OAuth 2.0 authorization server. Click **OAuth** in the request panel action bar to run a passive probe against the server's base URL.
+MCP servers that require authentication may implement an OAuth 2.0 authorization server. Click **OAuth** in the request panel action bar to probe the server's authorization setup against the current MCP authorization spec.
 
-MCPoke runs six checks automatically:
+Discovery and metadata checks (no extra traffic beyond the metadata fetches):
+
+| Check | What it flags |
+|---|---|
+| Protected Resource Metadata | Missing or empty `authorization_servers`, `resource` that does not match the server, internal or plaintext authorization server URLs, `offline_access` in `scopes_supported` |
+| Authorization server metadata | `issuer` that differs from the URL it was fetched from, no `code_challenge_methods_supported`, no `S256`, `plain` offered, no Client ID Metadata Document support, no RFC 9207 `iss` advertisement |
+| 401 challenge | No `scope=` parameter, `offline_access` in the challenge |
+
+Active probes (sent only to the target's own origin):
 
 | Check | What it tests |
 |---|---|
-| Discovery | Fetches `/.well-known/oauth-authorization-server` and `/.well-known/openid-configuration` |
-| No PKCE | Sends an authorization request without `code_challenge`: PKCE should be required |
-| Open redirect | Sends an authorization request with an unregistered `redirect_uri` (`evil.example.com`) |
-| Token: no client auth | Requests a token with no `client_id` or `client_secret` |
-| Token: bogus credentials | Attempts `client_credentials` grant with a fabricated client |
-| Privileged scopes | Requests `*`, `admin`, and broad OpenID scopes to test scope validation |
+| No PKCE | Authorization request without `code_challenge`: PKCE should be required |
+| Open redirect | Authorization request with an unregistered `redirect_uri` |
+| Token: no client auth / bogus credentials | Token requests with no client, and `client_credentials` for a fabricated client |
+| Privileged scopes | Requests `*`, `admin` and broad OpenID scopes |
+| Open registration | Unauthenticated Dynamic Client Registration (deprecated in the current spec in favor of Client ID Metadata Documents) |
+| Resource indicators (RFC 8707) | Authorization and token requests carry `resource=<this server>` as the spec requires. When registration was open, the probe also asks for a code for a resource the server cannot serve; a code issued for both raises a low finding, `invalid_target` passes |
+| Token audience | When the token endpoint will issue a token, presents one issued for another resource and expects a 401 |
+| Insufficient scope | Presents a token with no scopes and checks that a 403 carries `error="insufficient_scope"`, `scope=` and `resource_metadata` |
 
-Results appear in a table inside the OAuth modal. Any confirmed issues are automatically added to the server's Findings panel with remediation guidance.
+The two token checks run only when the token endpoint hands a token to an unregistered client. The resource-indicator check runs only when registration is open, since an unknown client would fail for reasons unrelated to `resource`. When these cannot run, the table says so.
+
+**Real tokens (optional):** open "Check with real access tokens" in the OAuth modal to supply a token issued for this server and, optionally, one issued for a different audience, then click **Run again with tokens**. The first should get a 200 (it also reports the token's `aud` claim without verifying it), and the second must get a 401; a 200 raises a high finding. This covers authorization servers that issue tokens only to registered clients. The tokens are sent only to the MCP endpoint for these requests and are never stored, logged, or exported.
+
+Results appear in a table inside the OAuth modal. Confirmed issues are added to the server's Findings panel with remediation guidance.
 
 If the server has no OAuth discovery endpoint, this is surfaced as an info finding: most stdio servers and simple HTTP servers will not have one.
 
 ### History
 
-Every request is logged in the history panel at the bottom. Use the **filter bar** (click the 🔍 icon in the history panel header) to search by tool name, server, or arguments. Click **Replay** to restore a previous call to the editor. **Export JSON** and **Export MD** download the full history: useful for evidence and reports.
+Every request is logged in the history panel at the bottom. Use the **filter bar** (click the 🔍 icon in the history panel header) to search by tool name, server, or arguments. Click **Replay** to restore a previous call to the editor, or **Copy cURL** to copy it as a `curl` command with the headers and token it was sent with. The **Export** dropdown downloads the full history as JSON, Markdown or HTML: useful for evidence.
 
 Double-click the **History** panel header to expand it full-screen for easier review.
 

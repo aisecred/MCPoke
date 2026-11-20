@@ -198,3 +198,55 @@ All items in this section are now closed.
 **2026-10-11, credential scan extension (uncommitted):** the credential scan now covers schema defaults/examples/enums, resource/prompt/template metadata, extra metadata fields, `serverInfo` and `instructions` (new category `Credential in Server Metadata`; tool name/description keeps `Credential in Tool Description`). Placeholder filter added. Unit-tested in node (10 leak locations caught, 3 placeholder/clean cases silent). Verified live in headless Chromium: a fixture with keys in a schema default, description, `_meta`, resource description, prompt argument and `instructions` produced 6 findings (placeholder and clean tools silent), and 7 local test servers produced no credential findings. Still open: Origin probe for SSE/stdio, artifact refresh, `dev` to `main`.
 
 **2026-10-11, cumulative splitting (uncommitted):** per-tool ledger in `_checkOpaqueCorrelation` (`_mappingCueFor`, `_ledgerAdd`). Three loops: (1) ledger plus one-finding-per-tool replacement and critical at 3 names; (2) tiered cues (strong source for ordinary names, weak sources only for generic names), name blanked from its own window, negation guard, key/value and table forms; (3) single-message hits on ordinary names with no mapping-shaped window downgraded critical to low, arrow/pipe/JSON/dash forms. 28 node cases pass, live static plus runtime accumulation verified, 7 local servers clean, ghostsplice fixture unchanged. Fixture: `ghostsplice_cumulative_server.py` in mcp_test_servers. Document refresh still pending.
+
+---
+
+## Shipped after the 2026-10 work (v1.1.0 tagged 2026-11-17, later items on dev)
+
+- [x] **Pagination cap made visible** (2026-11-17, v1.1.0)
+  List pagination stops at 25 pages (backend and frontend). A server still returning pages at the cap now raises a medium `pagination-cap` finding, and the cache and connect results carry `truncated_lists`, so truncation is never silent.
+
+- [x] **Sensitive project and session files** (2026-11-17, v1.1.0)
+  Project files hold tokens and headers in plaintext, so they are written 0600 (re-applied on every write), the save dialog shows a warning before the file is written, and Export Session asks for confirmation first. Redaction was rejected as too fragile for the breadth of what is stored.
+
+- [x] **Tester-adjustable severity with an audit trail** (2026-11-17, v1.1.0)
+  The baseline severity is never overwritten. A tester can change it with a required reason; the log is append-only, flags a change when the baseline later moves, and shows in every export (CSV, JSON, Markdown, HTML) and in project and session files.
+
+- [x] **HTML findings report redesign** (2026-11-17, v1.1.0)
+  Servers first (per-server risk badge, per-server findings fold, capabilities), then an overall findings section with severity chips, server and status filters and search. Request history was removed from the report and is its own HTML, JSON or Markdown export.
+
+- [x] **One Export dropdown** (2026-11-17, v1.1.0)
+  History and Findings tabs and both modals share one labelled dropdown, with the HTML report first.
+
+- [x] **OAuth probe checked against the current MCP authorization spec** (2026-11-17, dev)
+  Added: PKCE advertisement (absent, no S256, plain), `scope=` on the 401 challenge, Client ID Metadata Document support, `offline_access` in PRM or challenge, DCR marked deprecated, token audience binding (token for another resource must get 401), and the `insufficient_scope` 403 challenge. Fixtures: `oauth_dcr_server.py` gained `/lab/aud-strict/mcp` (spec-correct, zero new findings) and `/lab/aud-weak/mcp` (triggers all of them), plus a compliant `tenant3` authorization server.
+
+- [x] **Sync to form fixes** (2026-11-17, dev)
+  Switches to the tool named in the raw request, parses string `arguments`, clears stale values, and lists any argument with no form field instead of dropping it silently.
+
+- [x] **Copy cURL on history rows** (2026-11-17, dev)
+  Copies an entry with the headers and token it was actually sent with. HTTP servers only.
+
+- [x] **Auth tester: click to run, and endpoint parity check** (2026-11-19, dev)
+  The Auth variation tester no longer fires when the panel opens: it lists the planned requests and waits for Run, since each one carries the editor's request (possibly a destructive tool). New option "Also check other endpoints on this host" probes /mcp, /sse, the SSE message endpoint and the other usual paths with and without credentials (`/auth-parity`), shows an Endpoint parity table, and raises a high Auth Bypass finding when some answer openly and others require auth. Fixtures: `downgrade_server.py` (9101, finding), `spec_probes_server.py` (9197, all open, no finding), `oauth_dcr_server.py` (9108, all closed, no finding).
+
+- [x] **Auth tester: live requests count as accepted** (2026-11-19, dev)
+  A variation that makes the server pause the call to send its own request (elicitation, sampling, roots; status `pending_live_request`) now shows a "live request" badge, counts as passing authentication (so it can raise the bypass or "no authentication" finding), and the parked call is cancelled instead of left open. Reproduced on `spec_probes_server.py` over /sse, where five variations used to show a green raw status and no finding.
+
+- [x] **Version stamp** (2026-11-19, dev)
+  `__version__` plus a `+dev.<sha>[.dirty]` suffix off the tagged release or main; shown in the UI header, startup banner, `/version`, the HTML reports and the findings, session and project exports.
+
+- [x] **OAuth probe: RFC 8707 resource indicators** (2026-11-20, dev)
+  Authorization and token requests now carry `resource=<this server>` as a canonical URI (lower-case scheme and host, no fragment or query, no bare trailing slash), per the MCP spec and RFC 8707. When registration is open, the probe reuses the client it registered to ask for a code for the right resource and for an unknown one: a code for both raises a low finding (the parameter is ignored), `invalid_target` passes, anything else is inconclusive. Fixtures: `oauth_dcr_server.py` `/lab/resource-strict/mcp` (tenant4, validates `resource`, no finding) against the server's own `/mcp` and the other lab cases (shared authorize ignores it, finding).
+
+- [x] **OAuth probe: real tokens** (2026-11-20, dev)
+  The OAuth modal takes an optional token for this server and one for a different audience ("Run again with tokens"): the first should get 200 (its `aud` claim is shown, not verified), the second must get 401 or a high finding is raised. Works when the token endpoint issues nothing to an unregistered client. Tokens go only to the MCP endpoint for these requests; they are not stored, logged or exported (checked against findings and project data). The OAuth probe also now clears its earlier findings on every run.
+
+- [x] **Compare export restyled** (2026-11-20, dev)
+  Uses the same shell as the findings report: sticky header with Summary / section / All navigation, summary count cards (only in A, only in B, shared, changed; matrix: unique names, shared), count badges on each table, "changed" and "identical" chips, and a print rule that shows every page. One page per section is kept so wide matrices keep full width.
+
+### Open follow-ups
+
+- [ ] Auth tester: an unauthenticated variation against a server that answers 401 with a non-JSON-RPC body takes the full 15 s read timeout and shows ERR instead of 401 (seen on `downgrade_server.py`), so a sweep takes over a minute. Pre-existing.
+
+- [ ] No standing regression suite exists in the repo. On 2026-11-20 the 22 ad hoc headless-browser and Node scripts from the November sessions were re-run against dev (9182ece): all pass except `saveas_test.py`, which needs a missing `~/.mcpoke/tmp/sa_a.mcpoke` input. Several scripts need a second MCPoke on port 8011 or a fixture on 9392, and `sev_test.py` still uses the old `findings-export-menu` id (now `export-menu-main`). Consider committing a runner and the fixed scripts.

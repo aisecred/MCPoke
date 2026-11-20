@@ -3,6 +3,7 @@
 
 import asyncio
 import atexit
+import base64
 import ipaddress
 import json
 import os
@@ -30,6 +31,31 @@ _LOOPBACK_HOSTS = ('127.0.0.1', '::1', 'localhost')
 API_TOKEN = None  # str | None: set at startup when binding to non-loopback
 
 MCP_LATEST_VERSION = "2025-11-25"
+__version__ = "1.2.0"
+
+
+def _build_version() -> str:
+    """The release number, plus +dev.<sha> (and .dirty) when running from a git
+    checkout that is not exactly the tagged release or the main branch, so a
+    tester can tell which build produced a result. Falls back to the plain
+    release number when git is unavailable."""
+    def git(*a):
+        return subprocess.run(["git", *a], cwd=Path(__file__).resolve().parent, capture_output=True,
+                              text=True, timeout=2).stdout.strip()
+    try:
+        sha = git("rev-parse", "--short", "HEAD")
+        if not sha:
+            return __version__
+        if git("describe", "--exact-match", "--tags", "HEAD") == f"v{__version__}":
+            return __version__
+        if git("rev-parse", "--abbrev-ref", "HEAD") in ("main", "master"):
+            return __version__
+        return f"{__version__}+dev.{sha}" + (".dirty" if git("status", "--porcelain", "--untracked-files=no") else "")
+    except Exception:
+        return __version__
+
+
+MCPOKE_BUILD = _build_version()
 MAX_RESPONSE_BYTES = 256 * 1024
 CONNECT_TIMEOUT    = 5.0
 READ_TIMEOUT       = 15.0
@@ -1436,8 +1462,13 @@ async def root(token: str = ''):
     if API_TOKEN is not None:
         if not token or not secrets.compare_digest(token, API_TOKEN):
             return HTMLResponse(_AUTH_DENIED_HTML, status_code=401)
-    page = HTML.replace('__MCPOKE_TOKEN__', API_TOKEN or '', 1)
+    page = HTML.replace('__MCPOKE_TOKEN__', API_TOKEN or '', 1).replace('__MCPOKE_BUILD__', MCPOKE_BUILD)
     return HTMLResponse(page)
+
+
+@app.get("/version")
+async def version():
+    return {"name": "mcpoke", "version": __version__, "build": MCPOKE_BUILD}
 
 
 async def _finish_or_park(live, http_session: aiohttp.ClientSession,
@@ -1978,6 +2009,8 @@ async def _discover_sse(session, url: str, headers: dict, proxy: Optional[str]) 
                 if re.search(r"^event:\s*endpoint", buf, re.M):
                     m = re.search(r"^data:\s*(\S+)", buf, re.M)
                     row.update(verdict="sse", detail="legacy MCP SSE: endpoint event" + (f" -> {m.group(1)[:80]}" if m else ""))
+                    if m:
+                        row["endpoint"] = m.group(1)
                 elif buf.strip():
                     row.update(verdict="possible", detail="event stream, but no MCP endpoint event")
                 else:
@@ -2026,6 +2059,108 @@ async def discover_endpoints(req: DiscoverRequest):
     order = {"mcp": 0, "sse": 1, "auth": 2, "possible": 3, "none": 4}
     rows.sort(key=lambda r: order[r["verdict"]])
     return {"origin": origin, "results": rows}
+
+
+class ParityRequest(BaseModel):
+    url:            str
+    token:          Optional[str]  = None
+    proxy:          Optional[str]  = None
+    custom_headers: Optional[dict] = None
+
+    @field_validator("url")
+    @classmethod
+    def url_scheme(cls, v: str) -> str:
+        return _validate_url(v)
+
+
+async def _probe_sse_messages(session, url: str, headers: dict, proxy: Optional[str]) -> dict:
+    """POST an initialize to a legacy SSE transport's message endpoint. 2xx means it
+    took the message; 401/403 means it demands auth."""
+    row = {"url": url, "transport": "sse-messages", "verdict": "none", "status": 0, "detail": ""}
+    kw: dict = dict(json=make_initialize(), headers={"Content-Type": "application/json", **headers},
+                    allow_redirects=False, timeout=aiohttp.ClientTimeout(connect=CONNECT_TIMEOUT, total=8))
+    if _http_proxy(proxy):
+        kw["proxy"] = _http_proxy(proxy)
+    try:
+        async with session.post(url, **kw) as r:
+            row["status"] = r.status
+            if r.status in (401, 403):
+                row.update(verdict="auth", detail="auth required")
+            elif 200 <= r.status < 300:
+                row.update(verdict="mcp", detail="accepted the message")
+    except Exception as e:
+        row["detail"] = type(e).__name__
+    return row
+
+
+def _parity_state(row: Optional[dict]) -> Optional[str]:
+    if not row:
+        return None
+    return "open" if row["verdict"] in ("mcp", "sse") else "closed" if row["verdict"] == "auth" else None
+
+
+_PARITY_LABELS = {"http": "Streamable HTTP", "sse": "SSE", "sse-messages": "SSE message endpoint"}
+
+
+@app.post("/auth-parity")
+async def auth_parity(req: ParityRequest):
+    """Does every MCP endpoint on this host enforce auth the same way? Probes the
+    usual paths with no credentials (and, when given, with them) and reports a
+    finding when one answers openly while another demands auth, the leftover from
+    a transport migration. Only this host is contacted."""
+    u = urllib.parse.urlsplit(req.url)
+    origin = f"{u.scheme}://{u.netloc}"
+    creds = dict(req.custom_headers or {})
+    if req.token:
+        creds["Authorization"] = f"Bearer {req.token}"
+    typed = u.path or "/"
+    http_paths = ([typed] if typed not in _DISCOVER_HTTP_PATHS + _DISCOVER_SSE_PATHS else []) + _DISCOVER_HTTP_PATHS
+    try:
+        session_ctx = _make_session(req.proxy)
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+    async def sweep(session, headers):
+        jobs = [_discover_http(session, origin + p, headers, req.proxy) for p in http_paths]
+        jobs += [_discover_sse(session, origin + p, headers, req.proxy) for p in _DISCOVER_SSE_PATHS]
+        rows = await asyncio.gather(*jobs)
+        # SSE advertises where to POST: test that endpoint too, same origin only.
+        extra = []
+        for r in rows:
+            ep = r.get("endpoint")
+            if r["verdict"] == "sse" and ep:
+                tgt = urllib.parse.urljoin(r["url"], ep)
+                if urllib.parse.urlsplit(tgt).netloc == u.netloc:
+                    extra.append(_probe_sse_messages(session, tgt, headers, req.proxy))
+        return list(rows) + list(await asyncio.gather(*extra))
+
+    async with session_ctx as session:
+        no_rows, cred_rows = await asyncio.gather(sweep(session, {}), sweep(session, creds) if creds else asyncio.sleep(0, result=[]))
+
+    def key(r):
+        return (urllib.parse.urlsplit(r["url"]).path or "/", r["transport"])
+    cred_by = {key(r): r for r in cred_rows}
+    rows = []
+    for r in no_rows:
+        c = cred_by.get(key(r))
+        sn, sc = _parity_state(r), _parity_state(c)
+        if sn is None and sc is None:
+            continue
+        rows.append({"path": key(r)[0], "transport": r["transport"],
+                     "noauth": {"state": sn, "status": r["status"], "detail": r["detail"]},
+                     "auth":   {"state": sc, "status": c["status"], "detail": c["detail"]} if c else None})
+    order = {"http": 0, "sse": 1, "sse-messages": 2}
+    rows.sort(key=lambda x: (order.get(x["transport"], 3), x["path"]))
+
+    open_rows   = [x for x in rows if x["noauth"]["state"] == "open"]
+    closed_rows = [x for x in rows if x["noauth"]["state"] == "closed"]
+    label = lambda x: f"{x['path']} ({_PARITY_LABELS.get(x['transport'], x['transport'])})"
+    finds = []
+    if open_rows and closed_rows:
+        finds.append({"severity": "high", "category": "Auth Bypass", "item": "transport-auth",
+                      "detail": f"Authentication is enforced on some endpoints of this host but not others: {', '.join(label(x) for x in open_rows)} answer without credentials while {', '.join(label(x) for x in closed_rows)} require them. Anyone can reach the same server through the open one (the usual leftover from a transport migration).",
+                      "remediation": "Apply the same authentication to every transport and path the server exposes, including legacy SSE and its message endpoint, or remove the endpoints that are no longer used."})
+    return {"origin": origin, "rows": rows, "findings": finds, "compared_credentials": bool(creds)}
 
 
 @app.post("/connect")
@@ -2375,6 +2510,23 @@ class OAuthProbeRequest(BaseModel):
     # which is keyed on the MCP server's own URL, and to keep the active tests
     # inside the target's origin. Optional so older callers still work.
     server_url: Optional[str] = None
+    # Optional real access tokens supplied by the tester: one issued for this
+    # server, one issued for a different audience. Used only for the requests
+    # made by this probe; never stored in findings, history or exports.
+    token: Optional[str] = None
+    other_token: Optional[str] = None
+
+    @field_validator("token", "other_token")
+    @classmethod
+    def token_shape(cls, v: Optional[str]) -> Optional[str]:
+        v = (v or "").strip()
+        if v.lower().startswith("bearer "):
+            v = v[7:].strip()
+        if not v:
+            return None
+        if len(v) > 8192 or any(c in v for c in "\r\n\x00 "):
+            raise ValueError("token must be a single value of at most 8192 characters")
+        return v
 
     @field_validator("url")
     @classmethod
@@ -2511,13 +2663,60 @@ def _prm_resource_matches(resource: str, server_url: str) -> bool:
     return s == r or s.startswith(r + "/")
 
 
+def _www_param(www: str, name: str) -> Optional[str]:
+    """One quoted parameter from a WWW-Authenticate challenge, or None if absent."""
+    m = re.search(r'(?<![\w-])' + re.escape(name) + r'="([^"]*)"', www or "")
+    return m.group(1) if m else None
+
+
+def _scope_challenge_finding(www: str, where: str) -> Optional[dict]:
+    """A 403 from the MCP server should be an RFC 6750 insufficient_scope challenge
+    carrying scope= and resource_metadata (MCP authorization, Scope Challenge
+    Handling). Returns a finding when it is not, so a client cannot run step-up."""
+    if not www:
+        return {"severity": "medium", "category": "OAuth",
+                "detail": f"{where} returned 403 with no WWW-Authenticate challenge: a client cannot tell it is a scope shortfall, so step-up authorization never starts.",
+                "remediation": "Answer insufficient scope with 403 and WWW-Authenticate: Bearer error=\"insufficient_scope\", scope=\"<needed scopes>\", resource_metadata=\"<PRM URL>\"."}
+    missing = []
+    if _www_param(www, "error") != "insufficient_scope":
+        missing.append('error="insufficient_scope"')
+    if not _www_param(www, "scope"):
+        missing.append("scope=")
+    if not _www_param(www, "resource_metadata"):
+        missing.append("resource_metadata=")
+    if not missing:
+        return None
+    return {"severity": "medium" if 'error="insufficient_scope"' in missing else "low", "category": "OAuth",
+            "detail": f"{where} returned 403 but its WWW-Authenticate challenge lacks {', '.join(missing)}: clients rely on these to run step-up authorization.",
+            "remediation": "Return error=\"insufficient_scope\" with every scope the operation needs in one scope= value, plus resource_metadata (RFC 6750 3.1, MCP Scope Challenge Handling)."}
+
+
+def _canonical_resource(url: Optional[str]) -> Optional[str]:
+    """RFC 8707 / MCP canonical resource URI: lower-case scheme and host, no
+    fragment or query, no trailing slash when the path is just "/"."""
+    if not url:
+        return None
+    sp = urllib.parse.urlsplit(url)
+    if sp.scheme not in ("http", "https") or not sp.hostname:
+        return None
+    host = sp.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = host + (f":{sp.port}" if sp.port else "")
+    path = "" if sp.path in ("", "/") else sp.path
+    return f"{sp.scheme.lower()}://{netloc}{path}"
+
+
 async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None,
-                            server_url: Optional[str] = None) -> dict:
+                            server_url: Optional[str] = None,
+                            token: Optional[str] = None,
+                            other_token: Optional[str] = None) -> dict:
     base   = base_url.rstrip("/")
     meta   = {}
     tests  = []
     finds  = []
     prm_doc, prm_url = None, None
+    resource_id = _canonical_resource(server_url)
 
     try:
         session_ctx = _make_session(proxy)
@@ -2534,6 +2733,7 @@ async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None,
         origin = f"{sp.scheme}://{sp.netloc}" if sp and sp.scheme in ("http", "https") and sp.netloc else base
         mcp_path = sp.path.rstrip("/") if sp else ""
         issuers = []
+        www_auth, unauth_status = "", None
         if server_url:
             hdr_url = None
             try:
@@ -2549,8 +2749,23 @@ async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None,
                         hdr_url = urllib.parse.urljoin(server_url, m.group(1))
                     tests.append({"name": "Unauthenticated MCP request", "status": r.status,
                                   "body": wa[:200] or "(no WWW-Authenticate header)"})
+                    www_auth, unauth_status = wa, r.status
             except Exception as e:
                 tests.append({"name": "Unauthenticated MCP request", "error": str(e)})
+            if unauth_status == 401:
+                chal_scope = _www_param(www_auth, "scope")
+                if not chal_scope:
+                    finds.append({"severity": "low", "category": "OAuth",
+                                  "detail": "The 401 challenge has no scope= parameter: the MCP authorization spec says servers SHOULD include it so clients request least-privilege scopes up front instead of guessing from scopes_supported.",
+                                  "remediation": "Add scope=\"<minimal scopes>\" to the WWW-Authenticate header of 401 responses (RFC 6750 3)."})
+                elif "offline_access" in chal_scope.split():
+                    finds.append({"severity": "low", "category": "OAuth",
+                                  "detail": "The 401 challenge scope includes offline_access: refresh tokens are not a resource requirement, and the spec says servers SHOULD NOT advertise it.",
+                                  "remediation": "Remove offline_access from the WWW-Authenticate scope."})
+            elif unauth_status == 403:
+                f = _scope_challenge_finding(www_auth, "The unauthenticated MCP request")
+                if f:
+                    finds.append(f)
             cands = []
             if hdr_url:
                 risk = _oauth_url_risk(hdr_url, server_url)
@@ -2601,6 +2816,11 @@ async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None,
                     finds.append({"severity": "medium", "category": "OAuth",
                                   "detail": f"Protected Resource Metadata resource ({res}) does not match this MCP server ({server_url}): a client must reject it (RFC 9728 3.3); one that does not can be steered into binding tokens to the wrong resource.",
                                   "remediation": "Make resource equal the MCP server's canonical URI (or an origin/path prefix of it)."})
+                prm_scopes = prm_doc.get("scopes_supported")
+                if isinstance(prm_scopes, list) and "offline_access" in prm_scopes:
+                    finds.append({"severity": "low", "category": "OAuth",
+                                  "detail": f"Protected Resource Metadata ({prm_url}) lists offline_access in scopes_supported: the spec says servers SHOULD NOT, because refresh tokens are not a resource requirement.",
+                                  "remediation": "Drop offline_access from scopes_supported; let authorization servers offer it to clients on their own."})
                 for u in good:
                     risk = _oauth_url_risk(u, server_url)
                     if risk == "internal":
@@ -2725,7 +2945,8 @@ async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None,
             try:
                 async with session.post(token_ep,
                                         data={"grant_type": "authorization_code",
-                                              "code": "mcpoke-probe-code"},
+                                              "code": "mcpoke-probe-code",
+                                              **({"resource": resource_id} if resource_id else {})},
                                         timeout=aiohttp.ClientTimeout(total=10)) as r:
                     body = await r.text()
                     tests.append({"name": "Token: no client_id", "status": r.status,
@@ -2743,7 +2964,8 @@ async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None,
                 async with session.post(token_ep,
                                         data={"grant_type":    "client_credentials",
                                               "client_id":     "mcpoke-probe",
-                                              "client_secret": "mcpoke-secret"},
+                                              "client_secret": "mcpoke-secret",
+                                              **({"resource": resource_id} if resource_id else {})},
                                         timeout=aiohttp.ClientTimeout(total=10)) as r:
                     body = await r.text()
                     tests.append({"name": "Token: client_credentials (bogus)", "status": r.status,
@@ -2766,6 +2988,7 @@ async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None,
                     "code_challenge":        "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
                     "code_challenge_method": "S256",
                     "state":                 "mcpokestate",
+                    **({"resource": resource_id} if resource_id else {}),
                 })
                 try:
                     async with session.get(f"{auth_ep}?{params}",
@@ -2796,6 +3019,24 @@ async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None,
         # human login), which this probe does not attempt.
         # No tests[] row: unlike steps 2-6 this isn't an HTTP-response-based active probe
         # (no status code to show), just a metadata field check: surfaces via findings only.
+        pk = meta.get("code_challenge_methods_supported")
+        if not isinstance(pk, list) or not pk:
+            finds.append({"severity": "medium", "category": "OAuth",
+                          "detail": "code_challenge_methods_supported is absent: PKCE support cannot be confirmed from metadata, and MCP requires PKCE with S256 (clients may refuse to proceed).",
+                          "remediation": "Advertise code_challenge_methods_supported: [\"S256\"] and enforce it."})
+        else:
+            if "S256" not in pk:
+                finds.append({"severity": "high", "category": "OAuth",
+                              "detail": f"code_challenge_methods_supported ({', '.join(map(str, pk))}) does not include S256, the only PKCE method MCP clients are expected to use.",
+                              "remediation": "Support S256 and advertise it in code_challenge_methods_supported."})
+            if "plain" in pk:
+                finds.append({"severity": "low", "category": "OAuth",
+                              "detail": "code_challenge_methods_supported includes plain: the challenge is the verifier, so an intercepted authorization request defeats PKCE.",
+                              "remediation": "Remove plain; allow S256 only."})
+        if meta.get("client_id_metadata_document_supported") is not True:
+            finds.append({"severity": "low", "category": "OAuth",
+                          "detail": "client_id_metadata_document_supported is not true: the spec says authorization servers SHOULD support Client ID Metadata Documents, the preferred registration method now that Dynamic Client Registration is deprecated.",
+                          "remediation": "Support OAuth Client ID Metadata Documents and advertise client_id_metadata_document_supported: true."})
         iss_supported = meta.get("authorization_response_iss_parameter_supported")
         if not iss_supported:
             finds.append({"severity": "medium", "category": "OAuth",
@@ -2815,6 +3056,7 @@ async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None,
         # endpoint actually exists and accepts a new client with zero authentication, letting
         # any caller self-register an OAuth client against this server.
         reg_ep = _in_scope(meta.get("registration_endpoint"))
+        reg_client_id = None
         if reg_ep:
             try:
                 async with session.post(reg_ep,
@@ -2825,10 +3067,18 @@ async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None,
                     tests.append({"name": "DCR: unauthenticated registration", "status": r.status,
                                   "body": body[:300]})
                     if r.status in (200, 201):
+                        try:
+                            cid = json.loads(body).get("client_id")
+                            if isinstance(cid, str) and cid:
+                                reg_client_id = cid
+                        except Exception:
+                            pass
                         finds.append({"severity": "high", "category": "OAuth",
                                       "detail": "registration_endpoint accepted a new client "
                                                 "registration with no authentication: Dynamic "
-                                                "Client Registration is open to anyone.",
+                                                "Client Registration is open to anyone (and DCR is "
+                                                "deprecated in the current MCP spec in favor of "
+                                                "Client ID Metadata Documents).",
                                       "remediation": "Require an initial access token or other "
                                                      "authentication on every registration request "
                                                      "(RFC 7591 §3), or disable open registration and "
@@ -2836,12 +3086,202 @@ async def _run_oauth_probes(base_url: str, proxy: Optional[str] = None,
             except Exception as e:
                 tests.append({"name": "DCR: unauthenticated registration", "error": str(e)})
 
+        # 9: token audience binding and scope challenge (MCP authorization, Token
+        # Handling). Needs a token, which only exists here when the token endpoint
+        # hands one to an unregistered client (itself a finding above), so this
+        # runs against the target's own endpoints and says plainly when it cannot.
+        if token_ep and server_url:
+            chal = _www_param(www_auth, "scope") or ""
+            ps = (prm_doc or {}).get("scopes_supported")
+            hint = chal or (" ".join(x for x in ps if isinstance(x, str)) if isinstance(ps, list) else "")
+            hint = " ".join(w for w in hint.split() if w != "offline_access")
+            other = "https://mcpoke-audience-probe.invalid/mcp"
+            init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                               "clientInfo": {"name": "mcpoke-probe", "version": "1"}}}
+
+            async def _cc_token(resource, scope):
+                form = {"grant_type": "client_credentials", "client_id": "mcpoke-probe",
+                        "client_secret": "mcpoke-secret", "resource": resource}
+                if scope:
+                    form["scope"] = scope
+                try:
+                    async with session.post(token_ep, data=form, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        if r.status != 200:
+                            return None
+                        return (await r.json(content_type=None)).get("access_token")
+                except Exception:
+                    return None
+
+            async def _rs_call(tok):
+                try:
+                    async with session.post(server_url, json=init, allow_redirects=False,
+                                            headers={"Accept": "application/json, text/event-stream",
+                                                     "Authorization": f"Bearer {tok}"},
+                                            timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        return r.status, r.headers.get("WWW-Authenticate", "")
+                except Exception:
+                    return None, ""
+
+            good_tok = await _cc_token(resource_id or server_url, hint)
+            if not good_tok:
+                tests.append({"name": "Token: audience binding", "status": "skipped",
+                              "body": "the token endpoint issues no token without real client credentials; test audience binding with a real token in the Auth variation tester"})
+            else:
+                st, wa2 = await _rs_call(good_tok)
+                tests.append({"name": "Token: matching audience (control)", "status": st if st is not None else "error",
+                              "body": f"scope: {hint or '(none)'}"})
+                if st == 403:
+                    f = _scope_challenge_finding(wa2, "The MCP server")
+                    if f:
+                        finds.append(f)
+                if st == 200:
+                    bad_tok = await _cc_token(other, hint)
+                    if not bad_tok:
+                        tests.append({"name": "Token: wrong audience", "status": "skipped",
+                                      "body": "the authorization server refused a token for another resource (good)"})
+                    else:
+                        st2, _w = await _rs_call(bad_tok)
+                        tests.append({"name": "Token: wrong audience", "status": st2 if st2 is not None else "error",
+                                      "body": f"aud: {other}"})
+                        if st2 == 200:
+                            finds.append({"severity": "high", "category": "OAuth",
+                                          "detail": "The MCP server accepted an access token issued for a different audience: the spec says servers MUST validate that tokens were issued for them (RFC 8707), and one that does not can be fed tokens meant for other services (confused deputy, token passthrough).",
+                                          "remediation": "Check the token's aud (or resource indicator) against this server's canonical URI and answer 401 invalid_token when it differs."})
+                        elif st2 == 403:
+                            finds.append({"severity": "low", "category": "OAuth",
+                                          "detail": "A token for the wrong audience got 403: the spec says invalid tokens MUST receive 401, and 403 is for insufficient scope.",
+                                          "remediation": "Answer tokens that are not valid for this server with 401 and WWW-Authenticate error=\"invalid_token\"."})
+                elif st is not None:
+                    tests.append({"name": "Token: wrong audience", "status": "skipped",
+                                  "body": f"inconclusive: the control token (right audience) got {st}, not 200"})
+            if hint:
+                low_tok = await _cc_token(resource_id or server_url, "")
+                if low_tok:
+                    st3, wa3 = await _rs_call(low_tok)
+                    tests.append({"name": "Token: no scope (insufficient scope)", "status": st3 if st3 is not None else "error",
+                                  "body": (wa3[:160] or "(no WWW-Authenticate header)")})
+                    if st3 == 403:
+                        f = _scope_challenge_finding(wa3, "A token with no scopes")
+                        if f and f["detail"] not in {x["detail"] for x in finds}:
+                            finds.append(f)
+
+        # 10: RFC 8707 resource indicators on the authorization request. The spec
+        # says clients MUST send `resource`, and an authorization server that
+        # validates it rejects a resource it does not serve (invalid_target).
+        # Uses the client the open-registration test just created, so it only
+        # runs when registration is open; otherwise there is no valid client to
+        # ask with, and an error for an unknown client would say nothing about
+        # resource handling. Only a redirect carrying code= for BOTH resources
+        # is treated as proof the parameter is ignored.
+        if auth_ep and server_url and reg_client_id:
+            bogus_res = "https://mcpoke-audience-probe.invalid/mcp"
+
+            async def _authz(resource):
+                qs = urllib.parse.urlencode({
+                    "response_type": "code", "client_id": reg_client_id,
+                    "redirect_uri": "http://localhost:9999/callback",
+                    "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+                    "code_challenge_method": "S256", "state": "mcpokestate",
+                    "resource": resource})
+                try:
+                    async with session.get(f"{auth_ep}?{qs}", allow_redirects=False,
+                                           timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        loc = r.headers.get("Location", "")
+                        u = urllib.parse.urlsplit(loc)
+                        q = urllib.parse.parse_qs(u.query)
+                        q.update(urllib.parse.parse_qs(u.fragment))
+                        if r.status in (301, 302, 303, 307, 308) and "error" in q:
+                            return r.status, loc, "error", (q["error"][0] if q["error"] else "")
+                        if r.status in (301, 302, 303, 307, 308) and "code" in q:
+                            return r.status, loc, "code", ""
+                        return r.status, loc, "other", ""
+                except Exception:
+                    return None, "", "other", ""
+
+            st_a, loc_a, kind_a, _e = await _authz(resource_id or server_url)
+            st_b, loc_b, kind_b, err_b = await _authz(bogus_res)
+            tests.append({"name": "Resource indicator: matching (control)",
+                          "status": st_a if st_a is not None else "error", "location": loc_a})
+            tests.append({"name": "Resource indicator: unknown resource",
+                          "status": st_b if st_b is not None else "error", "location": loc_b,
+                          "body": f"resource={bogus_res}"})
+            if kind_a == "code" and kind_b == "code":
+                finds.append({"severity": "low", "category": "OAuth",
+                              "detail": "The authorization endpoint issued a code for a resource it cannot serve (resource="
+                                        f"{bogus_res}) exactly as it did for this server, so it does not appear to act on "
+                                        "the RFC 8707 resource parameter that MCP clients must send. RFC 8707 expects "
+                                        "invalid_target for an unknown resource, and without it tokens may not be bound "
+                                        "to this server's audience.",
+                              "remediation": "Validate the resource parameter against the resources this authorization "
+                                             "server issues tokens for, answer invalid_target otherwise, and bind the "
+                                             "issued token's audience to it."})
+            elif kind_a == "code" and kind_b == "error" and err_b != "invalid_target":
+                tests[-1]["body"] += f" (refused with {err_b or 'an error'}, spec says invalid_target)"
+
+        # 11: real tokens supplied by the tester. A token valid for this server
+        # should be accepted; one issued for another audience must get 401.
+        # Needs no open token endpoint, so it covers authorization servers that
+        # issue tokens only to registered clients. Tokens are used in the
+        # Authorization header of these requests only and are never echoed.
+        if server_url and (token or other_token):
+            tok_init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                   "clientInfo": {"name": "mcpoke-probe", "version": "1"}}}
+
+            async def _tok_call(tok):
+                try:
+                    async with session.post(server_url, json=tok_init, allow_redirects=False,
+                                            headers={"Accept": "application/json, text/event-stream",
+                                                     "Authorization": f"Bearer {tok}"},
+                                            timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        return r.status
+                except Exception:
+                    return None
+
+            def _jwt_aud(tok):
+                parts = tok.split(".")
+                if len(parts) != 3:
+                    return None
+                try:
+                    claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+                    aud = claims.get("aud")
+                    return [aud] if isinstance(aud, str) else ([a for a in aud if isinstance(a, str)] if isinstance(aud, list) else None)
+                except Exception:
+                    return None
+
+            ctrl_ok = False
+            if token:
+                aud = _jwt_aud(token)
+                if aud is not None:
+                    names_us = (resource_id or server_url).rstrip("/") in [a.rstrip("/") for a in aud]
+                    tests.append({"name": "Supplied token: audience claim", "status": "info",
+                                  "body": f"aud: {', '.join(aud) or '(empty)'}" + ("" if names_us else " (does not name this server's URL; may still be a valid alias)")})
+                st = await _tok_call(token)
+                tests.append({"name": "Supplied token: this server (control)",
+                              "status": st if st is not None else "error",
+                              "body": "expected 200" if st == 200 else "expected 200: the token may be expired or wrong, later results are inconclusive"})
+                ctrl_ok = st == 200
+            if other_token:
+                st2 = await _tok_call(other_token)
+                tests.append({"name": "Supplied token: other audience",
+                              "status": st2 if st2 is not None else "error",
+                              "body": "expected 401"})
+                if st2 == 200:
+                    finds.append({"severity": "high", "category": "OAuth",
+                                  "detail": "The MCP server accepted an access token the tester supplied as issued for a different audience: the spec says servers MUST validate that tokens were issued for them (RFC 8707), and one that does not can be fed tokens meant for other services (confused deputy, token passthrough).",
+                                  "remediation": "Check the token's aud (or resource indicator) against this server's canonical URI and answer 401 invalid_token when it differs."})
+                elif st2 == 403 and ctrl_ok:
+                    finds.append({"severity": "low", "category": "OAuth",
+                                  "detail": "A token for another audience got 403: the spec says tokens that are not valid for this server MUST receive 401, and 403 is for insufficient scope.",
+                                  "remediation": "Answer tokens that are not valid for this server with 401 and WWW-Authenticate error=\"invalid_token\"."})
+
     return {"metadata": meta, "tests": tests, "findings": finds, "prm": prm_doc, "prm_url": prm_url}
 
 
 @app.post("/oauth-probe")
 async def oauth_probe(req: OAuthProbeRequest):
-    return await _run_oauth_probes(req.url, req.proxy, req.server_url)
+    return await _run_oauth_probes(req.url, req.proxy, req.server_url, req.token, req.other_token)
 
 
 # ── stdio transport ───────────────────────────────────────────────────────────
@@ -4227,6 +4667,7 @@ label.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
 
 <div id="hdr">
   <h1>MCPoke</h1>
+  <span id="app-version" style="color:var(--muted);font-size:11px;font-family:monospace" title="MCPoke build. Include this in bug reports.">v__MCPOKE_BUILD__</span>
   <span style="color:var(--muted);font-size:12px">MCP server exploration tool</span>
   <span style="flex:1"></span>
   <label style="font-size:11px;color:var(--muted);display:flex;align-items:center;gap:0.3rem" title="OOB callback URL: substituted into payloads that reference burpcollaborator.net / interactsh.com / attacker.example">
@@ -8974,6 +9415,8 @@ document.addEventListener('click', e => {
   if (!e.target.closest('.export-wrap')) closeExportMenus();
 });
 
+const MCPOKE_BUILD = '__MCPOKE_BUILD__';
+
 function exportFindings(fmt) {
   closeExportMenus();
   const findings = buildFindings();
@@ -9001,11 +9444,11 @@ function exportFindings(fmt) {
               severityLog: S.findingSeverity[fp] || [],
               status: S.findingStatus[fp] || 'open', notes: S.findingNotes[fp] || ''};
     });
-    content = JSON.stringify({exported: now, findings: annotated}, null, 2);
+    content = JSON.stringify({exported: now, mcpokeVersion: MCPOKE_BUILD, findings: annotated}, null, 2);
     mime = 'application/json'; ext = 'json';
 
   } else {
-    const lines = [`# MCPoke Findings: ${now}`, '',
+    const lines = [`# MCPoke Findings: ${now}`, '', `*MCPoke v${MCPOKE_BUILD}*`, '',
       `**Total:** ${findings.length}`, ''];
     const bySev = {};
     for (const f of findings) (bySev[f.severity] = bySev[f.severity] || []).push(f);
@@ -11240,23 +11683,39 @@ function syncFormToRaw() {
 }
 
 function syncRawToForm() {
+  const srv = S.servers[S.activeUrl];
+  let payload;
   if (S.httpMode) {
     const parsed = parseHttpText(document.getElementById('raw-editor').value);
     if (!parsed) { showError('Cannot sync: invalid HTTP request format'); return; }
-    try {
-      const payload = JSON.parse(parsed.body);
-      const args = payload?.params?.arguments || {};
-      setMode('form');
-      setTimeout(() => fillArgs(args), 20);
-    } catch { showError('Cannot sync: HTTP body is not valid JSON'); }
+    try { payload = JSON.parse(parsed.body); }
+    catch { showError('Cannot sync: HTTP body is not valid JSON'); return; }
+  } else {
+    try { payload = JSON.parse(document.getElementById('raw-editor').value); }
+    catch { showError('Cannot sync: raw editor contains invalid JSON'); return; }
+  }
+  hideError();
+  let args = payload?.params?.arguments;
+  if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = undefined; } }
+  if (args === undefined && payload && typeof payload === 'object' && !payload.method && !payload.params) args = payload;
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    showError('Cannot sync: no params.arguments object found in the request');
     return;
   }
-  try {
-    const payload = JSON.parse(document.getElementById('raw-editor').value);
-    const args = payload?.params?.arguments || {};
-    setMode('form');
-    setTimeout(() => fillArgs(args), 20);
-  } catch { showError('Cannot sync: raw editor contains invalid JSON'); }
+  // The request may name a different tool than the one selected: the form
+  // fields belong to the selected tool, so switch to the named one first.
+  const named = payload?.params?.name;
+  let note = '';
+  if (srv && typeof named === 'string' && srv.tools[S.selectedIdx]?.name !== named) {
+    const idx = srv.tools.findIndex(t => t.name === named);
+    if (idx >= 0) selectTool(idx);
+    else note = `Tool "${named}" is not on this server; values were matched against ${srv.tools[S.selectedIdx]?.name || 'the selected tool'}. `;
+  }
+  setMode('form');
+  const missed = fillArgs(args);
+  if (missed.length) {
+    showError(note + `Not copied, no matching form field: ${missed.join(', ')}`);
+  } else if (note) showError(note.trim());
 }
 
 // ── HTTP text helpers ──────────────────────────────────────────────────────
@@ -12545,18 +13004,28 @@ function collectArgs() {
   return ok ? args : null;
 }
 
+// Fills the form from an arguments object. Clears every field first so the form
+// matches the request instead of mixing in stale values. Returns the argument
+// names that have no field (or whose value the field cannot hold).
 function fillArgs(args) {
   const rawEl = document.getElementById('raw-args');
-  if (rawEl) { rawEl.value = JSON.stringify(args, null, 2); return; }
+  if (rawEl) { rawEl.value = JSON.stringify(args, null, 2); return []; }
+  document.querySelectorAll('#params-form [data-name]').forEach(el => {
+    if (el.dataset.type === 'boolean') el.checked = false;
+    else el.value = '';
+  });
+  const missed = [];
   Object.entries(args).forEach(([name, val]) => {
     const el = document.getElementById(`p-${name}`);
-    if (!el) return;
+    if (!el) { missed.push(name); return; }
     const type = el.dataset.type;
     if (type === 'boolean') el.checked = Boolean(val);
-    else if (type === 'array' || type === 'object')
+    else if (type === 'array' || type === 'object' || (val !== null && typeof val === 'object'))
       el.value = JSON.stringify(val, null, 2);
-    else el.value = String(val);
+    else el.value = val === null ? '' : String(val);
+    if (el.tagName === 'SELECT' && el.value !== String(val)) missed.push(`${name} (not an allowed value)`);
   });
+  return missed;
 }
 
 // ── Send ───────────────────────────────────────────────────────────────────
@@ -14119,6 +14588,8 @@ function statusBadges(data, isErr) {
   let html = '';
   if (mcpErr) {
     html += `<span class="badge badge-error" title="${esc(mcpErr)}">ERR</span>`;
+  } else if (httpStatus === 'pending_live_request') {
+    html += `<span class="badge badge-warn" title="The server accepted the request and paused the call to send a request of its own (elicitation, sampling or roots). It only does this after authentication passed.">live request</span>`;
   } else if (httpStatus != null) {
     const cls = httpStatus >= 500 ? 'badge-error' :
                 httpStatus >= 400 ? 'badge-warn'  : 'badge-ok';
@@ -14222,6 +14693,7 @@ function buildHistoryRows(filterText) {
       <td class="mono" style="color:var(--muted);font-size:10px;white-space:nowrap">${fmtBytes(e.respSize)}</td>
       <td style="white-space:nowrap">
         <button class="btn-sm" data-replay="${e.id}">Replay</button>
+        <button class="btn-sm" data-hcurl="${e.id}" title="Copy this request as a curl command (includes the headers and token it was sent with)">Copy cURL</button>
         <button class="btn-sm" data-hfuzz="${e.id}" title="Fuzz a parameter from this history entry" style="color:#e3b341;border-color:#4a3a10">&#9889; Fuzz</button>
       </td>
     </tr>`;
@@ -14286,6 +14758,8 @@ document.getElementById('hist-body').addEventListener('click', e => {
   if (btn) replayEntry(parseInt(btn.dataset.replay));
   const ib = e.target.closest('[data-hfuzz]');
   if (ib) openHistFuzzModal(parseInt(ib.dataset.hfuzz));
+  const cb = e.target.closest('[data-hcurl]');
+  if (cb) copyHistoryCurl(parseInt(cb.dataset.hcurl), cb);
 });
 
 function _syncHistSelButtons() {
@@ -14673,7 +15147,7 @@ function renderServerMatrix() {
 // needs to scroll at all. ────────────────────────────────────────────────
 
 function _exportCard(pageId, title, summary) {
-  return `<div class="cmp-card" onclick="document.getElementById('cmp-summary').style.display='none';document.getElementById('${pageId}').style.display='';">
+  return `<div class="cmp-card" onclick="cmpShow('${pageId}')">
     <div class="cmp-card-title">${esc(title)} &#9656;</div>
     <div class="muted sm">${summary}</div>
   </div>`;
@@ -14682,8 +15156,8 @@ function _exportCard(pageId, title, summary) {
 function _exportPage(pageId, title, innerHtml) {
   return `<div id="${pageId}" class="cmp-page" style="display:none">
     <div class="cmp-page-hdr">
-      <button class="theme-btn" onclick="document.getElementById('${pageId}').style.display='none';document.getElementById('cmp-summary').style.display='';">&#8592; Back</button>
-      <span class="cmp-page-title">${esc(title)}</span>
+      <button class="theme-btn" onclick="cmpShow('cmp-summary')">&#8592; Back</button>
+      <h2 class="cmp-page-title">${esc(title)}</h2>
     </div>
     ${innerHtml}
   </div>`;
@@ -14701,21 +15175,22 @@ function _exportCompareSection(listA, listB, nameFn, detailFn) {
   const sharedRows = shared.length
     ? shared.map(s => {
         const da = detailFn(s.a), db = detailFn(s.b);
-        if (da === db) return `<tr><td class="mono">${esc(s.name)}</td><td class="muted sm">identical</td></tr>`;
+        if (da === db) return `<tr><td class="mono">${esc(s.name)}</td><td><span class="chip">identical</span></td></tr>`;
         const diffHtml = computeDiff(da.split('\n'), db.split('\n')).map(d => {
           const style = d.t === 'add' ? 'color:var(--green)' : d.t === 'del' ? 'color:var(--red)' : 'color:var(--muted)';
           const pfx = d.t === 'add' ? '+' : d.t === 'del' ? '-' : ' ';
           return `<div style="${style}">${pfx} ${esc(d.l)}</div>`;
         }).join('');
-        return `<tr><td class="mono">${esc(s.name)}</td><td><pre>${diffHtml}</pre></td></tr>`;
+        return `<tr><td class="mono">${esc(s.name)} <span class="chip chip-adj">changed</span></td><td><pre>${diffHtml}</pre></td></tr>`;
       }).join('')
     : '<tr><td class="muted sm">none</td></tr>';
 
-  const html = `<table><thead><tr><th>Only in A</th></tr></thead><tbody>${onlyARows}</tbody></table>
-  <table><thead><tr><th>Only in B</th></tr></thead><tbody>${onlyBRows}</tbody></table>
-  <table><thead><tr><th>Shared</th><th>Diff</th></tr></thead><tbody>${sharedRows}</tbody></table>`;
-  const summary = `${onlyA.length} only in A, ${onlyB.length} only in B, ${shared.length} shared`;
-  return {html, summary};
+  const changed = shared.filter(s => detailFn(s.a) !== detailFn(s.b)).length;
+  const html = `<table><thead><tr><th>Only in A <span class="h2-n">${onlyA.length}</span></th></tr></thead><tbody>${onlyARows}</tbody></table>
+  <table><thead><tr><th>Only in B <span class="h2-n">${onlyB.length}</span></th></tr></thead><tbody>${onlyBRows}</tbody></table>
+  <table><thead><tr><th>Shared <span class="h2-n">${shared.length}</span></th><th>Diff</th></tr></thead><tbody>${sharedRows}</tbody></table>`;
+  const summary = `${onlyA.length} only in A, ${onlyB.length} only in B, ${shared.length} shared (${changed} changed)`;
+  return {html, summary, stats: {onlyA: onlyA.length, onlyB: onlyB.length, shared: shared.length, changed}};
 }
 
 function _exportMatrixSection(kind, srvs) {
@@ -14743,13 +15218,20 @@ function _exportMatrixSection(kind, srvs) {
   }).join('');
   const html = `<div style="overflow-x:auto"><table style="width:max-content"><thead><tr><th></th>${headerCells}</tr></thead><tbody>${rows}</tbody></table></div>`;
   const summary = `${names.length} unique names across ${srvs.length} servers, ${sharedCount} shared`;
-  return {html, summary};
+  return {html, summary, stats: {names: names.length, shared: sharedCount}};
 }
 
 function exportCompareHTML() {
   const now = new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
   const isMatrix = document.getElementById('cmp-mode-matrix')?.classList.contains('active');
-  let title, intro, cards = '', pages = '';
+  let title, intro, cards = '', pages = '', nav = '';
+  const tot = {onlyA: 0, onlyB: 0, shared: 0, changed: 0, names: 0};
+  const addSec = (pageId, label, sec) => {
+    cards += _exportCard(pageId, label, sec.summary);
+    pages += _exportPage(pageId, label, sec.html);
+    nav += `<a href="#" onclick="cmpShow('${pageId}');return false">${esc(label)}</a>`;
+    for (const k of Object.keys(sec.stats || {})) tot[k] += sec.stats[k];
+  };
 
   if (isMatrix) {
     const srvs = Object.values(S.servers);
@@ -14759,9 +15241,7 @@ function exportCompareHTML() {
     for (const [kind, label] of [['tools','Tools'], ['resources','Resources'], ['prompts','Prompts']]) {
       const sec = _exportMatrixSection(kind, srvs);
       if (!sec) continue;
-      const pageId = `cmp-page-${kind}`;
-      cards += _exportCard(pageId, label, sec.summary);
-      pages += _exportPage(pageId, label, sec.html);
+      addSec(`cmp-page-${kind}`, label, sec);
     }
   } else {
     const urlA = document.getElementById('cmp-a')?.value;
@@ -14781,9 +15261,7 @@ function exportCompareHTML() {
     for (const [kind, label, listA, listB, nameFn, detailFn] of specs) {
       const sec = _exportCompareSection(listA, listB, nameFn, detailFn);
       if (!sec) continue;
-      const pageId = `cmp-page-${kind}`;
-      cards += _exportCard(pageId, label, sec.summary);
-      pages += _exportPage(pageId, label, sec.html);
+      addSec(`cmp-page-${kind}`, label, sec);
     }
   }
 
@@ -14796,11 +15274,13 @@ function exportCompareHTML() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MCPoke Compare: ${esc(title)}</title>
 ${_reportStyleBlock()}
+${_reportFindingsStyle()}
 </head>
 <body>
 <div class="header">
   <h1>&#8644; MCPoke Compare</h1>
-  <span class="ts">${esc(title)} &middot; Generated ${esc(now)}</span>
+  <nav class="rnav"><a href="#" onclick="cmpShow('cmp-summary');return false">Summary</a>${nav}<a href="#" onclick="cmpShow('all');return false">All</a></nav>
+  <span class="ts">${esc(title)} &middot; Generated ${esc(now)} &middot; MCPoke v${esc(MCPOKE_BUILD)}</span>
   <button class="theme-btn" id="cmp-tbtn" onclick="
     var t=document.documentElement;
     var next=t.getAttribute('data-theme')==='dark'?'light':'dark';
@@ -14811,10 +15291,25 @@ ${_reportStyleBlock()}
 <div class="container">
   <div id="cmp-summary">
     ${intro}
+    <div class="summary">${isMatrix
+      ? `<div class="sum-card"><div class="sum-n">${tot.names}</div><div class="sum-l">Unique names</div></div>
+         <div class="sum-card"><div class="sum-n">${tot.shared}</div><div class="sum-l">Shared</div></div>`
+      : `<div class="sum-card"><div class="sum-n">${tot.onlyA}</div><div class="sum-l">Only in A</div></div>
+         <div class="sum-card"><div class="sum-n">${tot.onlyB}</div><div class="sum-l">Only in B</div></div>
+         <div class="sum-card"><div class="sum-n">${tot.shared}</div><div class="sum-l">Shared</div></div>
+         <div class="sum-card"><div class="sum-n">${tot.changed}</div><div class="sum-l">Changed</div></div>`}</div>
     <div class="cmp-cards">${cards}</div>
   </div>
 </div>
 ${pages}
+<script>
+function cmpShow(id) {
+  document.querySelectorAll('#cmp-summary, .cmp-page').forEach(function (e) {
+    e.style.display = (id === 'all' || e.id === id) ? '' : 'none';
+  });
+  window.scrollTo(0, 0);
+}
+<\/script>
 </body>
 </html>`;
 
@@ -15369,6 +15864,8 @@ function openHistoryModal() {
     if (btn) { closeHistoryModal(); replayEntry(parseInt(btn.dataset.replay)); return; }
     const ib  = e.target.closest('[data-hfuzz]');
     if (ib)  { closeHistoryModal(); openHistFuzzModal(parseInt(ib.dataset.hfuzz)); return; }
+    const cb  = e.target.closest('[data-hcurl]');
+    if (cb)  { copyHistoryCurl(parseInt(cb.dataset.hcurl), cb); return; }
   });
   ov.addEventListener('dblclick', e => {
     const chk = e.target.closest('.hist-chk');
@@ -15392,6 +15889,37 @@ function closeHistoryModal() {
 }
 
 function _histModalEsc(e) { if (e.key === 'Escape') closeHistoryModal(); }
+
+// Copies one history entry as a curl command. Uses the headers that were actually
+// sent (auth, session id, custom headers) when the entry recorded them, else the
+// server's current token and custom headers.
+function copyHistoryCurl(id, btn) {
+  const e = _histById(id);
+  if (!e) return;
+  const srv = S.servers[e.url];
+  if (srv?.transport === 'stdio' || !/^https?:\/\//i.test(e.url)) {
+    showError('Copy cURL only applies to HTTP servers'); return;
+  }
+  const payload = e.rawPayload || {jsonrpc: '2.0', id: 10, method: 'tools/call',
+                                   params: {name: e.tool, arguments: e.args}};
+  const skip = new Set(['host', 'content-length', 'content-type', 'connection', 'accept-encoding']);
+  const hdrs = {};
+  if (e.requestHeaders && Object.keys(e.requestHeaders).length) {
+    for (const [k, v] of Object.entries(e.requestHeaders)) if (!skip.has(k.toLowerCase())) hdrs[k] = String(v);
+  } else if (srv) {
+    Object.assign(hdrs, srv.customHeaders || {});
+    if (srv.token) hdrs['Authorization'] = `Bearer ${srv.token}`;
+  }
+  const q = v => String(v).replace(/'/g, "'\\''");
+  const hArgs = Object.entries(hdrs).map(([k, v]) => ` \\\n  -H '${q(k)}: ${q(v)}'`).join('');
+  const text = `curl -s -X POST '${q(e.url)}' \\\n  -H 'Content-Type: application/json'${hArgs} \\\n  -d '${q(JSON.stringify(payload))}'`;
+  navigator.clipboard.writeText(text).then(() => {
+    if (!btn) return;
+    const orig = btn.textContent;
+    btn.textContent = '\u2713 Copied';
+    setTimeout(() => { btn.textContent = orig; }, 1500);
+  }, () => showError('Could not write to the clipboard'));
+}
 
 function replayEntry(id) {
   const e = _histById(id);
@@ -15456,6 +15984,7 @@ function buildProjectData() {
   }));
   return {
     version: 2,
+    mcpokeVersion: MCPOKE_BUILD,
     saved: new Date().toISOString(),
     servers,
     history:          S.history,
@@ -16183,7 +16712,8 @@ function _reportStyleBlock() {
   .cmp-card-title { font-weight: 600; color: var(--accent); margin-bottom: .2rem; }
   .cmp-page { padding: 1.5rem 2rem; }
   .cmp-page-hdr { display: flex; align-items: center; gap: .8rem; margin-bottom: 1rem; }
-  .cmp-page-title { font-weight: 600; font-size: 1rem; }
+  .cmp-page-title { font-weight: 600; font-size: 1rem; margin: 0; }
+  @media print { .cmp-page, #cmp-summary { display: block !important; } .cmp-page-hdr .theme-btn { display: none; } }
 </style>`;
 }
 
@@ -16236,7 +16766,7 @@ ${_reportFindingsStyle()}
 <body>
 <div class="header">
   <h1>&#9741; MCPoke Request History</h1>
-  <span class="ts">Generated ${he(now)}</span>
+  <span class="ts">Generated ${he(now)} &middot; MCPoke v${he(MCPOKE_BUILD)}</span>
   <button class="theme-btn" id="tbtn" onclick="
     var t=document.documentElement;
     var next=t.getAttribute('data-theme')==='dark'?'light':'dark';
@@ -16547,7 +17077,7 @@ ${_reportFindingsStyle()}
 <div class="header">
   <h1>&#9741; MCPoke Report</h1>
   <nav class="rnav"><a href="#servers">Servers</a><a href="#findings">Findings</a></nav>
-  <span class="ts">Generated ${he(now)}</span>
+  <span class="ts">Generated ${he(now)} &middot; MCPoke v${he(MCPOKE_BUILD)}</span>
   <button class="theme-btn" id="tbtn" onclick="
     var t=document.documentElement;
     var next=t.getAttribute('data-theme')==='dark'?'light':'dark';
@@ -17609,7 +18139,10 @@ function openAuthTestModal() {
     <div id="auth-modal">
       <div class="auth-hdr">
         <span class="auth-hdr-title">&#9919; Auth Variation Tester</span>
-        <span id="auth-prog" style="color:var(--muted);font-size:11px;flex:1">Ready</span>
+        <span id="auth-prog" style="color:var(--muted);font-size:11px;flex:1">Ready, nothing sent yet</span>
+        ${/^https?:\/\//i.test(srv.url) && srv.transport !== 'stdio' ? `<label style="font-size:11px;color:var(--muted);display:flex;align-items:center;gap:.25rem;cursor:pointer" title="After the variations, probe the other usual MCP paths on this host (/mcp, /sse, /messages and so on) with no credentials and report a finding if some are open while others require auth">
+          <input type="checkbox" id="auth-parity-chk"> Also check other endpoints on this host</label>` : ''}
+        <button class="btn-sm" id="auth-run-btn" style="color:#3fb950;border-color:#3fb950;font-weight:600" onclick="startAuthRun()">&#9654; Run</button>
         <button class="btn-sm" onclick="addCustomAuthVariation()" title="Add a blank row with your own header value to test">&#x2795; Add variation</button>
         <button class="btn-sm" onclick="document.getElementById('auth-overlay').remove()">&#x2715; Close</button>
       </div>
@@ -17619,6 +18152,7 @@ function openAuthTestModal() {
         Variations that succeed are confirming the server requires no auth, not detecting a bypass.
         Configure a token first if the server is supposed to require one.
       </div>` : ''}
+      <div id="auth-ready" style="padding:.4rem .6rem;border-bottom:1px solid var(--border);font-size:11px;color:var(--muted)"></div>
       <div style="overflow-y:auto;flex:1;min-height:0">
         <table id="auth-tbl">
           <colgroup>
@@ -17631,6 +18165,7 @@ function openAuthTestModal() {
           </tr></thead>
           <tbody id="auth-tbody"></tbody>
         </table>
+        <div id="auth-parity" style="padding:.6rem;display:none"></div>
       </div>
       <div class="auth-h-resizer" id="auth-h-resizer"></div>
       <div id="auth-response-pane" style="height:35vh">(click a row to see full response)</div>
@@ -17638,7 +18173,91 @@ function openAuthTestModal() {
   document.body.appendChild(ov);
   ov.addEventListener('click', e => { if (e.target === ov) ov.remove(); });
   initAuthResizer();
-  runAuthTests(srv, parsed);
+  prepareAuthTests(srv, parsed);
+}
+
+// Opening the tester sends nothing: it lists what Run will send, so a request that
+// calls a destructive tool is never fired (several times over) just by opening the panel.
+function _authDisplayHeader(srv, v) {
+  return v.displayHdr ?? (
+    v.header === null ? `Bearer ${srv.token || '(none)'}` :
+    v.header === ''   ? '(none)'                           : v.header);
+}
+
+function prepareAuthTests(srv, payload) {
+  const tbody = document.getElementById('auth-tbody');
+  const tbl   = document.getElementById('auth-tbl');
+  if (!tbody || !tbl) return;
+  tbl._authSrv     = srv;
+  tbl._authPayload = payload;
+  const vars = authVariations(srv.token, srv.customHeaders);
+  tbody.innerHTML = vars.map((v, i) => `<tr class="auth-planned" style="opacity:.6">
+    <td style="color:var(--muted)">${i + 1}</td><td style="white-space:nowrap;font-weight:600">${esc(v.name)}</td>
+    <td class="mono" style="color:var(--muted)">${esc(_authDisplayHeader(srv, v))}</td><td></td>
+    <td style="color:var(--muted)">not run</td><td></td></tr>`).join('');
+  const what = payload?.method === 'tools/call' ? `tools/call ${payload?.params?.name || ''}` : (payload?.method || 'the request');
+  const rd = document.getElementById('auth-ready');
+  if (rd) rd.innerHTML = `Run sends <b>${vars.length}</b> requests to <span class="mono">${esc(srv.url)}</span>, each carrying <b>${esc(what)}</b> from the editor with a different Authorization header. Nothing has been sent yet.`;
+  const chk = document.getElementById('auth-parity-chk');
+  if (chk) {
+    try { chk.checked = localStorage.getItem('mcpoke-auth-parity') !== '0'; } catch { chk.checked = true; }
+    chk.addEventListener('change', () => { try { localStorage.setItem('mcpoke-auth-parity', chk.checked ? '1' : '0'); } catch {} });
+  }
+}
+
+async function startAuthRun() {
+  const tbl = document.getElementById('auth-tbl');
+  const btn = document.getElementById('auth-run-btn');
+  if (!tbl?._authSrv || (btn && btn.disabled)) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Running...'; }
+  document.getElementById('auth-ready').style.display = 'none';
+  document.getElementById('auth-tbody').querySelectorAll('tr.auth-planned').forEach(r => r.remove());
+  const par = document.getElementById('auth-parity');
+  if (par) { par.style.display = 'none'; par.innerHTML = ''; }
+  try {
+    await runAuthTests(tbl._authSrv, tbl._authPayload);
+    if (document.getElementById('auth-parity-chk')?.checked) await runAuthParity(tbl._authSrv);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '&#9654; Run again'; }
+  }
+}
+
+async function runAuthParity(srv) {
+  const box  = document.getElementById('auth-parity');
+  const prog = document.getElementById('auth-prog');
+  if (!box) return;
+  box.style.display = 'block';
+  box.innerHTML = '<div style="color:var(--muted);font-size:11px">Checking other endpoints on this host...</div>';
+  if (prog) prog.textContent = 'Checking other endpoints...';
+  let data;
+  try {
+    const res = await fetch('/auth-parity', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url: srv.url, token: srv.token || null, proxy: srv.proxy || null,
+                            custom_headers: srv.customHeaders && Object.keys(srv.customHeaders).length ? srv.customHeaders : null})});
+    data = await res.json();
+  } catch (e) { box.innerHTML = `<div style="color:#f85149;font-size:11px">Endpoint check failed: ${esc(e.message)}</div>`; return; }
+  if (data.error || data.detail) { box.innerHTML = `<div style="color:#f85149;font-size:11px">Endpoint check failed: ${esc(data.error || JSON.stringify(data.detail))}</div>`; return; }
+  const badge = st => !st ? '<span style="color:var(--muted)">-</span>'
+    : st.state === 'open'   ? `<span class="badge badge-error" title="${esc(st.detail)}">answers (${esc(String(st.status))})</span>`
+    : st.state === 'closed' ? `<span class="badge badge-ok" title="${esc(st.detail)}">requires auth (${esc(String(st.status))})</span>`
+    : '<span style="color:var(--muted)">-</span>';
+  const names = {http: 'Streamable HTTP', sse: 'SSE', 'sse-messages': 'SSE message endpoint'};
+  box.innerHTML = `<div style="font-weight:700;font-size:12px;margin-bottom:.3rem">Endpoint parity</div>
+    <div style="color:var(--muted);font-size:10px;margin-bottom:.4rem">Every MCP endpoint found on ${esc(data.origin)}, probed with no credentials${data.compared_credentials ? ' and with the configured ones' : ''}. Mixed results mean authentication is not applied everywhere.</div>
+    ${data.rows.length ? `<table style="width:100%;border-collapse:collapse;font-size:11px">
+      <thead><tr style="border-bottom:1px solid var(--border)"><th style="text-align:left;padding:.25rem">Path</th><th style="text-align:left;padding:.25rem">Transport</th>
+        <th style="text-align:left;padding:.25rem">No credentials</th>${data.compared_credentials ? '<th style="text-align:left;padding:.25rem">With credentials</th>' : ''}</tr></thead>
+      <tbody>${data.rows.map(r => `<tr style="border-bottom:1px solid var(--border)"><td class="mono" style="padding:.25rem">${esc(r.path)}</td>
+        <td style="padding:.25rem">${esc(names[r.transport] || r.transport)}</td><td style="padding:.25rem">${badge(r.noauth)}</td>
+        ${data.compared_credentials ? `<td style="padding:.25rem">${badge(r.auth)}</td>` : ''}</tr>`).join('')}</tbody></table>`
+      : '<div style="color:var(--muted);font-size:11px">No other MCP endpoints answered.</div>'}
+    <div style="margin-top:.4rem;font-size:11px;color:${data.findings.length ? '#f85149' : '#3fb950'}">${data.findings.length ? '&#9888; ' + esc(data.findings[0].detail) : 'No difference in authentication between endpoints.'}</div>`;
+  const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  srv.findings = (srv.findings || []).filter(f => f.item !== 'transport-auth');
+  srv.findings.push(...data.findings.map(f => ({...f, server: srvShort})));
+  renderFindings();
+  if (data.findings.length) renderServers();
+  if (prog) prog.textContent = 'Done, click a row to inspect, edit any header and press Enter to re-run it';
 }
 
 function authFingerprint(data) {
@@ -17672,6 +18291,14 @@ async function fireAuthVariation(srv, payload, v) {
     data    = await res.json();
     elapsed = Date.now() - t0;
     isErr   = !!(data?.error || data?.result?.error || data?.result?.result?.isError);
+    // The server paused the call on a request of its own (elicitation, sampling, roots).
+    // Nothing here answers it, so free the connection now instead of leaving it parked.
+    if (data?.status === 'pending_live_request' && data.pending_token) {
+      try {
+        await fetch('/elicit/respond', {method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({pending_token: data.pending_token, cancel: true})});
+      } catch {}
+    }
   } catch(e) {
     elapsed = Date.now() - t0;
     data    = {error: e.message};
@@ -17792,9 +18419,7 @@ async function runAuthTests(srv, payload) {
   for (let i = 0; i < vars.length; i++) {
     const v = vars[i];
     if (prog) prog.textContent = `${i + 1} / ${vars.length}`;
-    const displayHeader = v.displayHdr ?? (
-      v.header === null ? `Bearer ${srv.token || '(none)'}` :
-      v.header === ''   ? '(none)'                           : v.header);
+    const displayHeader = _authDisplayHeader(srv, v);
     const result = await fireAuthVariation(srv, payload, v);
     _recordAuthRun(srv, payload, v, displayHeader, result);
     const tr = buildAuthRow(tbody, i, v, displayHeader, result);
@@ -17820,6 +18445,14 @@ async function runAuthTests(srv, payload) {
   analyzeAuthFindings(srv, vars, results);
 }
 
+// A variation counts as accepted on a 200, or when the server got far enough to send
+// its own request mid-call (status 'pending_live_request'): that only happens once the
+// request has passed authentication and the tool started running.
+function _authAccepted(r) {
+  if (!r || r.isErr || !r.data) return false;
+  return r.data.status === 200 || r.data.status === 'pending_live_request';
+}
+
 function analyzeAuthFindings(srv, vars, results) {
   if (!results.length) return;
   const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
@@ -17827,7 +18460,7 @@ function analyzeAuthFindings(srv, vars, results) {
 
   const baseline        = results[0];
   const baseFp          = baseline?.fp;
-  const baseOk          = baseline && !baseline.isErr && baseline.data?.status === 200;
+  const baseOk          = _authAccepted(baseline);
   // When no credentials are configured the baseline IS unauthenticated: matches
   // are trivially true and don't indicate bypass; generate a single accurate finding instead.
   const noCredentials   = !srv.token && !srv.customHeaders;
@@ -17844,7 +18477,7 @@ function analyzeAuthFindings(srv, vars, results) {
       });
     }
     // Still flag the inconsistency case: baseline failed but some variation succeeded
-    if (!baseOk && results.slice(1).some(r => !r.isErr && r.data?.status === 200)) {
+    if (!baseOk && results.slice(1).some(r => _authAccepted(r))) {
       newFindings.push({
         severity: 'critical',
         category: 'Auth Bypass',
@@ -17866,16 +18499,19 @@ function analyzeAuthFindings(srv, vars, results) {
       if (!r || !r.data) continue;
 
       const sameContent = baseFp && r.fp === baseFp;
-      const httpOk      = !r.isErr && r.data?.status === 200 && !r.data?.result?.error;
+      const httpOk      = _authAccepted(r) && !r.data?.result?.error;
 
       if (!sameContent && !httpOk) continue;
 
       // Suppress duplicate findings when the endpoint is simply unauthenticated
       if (i > 1 && noAuthSame && sameContent) continue;
 
+      const live = r.data?.status === 'pending_live_request';
       const confidence = sameContent
         ? 'Definitive bypass: response body identical to authenticated baseline'
-        : 'Probable bypass: server returned success without rejecting the request (response content differs from baseline)';
+        : live
+          ? 'Probable bypass: the server accepted the request and sent a live request (elicitation, sampling or roots) mid-call, which only happens after authentication passed'
+          : 'Probable bypass: server returned success without rejecting the request (response content differs from baseline)';
 
       const isCustomVar = 'customHeadersOverride' in v;
       let what;
@@ -17903,7 +18539,7 @@ function analyzeAuthFindings(srv, vars, results) {
       });
     }
 
-    if (!baseOk && results.slice(1).some(r => !r.isErr && r.data?.status === 200)) {
+    if (!baseOk && results.slice(1).some(r => _authAccepted(r))) {
       newFindings.push({
         severity: 'critical',
         category: 'Auth Bypass',
@@ -19205,6 +19841,19 @@ function openOAuthModal() {
         <button class="btn-sm" onclick="document.getElementById('oauth-overlay').remove()">&#x2715; Close</button>
       </div>
       <div style="overflow-y:auto;padding:0.8rem 1rem;flex:1;min-height:0">
+        <details id="oauth-tokens" style="margin-bottom:0.8rem;font-size:11px">
+          <summary style="cursor:pointer;color:var(--muted)">Check with real access tokens (optional)</summary>
+          <div style="margin-top:0.4rem;display:grid;grid-template-columns:200px 1fr;gap:0.3rem 0.6rem;align-items:center">
+            <label for="oauth-tok" style="color:var(--muted)">Token for this server</label>
+            <input id="oauth-tok" type="password" autocomplete="off" spellcheck="false" placeholder="should be accepted (200)" style="font-family:monospace;font-size:11px">
+            <label for="oauth-tok2" style="color:var(--muted)">Token for a different audience</label>
+            <input id="oauth-tok2" type="password" autocomplete="off" spellcheck="false" placeholder="must be refused (401)" style="font-family:monospace;font-size:11px">
+          </div>
+          <div style="margin-top:0.4rem;display:flex;gap:0.6rem;align-items:center">
+            <button class="btn-sm" onclick="rerunOAuthProbe()">Run again with tokens</button>
+            <span style="color:var(--muted)">Sent only to this server's MCP endpoint for these checks. Not saved, logged, or exported.</span>
+          </div>
+        </details>
         <div id="oauth-meta" style="margin-bottom:0.8rem"></div>
         <h4 style="font-size:11px;color:var(--muted);margin:0 0 0.4rem">Probe results</h4>
         <table id="oauth-tbl" style="width:100%;border-collapse:collapse;font-size:11px">
@@ -19225,6 +19874,17 @@ function openOAuthModal() {
   runOAuthProbe(srv, baseUrl);
 }
 
+function rerunOAuthProbe() {
+  const srv = S.servers[S.activeUrl];
+  if (!srv) return;
+  const tbody = document.getElementById('oauth-tbody');
+  if (tbody) tbody.innerHTML = '';
+  for (const id of ['oauth-meta', 'oauth-finds']) { const el = document.getElementById(id); if (el) el.innerHTML = ''; }
+  const prog = document.getElementById('oauth-prog');
+  if (prog) prog.textContent = 'Probing…';
+  runOAuthProbe(srv, srv.url.replace(/\/[^/]*$/, ''));
+}
+
 async function runOAuthProbe(srv, baseUrl) {
   const prog  = document.getElementById('oauth-prog');
   const tbody = document.getElementById('oauth-tbody');
@@ -19235,11 +19895,14 @@ async function runOAuthProbe(srv, baseUrl) {
   try {
     const res  = await fetch('/oauth-probe', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url: baseUrl, proxy: srv.proxy || null, server_url: srv.url}),
+      body: JSON.stringify({url: baseUrl, proxy: srv.proxy || null, server_url: srv.url,
+        token: (document.getElementById('oauth-tok')?.value || '').trim() || null,
+        other_token: (document.getElementById('oauth-tok2')?.value || '').trim() || null}),
     });
     const data = await res.json();
 
     if (data.error) { prog.textContent = '⚠ ' + data.error; return; }
+    if (data.detail) { prog.textContent = '⚠ ' + (typeof data.detail === 'string' ? data.detail : 'Invalid request (a token must be a single value with no spaces)'); return; }
     prog.textContent = 'Done';
 
     if (data.metadata) {
@@ -19283,9 +19946,9 @@ async function runOAuthProbe(srv, baseUrl) {
     }
 
     const newFinds = data.findings || [];
+    srv.findings = (srv.findings || []).filter(f => f.item !== 'oauth-probe');
     if (newFinds.length) {
       const srvShort = srv.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
-      srv.findings = (srv.findings || []).filter(f => f.item !== 'oauth-probe');
       for (const f of newFinds) {
         srv.findings.push({...f, server: srvShort, item: 'oauth-probe',
           source: 'active',
@@ -19294,6 +19957,7 @@ async function runOAuthProbe(srv, baseUrl) {
       renderFindings();
       finds.innerHTML = `<span style="color:var(--error);font-size:11px">&#9632; ${newFinds.length} finding${newFinds.length>1?'s':''} added to the Findings panel</span>`;
     } else if (data.metadata) {
+      renderFindings();
       finds.innerHTML = '<span style="color:var(--green);font-size:11px">&#10003; No issues found in automated checks</span>';
     }
   } catch (e) {
@@ -20473,8 +21137,8 @@ if __name__ == "__main__":
             f"WARNING: MCPoke is binding to {args.host}: token auth is required.",
             file=sys.stderr, flush=True
         )
-        print(f"MCPoke running at http://{args.host}:{args.port}/?token={API_TOKEN}", flush=True)
+        print(f"MCPoke v{MCPOKE_BUILD} running at http://{args.host}:{args.port}/?token={API_TOKEN}", flush=True)
     else:
-        print(f"MCPoke running at http://{args.host}:{args.port}", flush=True)
+        print(f"MCPoke v{MCPOKE_BUILD} running at http://{args.host}:{args.port}", flush=True)
     # Pass app object directly so uvicorn uses this process's globals (including API_TOKEN)
     uvicorn.run(app, host=args.host, port=args.port, reload=False)
